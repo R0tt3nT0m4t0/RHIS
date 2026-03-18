@@ -49,7 +49,7 @@ AAP_ADMIN_PASS="${AAP_ADMIN_PASS:-}"
 # Shared identity/network defaults (single source of truth)
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASS="${ADMIN_PASS:-r3dh4t7!}"
-DOMAIN="${DOMAIN:-example.com}"
+DOMAIN="${DOMAIN:-}"
 REALM="${REALM:-}"
 NETMASK="${NETMASK:-255.255.0.0}"
 INTERNAL_GW="${INTERNAL_GW:-0.0.0.0}"
@@ -58,9 +58,9 @@ INTERNAL_GW="${INTERNAL_GW:-0.0.0.0}"
 SAT_IP="${SAT_IP:-10.168.128.1}"
 AAP_IP="${AAP_IP:-10.168.128.2}"
 IDM_IP="${IDM_IP:-10.168.128.3}"
-SAT_HOSTNAME="${SAT_HOSTNAME:-satellite-618.example.com}"
-AAP_HOSTNAME="${AAP_HOSTNAME:-aap-26.example.com}"
-IDM_HOSTNAME="${IDM_HOSTNAME:-idm.example.com}"
+SAT_HOSTNAME="${SAT_HOSTNAME:-}"
+AAP_HOSTNAME="${AAP_HOSTNAME:-}"
+IDM_HOSTNAME="${IDM_HOSTNAME:-}"
 
 # Satellite defaults
 SAT_ORG="${SAT_ORG:-REDHAT}"
@@ -79,6 +79,8 @@ AAP_SSH_KEY_DIR="${AAP_SSH_KEY_DIR:-${HOME}/.ssh/rhis-aap}"
 AAP_SSH_PRIVATE_KEY="${AAP_SSH_KEY_DIR}/id_rsa"
 AAP_SSH_PUBLIC_KEY="${AAP_SSH_KEY_DIR}/id_rsa.pub"
 AAP_SETUP_LOG_LOCAL="${AAP_SETUP_LOG_LOCAL:-/tmp/aap-setup-$(date +%s).log}"
+RHIS_VM_MONITOR_SESSION="${RHIS_VM_MONITOR_SESSION:-rhis-vm-consoles}"
+RHIS_VM_MONITOR_PID_FILE="${RHIS_VM_MONITOR_PID_FILE:-/tmp/rhis-vm-console-pids-${USER}}"
 
 # Function to print colored output
 print_step() {
@@ -99,7 +101,7 @@ Usage: $(basename "$0") [options]
 
 Options:
   --non-interactive        Run without prompts; required values must be preseeded
-  --menu-choice <0-6>      Preselect a visible menu option
+        --menu-choice <0-6>      Preselect a visible menu option
   --env-file <path>        Load preseed variables from a custom env file
   --reconfigure            Prompt for all env values and update env.yml
   --demo                   Use minimal PoC/demo VM specs and kickstarts
@@ -259,6 +261,9 @@ is_unresolved_template_value() {
         *"{{"*|*"}}"*)
             return 0
             ;;
+        "example.com"|"example.org"|"EXAMPLE.COM"|"EXAMPLE.ORG")
+            return 0
+            ;;
         *)
             return 1
             ;;
@@ -289,7 +294,7 @@ normalize_shared_env_vars() {
         IDM_DOMAIN=""
     fi
 
-    DOMAIN="${DOMAIN:-${SAT_DOMAIN:-${AAP_DOMAIN:-${IDM_DOMAIN:-example.com}}}}"
+    DOMAIN="${DOMAIN:-${SAT_DOMAIN:-${AAP_DOMAIN:-${IDM_DOMAIN:-}}}}"
     REALM="${REALM:-${IDM_REALM:-${SAT_REALM:-}}}"
     [ -n "${REALM:-}" ] || REALM="$(to_upper "$DOMAIN")"
 
@@ -520,6 +525,123 @@ show_menu() {
     echo "0) Exit"
     echo ""
     read -r -p "Enter choice [0-6]: " choice
+}
+
+launch_vm_console_monitors_auto() {
+    local -a vms=("satellite-618" "aap-26" "idm")
+    local vm launched=0
+    local term_pid
+
+    stop_vm_console_monitors >/dev/null 2>&1 || true
+    : > "${RHIS_VM_MONITOR_PID_FILE}"
+
+    if ! command -v virsh >/dev/null 2>&1; then
+        print_warning "virsh not found; skipping VM console monitor auto-launch."
+        return 0
+    fi
+
+    # GUI terminal popups (preferred)
+    if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        if command -v gnome-terminal >/dev/null 2>&1; then
+            for vm in "${vms[@]}"; do
+                gnome-terminal -- bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                term_pid=$!
+                echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
+            done
+            launched=1
+        elif command -v x-terminal-emulator >/dev/null 2>&1; then
+            for vm in "${vms[@]}"; do
+                x-terminal-emulator -e bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                term_pid=$!
+                echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
+            done
+            launched=1
+        elif command -v konsole >/dev/null 2>&1; then
+            for vm in "${vms[@]}"; do
+                konsole -e bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                term_pid=$!
+                echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
+            done
+            launched=1
+        elif command -v xterm >/dev/null 2>&1; then
+            for vm in "${vms[@]}"; do
+                xterm -e bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                term_pid=$!
+                echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
+            done
+            launched=1
+        fi
+    fi
+
+    if [ "$launched" = "1" ]; then
+        print_step "Opened 3 console monitor terminals (Satellite/AAP/IdM)."
+        return 0
+    fi
+
+    # Headless fallback: detached tmux session (non-blocking)
+    if command -v tmux >/dev/null 2>&1; then
+        tmux has-session -t "$RHIS_VM_MONITOR_SESSION" 2>/dev/null && tmux kill-session -t "$RHIS_VM_MONITOR_SESSION"
+        tmux new-session -d -s "$RHIS_VM_MONITOR_SESSION" "bash -lc 'while ! sudo virsh dominfo satellite-618 >/dev/null 2>&1; do sleep 5; done; sudo virsh console satellite-618 || true'"
+        tmux split-window -h -t "$RHIS_VM_MONITOR_SESSION:0" "bash -lc 'while ! sudo virsh dominfo aap-26 >/dev/null 2>&1; do sleep 5; done; sudo virsh console aap-26 || true'"
+        tmux split-window -v -t "$RHIS_VM_MONITOR_SESSION:0.0" "bash -lc 'while ! sudo virsh dominfo idm >/dev/null 2>&1; do sleep 5; done; sudo virsh console idm || true'"
+        tmux select-layout -t "$RHIS_VM_MONITOR_SESSION:0" tiled >/dev/null 2>&1 || true
+        print_step "No GUI terminal detected. Started tmux console monitor session: $RHIS_VM_MONITOR_SESSION"
+        print_step "Attach anytime with: tmux attach -t $RHIS_VM_MONITOR_SESSION"
+        return 0
+    fi
+
+    print_warning "No GUI terminal emulator or tmux found; skipping auto console monitor launch."
+    return 0
+}
+
+stop_vm_console_monitors() {
+    local pid
+
+    if command -v tmux >/dev/null 2>&1; then
+        tmux has-session -t "$RHIS_VM_MONITOR_SESSION" 2>/dev/null && tmux kill-session -t "$RHIS_VM_MONITOR_SESSION" || true
+    fi
+
+    if [ -f "$RHIS_VM_MONITOR_PID_FILE" ]; then
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            kill "$pid" >/dev/null 2>&1 || true
+            kill -9 "$pid" >/dev/null 2>&1 || true
+        done < "$RHIS_VM_MONITOR_PID_FILE"
+        rm -f "$RHIS_VM_MONITOR_PID_FILE"
+    fi
+
+    return 0
+}
+
+force_kill_rhis_leftovers() {
+    local -a patterns=(
+        "python3 -m http.server 8080 --bind"
+        "virsh console satellite-618"
+        "virsh console aap-26"
+        "virsh console idm"
+        "rhis-vm-consoles"
+        "curl -fL --retry 3 --retry-delay 10"
+        "aap-bundle.tar.gz"
+        "setup.sh 2>&1"
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${AAP_SSH_PRIVATE_KEY}"
+    )
+    local pattern
+
+    print_step "Force-killing RHIS leftover processes from current/past runs"
+    for pattern in "${patterns[@]}"; do
+        sudo pkill -9 -f "$pattern" >/dev/null 2>&1 || true
+    done
+
+    # Also hard-kill any tracked monitor terminal PIDs from previous runs.
+    if [ -f "$RHIS_VM_MONITOR_PID_FILE" ]; then
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            kill -9 "$pid" >/dev/null 2>&1 || true
+        done < "$RHIS_VM_MONITOR_PID_FILE"
+        rm -f "$RHIS_VM_MONITOR_PID_FILE"
+    fi
+
+    return 0
 }
 
 # Ensure Node.js is installed
@@ -1108,11 +1230,11 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
         if needs_prompt_var DOMAIN; then
-            prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-example.com}" 0 1 || return 1
+            prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-}" 0 1 || return 1
             env_changed=1
         fi
-        if [ -z "${REALM:-}" ]; then
-            realm_default="$(to_upper "${DOMAIN:-example.com}")"
+        if [ -z "${REALM:-}" ] || is_unresolved_template_value "${REALM:-}"; then
+            realm_default="$(to_upper "${DOMAIN}")"
             prompt_with_default REALM "Shared Kerberos Realm" "${REALM:-$realm_default}" 0 1 || return 1
             env_changed=1
         fi
@@ -1245,8 +1367,8 @@ prompt_all_env_options_once() {
     echo "=== Global (remaining missing: ${global_missing}/12) ==="
     prompt_with_default ADMIN_USER "Shared Admin Username" "${ADMIN_USER:-admin}" 0 1 || return 1
     prompt_with_default ADMIN_PASS "Shared Admin Password" "${ADMIN_PASS:-r3dh4t7!}" 1 1 || return 1
-    prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-example.com}" 0 1 || return 1
-    realm_default="$(to_upper "${DOMAIN:-example.com}")"
+    prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-}" 0 1 || return 1
+    realm_default="$(to_upper "${DOMAIN}")"
     prompt_with_default REALM "Shared Kerberos Realm" "${REALM:-$realm_default}" 0 1 || return 1
     prompt_with_default NETMASK "Shared Internal Netmask" "${NETMASK:-255.255.0.0}" 0 1 || return 1
     prompt_with_default INTERNAL_GW "Shared Internal Gateway" "${INTERNAL_GW:-0.0.0.0}" 0 1 || return 1
@@ -1500,6 +1622,7 @@ preflight_download_aap_bundle() {
 wait_for_vm_ssh() {
     local vm_name="${1:-aap-26}"
     local vm_ip
+    local vm_state
     local ssh_attempts=0
     local ssh_max_attempts=540  # 540 × 10s = 90 minutes
     local elapsed_minutes=0
@@ -1508,8 +1631,23 @@ wait_for_vm_ssh() {
     print_step "  (Anaconda install + 3.5 GB bundle download typically takes 30-60 min)"
 
     while [ "${ssh_attempts}" -lt "${ssh_max_attempts}" ]; do
+        vm_state="$(sudo virsh domstate "${vm_name}" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [ "$vm_state" = "shutoff" ] || [ "$vm_state" = "crashed" ] || [ "$vm_state" = "pmsuspended" ]; then
+            print_warning "${vm_name} state is ${vm_state}; starting it to continue automated setup"
+            sudo virsh start "${vm_name}" >/dev/null 2>&1 || true
+            sleep 5
+        fi
+
         # Get the VM's IP from virsh
-        vm_ip="$(sudo virsh domifaddr "${vm_name}" --lease 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        vm_ip="$(sudo virsh domifaddr "${vm_name}" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+
+        if [ -z "${vm_ip}" ]; then
+            case "$vm_name" in
+                aap-26) vm_ip="${AAP_IP:-}" ;;
+                satellite-618) vm_ip="${SAT_IP:-}" ;;
+                idm) vm_ip="${IDM_IP:-}" ;;
+            esac
+        fi
 
         if [ -n "${vm_ip}" ]; then
             print_step "${vm_name} has IP ${vm_ip} — checking SSH..."
@@ -1792,6 +1930,7 @@ text
 reboot
 keyboard us
 lang en_US.UTF-8
+bootloader --append="net.ifnames=0 biosdevname=0"
 
 rootpw --plaintext "${ADMIN_PASS}"
 user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
@@ -1867,8 +2006,22 @@ PKGS_END
     # --- Post-install (variable expansion required) ---
     cat >> "$tmp_ks" <<POSTEOF
 %post --log=/root/ks-post.log
-# 1. Registration
-subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach
+set -euxo pipefail
+
+# 1. Registration (retry until network/RHSM are reachable)
+register_rhsm() {
+    local try
+    for try in $(seq 1 10); do
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
+        subscription-manager unregister >/dev/null 2>&1 || true
+        subscription-manager clean >/dev/null 2>&1 || true
+        sleep 15
+    done
+    return 1
+}
+
+register_rhsm
+subscription-manager refresh || true
 
 # 1.1 Local hosts mapping (temporary DNS-independent bootstrap)
 cat > /etc/hosts <<EOF
@@ -1882,11 +2035,126 @@ EOF
 subscription-manager repos --disable="*"
 subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-10-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-10-x86_64-rpms"
 
+for repo in \
+    rhel-10-for-x86_64-baseos-rpms \
+    rhel-10-for-x86_64-appstream-rpms \
+    satellite-6.18-for-rhel-10-x86_64-rpms \
+    satellite-maintenance-6.18-for-rhel-10-x86_64-rpms; do
+    subscription-manager repos --list-enabled | grep -q "$repo"
+done
+
 # 3. Installation
 dnf install -y satellite
 
 # 4. Satellite Installer
 satellite-installer --scenario satellite --foreman-initial-organization "${SAT_ORG}" --foreman-initial-location "${SAT_LOC}" --foreman-initial-admin-username "${ADMIN_USER}" --foreman-initial-admin-password "${ADMIN_PASS}" --foreman-proxy-dns true --foreman-proxy-dns-interface eth1 --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface eth1 --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --enable-foreman-compute-ec2 --enable-foreman-compute-gce --enable-foreman-compute-azure --enable-foreman-compute-libvirt --enable-foreman-plugin-openscap --enable-foreman-proxy-plugin-openscap --register-with-insights true
+
+# 4.1 RHIS CMDB single-pane dashboard (Satellite + AAP + IdM + RHIS container endpoint)
+dnf install -y python3-pip sshpass
+python3 -m pip install --upgrade pip setuptools wheel || true
+python3 -m pip install ansible-cmdb || true
+
+mkdir -p /etc/ansible /var/lib/rhis-cmdb/facts /var/www/rhis-cmdb
+
+cat > /usr/local/bin/rhis-cmdb-refresh.sh <<CMDB_REFRESH
+#!/usr/bin/env bash
+set -euo pipefail
+
+INV=/etc/ansible/rhis_inventory.ini
+FACTS=/var/lib/rhis-cmdb/facts
+OUT=/var/www/rhis-cmdb/index.html
+
+cat > "\${INV}" <<INV_EOF
+[rhis_linux]
+${SAT_HOSTNAME} ansible_host=${SAT_IP}
+${AAP_HOSTNAME} ansible_host=${AAP_IP}
+${IDM_HOSTNAME} ansible_host=${IDM_IP}
+
+[all:vars]
+ansible_user=${ADMIN_USER}
+ansible_password=${ADMIN_PASS}
+ansible_become=true
+ansible_become_password=${ADMIN_PASS}
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+INV_EOF
+
+mkdir -p "\${FACTS}"
+
+# Gather facts from RHIS nodes (best effort so dashboard always refreshes)
+ansible -i "\${INV}" rhis_linux -m setup --tree "\${FACTS}" || true
+
+# Add synthetic container health node so RHIS container shows in the same pane
+container_status="down"
+if curl -ksSf --max-time 5 "http://${HOST_INT_IP}:3000/" >/dev/null 2>&1; then
+    container_status="up"
+fi
+
+cat > "\${FACTS}/rhis-container" <<JSON
+{
+    "ansible_facts": {
+        "nodename": "rhis-container",
+        "fqdn": "rhis-container",
+        "default_ipv4": {"address": "${HOST_INT_IP}"},
+        "rhis_container_endpoint": "http://${HOST_INT_IP}:3000",
+        "rhis_container_status": "\${container_status}"
+    },
+    "changed": false
+}
+JSON
+
+ansible-cmdb -t html_fancy "\${FACTS}" > "\${OUT}"
+CMDB_REFRESH
+
+chmod 0755 /usr/local/bin/rhis-cmdb-refresh.sh
+
+cat > /etc/systemd/system/rhis-cmdb-refresh.service <<'CMDB_REFRESH_SVC'
+[Unit]
+Description=Refresh RHIS ansible-cmdb dashboard data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rhis-cmdb-refresh.sh
+CMDB_REFRESH_SVC
+
+cat > /etc/systemd/system/rhis-cmdb-refresh.timer <<'CMDB_REFRESH_TIMER'
+[Unit]
+Description=Periodic RHIS ansible-cmdb refresh timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=rhis-cmdb-refresh.service
+
+[Install]
+WantedBy=timers.target
+CMDB_REFRESH_TIMER
+
+cat > /etc/systemd/system/rhis-cmdb-http.service <<'CMDB_HTTP_SVC'
+[Unit]
+Description=RHIS CMDB Dashboard HTTP Server
+After=network-online.target rhis-cmdb-refresh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/rhis-cmdb
+ExecStart=/usr/bin/python3 -m http.server 18080 --bind 0.0.0.0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+CMDB_HTTP_SVC
+
+systemctl daemon-reload
+systemctl enable --now rhis-cmdb-refresh.timer
+systemctl start rhis-cmdb-refresh.service || true
+systemctl enable --now rhis-cmdb-http.service
+
+firewall-cmd --permanent --add-port=18080/tcp || true
+firewall-cmd --reload || true
 
 # 5. Performance baseline for virtual guests
 systemctl enable --now qemu-guest-agent || true
@@ -1970,6 +2238,7 @@ text
 reboot
 keyboard us
 lang en_US.UTF-8
+bootloader --append="net.ifnames=0 biosdevname=0"
 
 rootpw --plaintext "${ADMIN_PASS}"
 user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
@@ -2028,11 +2297,25 @@ tuned
 
 PKGS
 
-    # --- Post-install: write literal kicsstart %post section, then make per-variable substitutions ---
-    cat >> "$tmp_ks" <<'POSTEOF'
+        # --- Post-install: write kickstart %post and substitute placeholders ---
+        cat >> "$tmp_ks" <<POSTEOF
 %post --log=/root/ks-post.log
-# 1. Registration
-subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach
+set -euxo pipefail
+
+# 1. Registration (retry until network/RHSM are reachable)
+register_rhsm() {
+    local try
+    for try in $(seq 1 10); do
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
+        subscription-manager unregister >/dev/null 2>&1 || true
+        subscription-manager clean >/dev/null 2>&1 || true
+        sleep 15
+    done
+    return 1
+}
+
+register_rhsm
+subscription-manager refresh || true
 
 # 1.1 Local hosts mapping (temporary DNS-independent bootstrap)
 cat > /etc/hosts <<HOSTS
@@ -2045,6 +2328,13 @@ HOSTS
 # 2. Repositories
 subscription-manager repos --disable="*"
 subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms" --enable="ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms"
+
+for repo in \
+    rhel-10-for-x86_64-baseos-rpms \
+    rhel-10-for-x86_64-appstream-rpms \
+    ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms; do
+    subscription-manager repos --list-enabled | grep -q "$repo"
+done
 
 # 3. Download the AAP bundle from the host HTTP server (started by run_rhis_install_sequence.sh)
 mkdir -p /root/aap-setup
@@ -2163,6 +2453,7 @@ text
 reboot
 keyboard us
 lang en_US.UTF-8
+bootloader --append="net.ifnames=0 biosdevname=0"
 
 rootpw --plaintext "${ADMIN_PASS}"
 user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
@@ -2230,8 +2521,22 @@ PKGS
     # --- Post-install (variable expansion required) ---
     cat >> "$tmp_ks" <<POSTEOF
 %post --log=/root/ks-post.log
-# 1. Registration
-subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach
+set -euxo pipefail
+
+# 1. Registration (retry until network/RHSM are reachable)
+register_rhsm() {
+    local try
+    for try in $(seq 1 10); do
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
+        subscription-manager unregister >/dev/null 2>&1 || true
+        subscription-manager clean >/dev/null 2>&1 || true
+        sleep 15
+    done
+    return 1
+}
+
+register_rhsm
+subscription-manager refresh || true
 
 # 2. Hostname
 hostnamectl set-hostname "${IDM_HOSTNAME}"
@@ -2247,6 +2552,12 @@ EOF
 # 3. Repositories
 subscription-manager repos --disable="*"
 subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms"
+
+for repo in \
+    rhel-10-for-x86_64-baseos-rpms \
+    rhel-10-for-x86_64-appstream-rpms; do
+    subscription-manager repos --list-enabled | grep -q "$repo"
+done
 
 # 4. IdM Server Installation (unattended)
 ipa-server-install --unattended --realm="${IDM_REALM}" --domain="${IDM_DOMAIN}" --hostname="${IDM_HOSTNAME}" --admin-password="${IDM_ADMIN_PASS}" --ds-password="${IDM_DS_PASS}" --setup-dns --auto-forwarders --no-ntp
@@ -2396,11 +2707,17 @@ create_vm_if_missing() {
         return 1
     fi
 
+    sudo virsh autostart "$vm_name" >/dev/null 2>&1 || true
+
 	print_success "VM creation requested: $vm_name"
 }
 
 demokill_cleanup() {
     print_step "DEMOKILL: destroying demo VMs and cleaning generated files"
+
+    print_step "Stopping auto-launched VM console monitors"
+    stop_vm_console_monitors || true
+    force_kill_rhis_leftovers || true
 
     local vm
     local -a demo_vms=("satellite-618" "aap-26" "idm")
@@ -2452,6 +2769,31 @@ demokill_cleanup() {
     sudo virsh net-autostart external >/dev/null 2>&1 || true
     sudo virsh net-start internal >/dev/null 2>&1 || true
     sudo virsh net-autostart internal >/dev/null 2>&1 || true
+
+    print_step "Reconnecting qemu/kvm session"
+    if sudo virsh -c qemu:///system list --all >/dev/null 2>&1; then
+        print_success "qemu/kvm reconnected (qemu:///system reachable)"
+    else
+        print_warning "Initial qemu/kvm reconnect check failed; retrying after virtqemud/libvirtd refresh"
+        sudo systemctl restart virtqemud >/dev/null 2>&1 || true
+        sudo systemctl restart libvirtd >/dev/null 2>&1 || true
+        if sudo virsh -c qemu:///system list --all >/dev/null 2>&1; then
+            print_success "qemu/kvm reconnected after service refresh"
+        else
+            print_warning "qemu/kvm reconnect still failed; check 'sudo systemctl status libvirtd virtqemud'"
+        fi
+    fi
+
+    print_step "Restarting virt-manager session"
+    pkill -f "virt-manager" >/dev/null 2>&1 || true
+    sleep 1
+    if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        nohup virt-manager >/dev/null 2>&1 &
+        disown || true
+        print_success "virt-manager restarted"
+    else
+        print_warning "No desktop session detected; virt-manager not auto-started"
+    fi
 
     print_success "DEMOKILL complete. Demo VMs/files and RHIS temp artifacts removed; libvirtd restarted."
 }
@@ -2539,7 +2881,7 @@ create_rhis_vms() {
     # The VM will curl it from there during %post via the HTTP server below.
     preflight_download_aap_bundle || print_warning "AAP bundle preflight skipped. Ensure aap-bundle.tar.gz is in ${AAP_BUNDLE_DIR} before the VM runs %post."
 
-    create_vm_if_missing "satellite-618" "${VM_DIR}/satellite-618.qcow2" "$sat_disk" "$sat_ram" "$sat_vcpu" "${KS_DIR}/satellite-618.ks" "hd:LABEL=OEMDRV:/ks.cfg"
+    create_vm_if_missing "satellite-618" "${VM_DIR}/satellite-618.qcow2" "$sat_disk" "$sat_ram" "$sat_vcpu" "${KS_DIR}/satellite-618.ks" "hd:LABEL=OEMDRV:/ks.cfg" || return 1
 
     # Start the HTTP server before the AAP VM boots so the bundle is available
     # when anaconda runs %post.
@@ -2547,7 +2889,14 @@ create_rhis_vms() {
         serve_aap_bundle || print_warning "Could not start AAP bundle HTTP server; AAP %post bundle download will fail."
     fi
 
-    create_vm_if_missing "aap-26"        "${VM_DIR}/aap-26.qcow2"        "$aap_disk" "$aap_ram" "$aap_vcpu" "${KS_DIR}/aap-26.ks"
+    create_vm_if_missing "aap-26"        "${VM_DIR}/aap-26.qcow2"        "$aap_disk" "$aap_ram" "$aap_vcpu" "${KS_DIR}/aap-26.ks" || return 1
+
+    # Create IdM immediately after AAP VM request, before any long AAP callback wait.
+    create_vm_if_missing "idm"           "${VM_DIR}/idm.qcow2"           "$idm_disk" "$idm_ram" "$idm_vcpu" "${KS_DIR}/idm.ks" || return 1
+
+    if ! is_noninteractive; then
+        launch_vm_console_monitors_auto || true
+    fi
 
     # Post-boot callback orchestration: wait for AAP VM to boot, then run setup.sh remotely via SSH
     if [ "${AAP_HTTP_PID}" -gt 0 ] 2>/dev/null; then
@@ -2569,7 +2918,29 @@ create_rhis_vms() {
         close_aap_bundle_firewall
     fi
 
-    create_vm_if_missing "idm"           "${VM_DIR}/idm.qcow2"           "$idm_disk" "$idm_ram" "$idm_vcpu" "${KS_DIR}/idm.ks"
+    ensure_rhis_vms_powered_on
+}
+
+ensure_rhis_vms_powered_on() {
+    local vm state
+    local -a vms=("satellite-618" "aap-26" "idm")
+
+    print_step "Ensuring Satellite/AAP/IdM are ON and autostart-enabled"
+    for vm in "${vms[@]}"; do
+        if ! sudo virsh dominfo "$vm" >/dev/null 2>&1; then
+            print_warning "VM not defined (skipping power policy): $vm"
+            continue
+        fi
+
+        sudo virsh autostart "$vm" >/dev/null 2>&1 || true
+        state="$(sudo virsh domstate "$vm" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [ "$state" != "running" ]; then
+            print_step "Starting VM: $vm"
+            sudo virsh start "$vm" >/dev/null 2>&1 || true
+        fi
+        state="$(sudo virsh domstate "$vm" 2>/dev/null | tr -d '[:space:]' || true)"
+        print_step "VM state: $vm => ${state:-unknown}"
+    done
 }
 
 setup_virt_manager() {
@@ -2658,7 +3029,7 @@ main() {
             6) generate_satellite_oemdrv_only ;;
             0) print_success "Exiting installation script"; exit 0 ;;
             8) demokill_cleanup ;;
-            *) print_warning "Invalid choice. Please select 0-6." ;;
+        *) print_warning "Invalid choice. Please select 0-6." ;;
 		esac
 
         if is_noninteractive || [ "${RUN_ONCE:-0}" = "1" ]; then
