@@ -379,13 +379,8 @@ set_or_prompt_optional() {
     local prompt_text="$2"
     local is_secret="${3:-0}"
     local prompt_value
-    local lower_prompt prompt_label
-
-    lower_prompt="$(printf '%s' "$prompt_text" | tr '[:upper:]' '[:lower:]')"
+    local prompt_label
     prompt_label="$prompt_text"
-    if [[ "$lower_prompt" != *"optional"* ]] && [[ "$lower_prompt" != *"required"* ]]; then
-        prompt_label="${prompt_text} [Optional]"
-    fi
 
     if [ -n "${!var_name:-}" ]; then
         return 0
@@ -413,17 +408,8 @@ prompt_with_default() {
     local is_secret="${4:-0}"
     local is_required="${5:-0}"
     local input_value=""
-    local prompt_with_meta lower_prompt
-
-    lower_prompt="$(printf '%s' "$prompt_label" | tr '[:upper:]' '[:lower:]')"
+    local prompt_with_meta
     prompt_with_meta="$prompt_label"
-    if [[ "$lower_prompt" != *"optional"* ]] && [[ "$lower_prompt" != *"required"* ]]; then
-        if [ "$is_required" = "1" ]; then
-            prompt_with_meta="${prompt_label} [Required]"
-        else
-            prompt_with_meta="${prompt_label} [Optional]"
-        fi
-    fi
 
     if is_noninteractive; then
         if [ -n "${!var_name:-}" ] && ! is_unresolved_template_value "${!var_name:-}"; then
@@ -1100,6 +1086,7 @@ prompt_all_env_options_once() {
     local env_changed=0
     local global_missing sat_missing aap_missing idm_missing
     local has_env_file=0
+    local realm_default
     [ -f "$ANSIBLE_ENV_FILE" ] && has_env_file=1
 
     if [ "$has_env_file" -eq 1 ] && [ "${FORCE_PROMPT_ALL:-0}" != "1" ]; then
@@ -1125,7 +1112,8 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
         if [ -z "${REALM:-}" ]; then
-            prompt_with_default REALM "Shared Kerberos Realm (blank=DOMAIN uppercased)" "${REALM:-}" 0 0 || return 1
+            realm_default="$(to_upper "${DOMAIN:-example.com}")"
+            prompt_with_default REALM "Shared Kerberos Realm" "${REALM:-$realm_default}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${NETMASK:-}" ]; then
@@ -1149,7 +1137,7 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
         if [ -z "${RH_ACCESS_TOKEN:-}" ]; then
-            prompt_with_default RH_ACCESS_TOKEN "Red Hat Access Token (optional)" "${RH_ACCESS_TOKEN:-}" 1 0 || return 1
+            prompt_with_default RH_ACCESS_TOKEN "Red Hat Access Token" "${RH_ACCESS_TOKEN:-}" 1 1 || return 1
             env_changed=1
         fi
         if [ -z "${HUB_TOKEN:-}" ]; then
@@ -1239,6 +1227,14 @@ prompt_all_env_options_once() {
 
     if [ "$has_env_file" -eq 1 ] && [ "${FORCE_PROMPT_ALL:-0}" = "1" ]; then
         print_step "Reconfigure mode: prompting for all values (press Enter to keep current defaults)"
+        # In reconfigure mode, sensitive values should be re-entered explicitly.
+        RH_USER=""
+        RH_PASS=""
+        RH_OFFLINE_TOKEN=""
+        RH_ACCESS_TOKEN=""
+        HUB_TOKEN=""
+        RH_ISO_URL=""
+        AAP_BUNDLE_URL=""
     fi
 
     print_step "First run detected: collecting environment values and storing them in ansible-vault"
@@ -1250,14 +1246,15 @@ prompt_all_env_options_once() {
     prompt_with_default ADMIN_USER "Shared Admin Username" "${ADMIN_USER:-admin}" 0 1 || return 1
     prompt_with_default ADMIN_PASS "Shared Admin Password" "${ADMIN_PASS:-r3dh4t7!}" 1 1 || return 1
     prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-example.com}" 0 1 || return 1
-    prompt_with_default REALM "Shared Kerberos Realm (blank=DOMAIN uppercased)" "${REALM:-}" 0 0 || return 1
+    realm_default="$(to_upper "${DOMAIN:-example.com}")"
+    prompt_with_default REALM "Shared Kerberos Realm" "${REALM:-$realm_default}" 0 1 || return 1
     prompt_with_default NETMASK "Shared Internal Netmask" "${NETMASK:-255.255.0.0}" 0 1 || return 1
     prompt_with_default INTERNAL_GW "Shared Internal Gateway" "${INTERNAL_GW:-0.0.0.0}" 0 1 || return 1
 
     prompt_with_default RH_USER "Red Hat CDN Username" "${RH_USER:-}" 0 1 || return 1
     prompt_with_default RH_PASS "Red Hat CDN Password" "${RH_PASS:-}" 1 1 || return 1
     prompt_with_default RH_OFFLINE_TOKEN "Red Hat Offline Token" "${RH_OFFLINE_TOKEN:-}" 1 1 || return 1
-    prompt_with_default RH_ACCESS_TOKEN "Red Hat Access Token (optional)" "${RH_ACCESS_TOKEN:-}" 1 0 || return 1
+    prompt_with_default RH_ACCESS_TOKEN "Red Hat Access Token" "${RH_ACCESS_TOKEN:-}" 1 1 || return 1
     prompt_with_default HUB_TOKEN "Automation Hub token" "${HUB_TOKEN:-}" 1 1 || return 1
     prompt_with_default RH_ISO_URL "RHEL ISO URL" "${RH_ISO_URL:-}" 0 1 || return 1
 
@@ -1796,6 +1793,9 @@ reboot
 keyboard us
 lang en_US.UTF-8
 
+rootpw --plaintext "${ADMIN_PASS}"
+user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
+
 network --bootproto=dhcp --device=eth0 --activate --onboot=yes
 network --bootproto=static --device=eth1 --ip=${SAT_IP} --netmask=${SAT_NETMASK} --gateway=${SAT_GW} --activate --onboot=yes --hostname=${SAT_HOSTNAME}
 
@@ -1809,6 +1809,7 @@ HEADER
 # Requirements: 8 vCPU, 24 GB RAM, 100 GB raw storage
 zerombr
 clearpart --all --initlabel
+part biosboot --fstype="biosboot" --size=1
 part /boot --fstype="xfs"  --size=2048
 part swap                   --size=18432
 part /     --fstype="xfs"  --grow --size=1
@@ -1821,6 +1822,7 @@ DEMO_PART
 # Requirements: 8 vCPU, 32 GB RAM, 75 GB raw storage minimum
 zerombr
 clearpart --all --initlabel
+part biosboot --fstype="biosboot" --size=1
 part /boot --fstype="xfs" --size=2048
 part swap  --size=24000
 part pv.01 --grow --size=1
@@ -1969,6 +1971,9 @@ reboot
 keyboard us
 lang en_US.UTF-8
 
+rootpw --plaintext "${ADMIN_PASS}"
+user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
+
 network --bootproto=dhcp --device=eth0 --activate --onboot=yes
 network --bootproto=static --device=eth1 --ip=${AAP_IP} --netmask=${AAP_NETMASK} --gateway=${AAP_GW} --activate --onboot=yes --hostname=${AAP_HOSTNAME}
 
@@ -1982,6 +1987,7 @@ HEADER
 # Requirements: 4 vCPU, 8152 MB RAM, 50 GB raw storage
 zerombr
 clearpart --all --initlabel
+part biosboot --fstype="biosboot" --size=1
 part /boot --fstype="xfs"  --size=2048
 part swap                   --size=10240
 part /     --fstype="xfs"  --grow --size=1
@@ -1994,6 +2000,7 @@ DEMO_PART
 # Requirements: 8 vCPU, 16 GB RAM, 50 GB raw storage minimum
 zerombr
 clearpart --all --initlabel
+part biosboot --fstype="biosboot" --size=1
 part /boot --fstype="xfs" --size=2048
 part swap  --size=16384
 part pv.01 --grow --size=1
@@ -2157,6 +2164,9 @@ reboot
 keyboard us
 lang en_US.UTF-8
 
+rootpw --plaintext "${ADMIN_PASS}"
+user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
+
 network --bootproto=dhcp --device=eth0 --activate --onboot=yes
 HEADER
 
@@ -2174,6 +2184,7 @@ NET
 # Requirements: 2 vCPU, 4 GB RAM, 30 GB raw storage
 zerombr
 clearpart --all --initlabel
+part biosboot --fstype="biosboot" --size=1
 part /boot --fstype="xfs"  --size=2048
 part swap                   --size=4096
 part /     --fstype="xfs"  --grow --size=1
@@ -2186,6 +2197,7 @@ DEMO_PART
 # Requirements: 4 vCPU, 16 GB RAM, 60 GB raw storage minimum
 zerombr
 clearpart --all --initlabel
+part biosboot --fstype="biosboot" --size=1
 part /boot --fstype="xfs" --size=2048
 part swap  --size=8192
 part pv.01 --grow --size=1
