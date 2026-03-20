@@ -20,6 +20,7 @@ The script automates:
 - kickstart generation for Satellite, AAP, and IdM
 - unattended VM creation on libvirt/KVM
 - RHSM registration and repo enablement during kickstart `%post`
+- automatic `rhc connect` in guest `%post` (enabled by default)
 - initial Day-0 bootstrap actions required to continue automated configuration
 
 If you are starting fresh, review:
@@ -102,6 +103,10 @@ Environment toggles:
 
 - `RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY=0` disables auto config-as-code after menu option `2`
 - `RHIS_RETRY_FAILED_PHASES_ONCE=0` disables automatic retry of failed config-as-code phases
+- `RHC_AUTO_CONNECT=0` disables automatic `rhc connect` during guest kickstart `%post`
+- `RHIS_POST_VM_SETTLE_GRACE=<seconds>` guest settle window before SSH preflight (default `300`)
+- `RHIS_INTERNAL_SSH_WARN_GRACE=<seconds>` delay before per-host warning logs (default `600`)
+- `RHIS_INTERNAL_SSH_LOG_EVERY=<seconds>` periodic preflight progress log cadence (default `60`)
 
 ### Command-line options
 
@@ -116,6 +121,7 @@ Environment toggles:
                          --DEMO always forces DEMO-inventory.j2 and skips the submenu.
 --container-config-only  One-shot: start container + run IdM -> Satellite -> AAP
 --attach-consoles        Re-open VM console monitors for Satellite/AAP/IdM
+  --status                 Read-only status snapshot (no provisioning changes)
 --reconfigure            Prompt for all installer values and update env.yml
 --test[=fast|full]       Run a curated non-interactive test sweep and print a summary
 --DEMO|--demo            Use demo sizing/profile for VM specs
@@ -171,6 +177,12 @@ Re-open VM console monitors after boot:
 
 ```bash
 ./run_rhis_install_sequence.sh --attach-consoles
+```
+
+Read-only health/status snapshot (no provisioning changes):
+
+```bash
+./run_rhis_install_sequence.sh --status
 ```
 
 Run a fast noninteractive validation sweep (recommended after `--DEMOKILL`):
@@ -265,8 +277,19 @@ By default, the script uses these internal addresses:
 
 Shared defaults also include:
 
+- `INTERNAL_NETWORK=10.168.0.0`
 - `NETMASK=255.255.0.0`
-- `INTERNAL_GW=0.0.0.0`
+- `INTERNAL_GW=10.168.0.1`
+
+Connectivity defaults also include:
+
+- `RHC_AUTO_CONNECT=1` (attempt `rhc connect` by default on Satellite, AAP, and IdM)
+
+Role aliases (used for hostname-role matching and inventory convenience names):
+
+- `SAT_ALIAS=satellite`
+- `AAP_ALIAS=aap`
+- `IDM_ALIAS=idm`
 
 Adjust these during `--reconfigure` if your environment needs different values.
 
@@ -357,6 +380,9 @@ After provisioning, config-as-code is executed in dependency order:
 2. `Satellite`
 3. `AAP`
 
+The AAP callback/install step is deferred until the AAP phase so foundational
+IdM/Satellite phases can proceed first.
+
 If a phase fails, the script retries only failed phases once by default.
 
 ### Console monitoring during build
@@ -438,6 +464,20 @@ The interactive dashboard now includes:
 - tail of the temporary AAP bundle HTTP log
 - AAP callback log presence
 - Satellite CMDB URL / port status
+
+### Read-only status mode (`--status`)
+
+The script can provide a non-destructive snapshot without provisioning changes:
+
+- runtime configuration summary
+- VM state + internal SSH reachability summary
+- one-shot dashboard snapshot
+
+Use:
+
+```bash
+./run_rhis_install_sequence.sh --status
+```
 
 ### Ports used by the workflow
 

@@ -93,6 +93,7 @@ RHIS_INTERNAL_SSH_WAIT_INTERVAL="${RHIS_INTERNAL_SSH_WAIT_INTERVAL:-10}"
 RHIS_POST_VM_SETTLE_GRACE="${RHIS_POST_VM_SETTLE_GRACE:-300}"
 RHIS_INTERNAL_SSH_WARN_GRACE="${RHIS_INTERNAL_SSH_WARN_GRACE:-600}"
 RHIS_INTERNAL_SSH_LOG_EVERY="${RHIS_INTERNAL_SSH_LOG_EVERY:-60}"
+RHC_AUTO_CONNECT="${RHC_AUTO_CONNECT:-1}"
 
 # Automation Hub + AAP bundle pre-flight HTTP-serve variables
 HUB_TOKEN="${HUB_TOKEN:-}"
@@ -211,6 +212,7 @@ Options:
   --demokill               Destroy demo VMs/files/temp locks and exit (CLI-only)
   (env) RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY=0  Disable auto config after menu option 2
   (env) RHIS_RETRY_FAILED_PHASES_ONCE=0       Disable automatic retry of failed phases
+    (env) RHC_AUTO_CONNECT=0                    Disable automatic rhc connect in guest kickstarts
   --help                   Show this help message
 EOF
 }
@@ -262,6 +264,7 @@ print_runtime_configuration() {
     echo "  RHIS_ANSIBLE_FACT_CACHE_HOST=${RHIS_ANSIBLE_FACT_CACHE_HOST}"
     echo "  AAP_ANSIBLE_LOG=${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
     echo "  RHIS_RETRY_FAILED_PHASES_ONCE=${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
+    echo "  RHC_AUTO_CONNECT=${RHC_AUTO_CONNECT:-1}"
 }
 
 generate_rhis_ansible_cfg() {
@@ -731,6 +734,35 @@ is_enabled() {
             return 1
             ;;
     esac
+}
+
+probe_ssh_endpoint() {
+    local ip="$1"
+    local err
+
+    if timeout 5 ssh \
+        -o BatchMode=yes \
+        -o PreferredAuthentications=none \
+        -o PasswordAuthentication=no \
+        -o PubkeyAuthentication=no \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=3 \
+        "root@${ip}" true >/dev/null 2>&1; then
+        return 0
+    fi
+
+    err="$(timeout 5 ssh \
+        -o BatchMode=yes \
+        -o PreferredAuthentications=none \
+        -o PasswordAuthentication=no \
+        -o PubkeyAuthentication=no \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=3 \
+        "root@${ip}" true 2>&1 || true)"
+
+    printf '%s' "$err" | grep -Eqi 'permission denied|authentication failed|denied \(publickey\)|too many authentication failures'
 }
 
 load_preseed_env() {
@@ -1725,7 +1757,7 @@ run_container_config_only() {
 preflight_config_as_code_targets() {
     local missing_vm=0
     local unreachable_target=0
-    local vm_name vm_state target_ip
+    local vm_name vm_state target_ip configured_ip
     local wait_deadline wait_start now remaining elapsed
     local last_progress_log=0
     local show_detail_logs=0
@@ -1750,12 +1782,40 @@ preflight_config_as_code_targets() {
         return 0
     fi
 
+    discover_vm_ipv4() {
+        local vm="$1"
+        timeout 10 sudo -n virsh domifaddr "$vm" 2>/dev/null \
+            | awk '/ipv4/ {print $4}' \
+            | cut -d/ -f1 \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -1
+    }
+
+    resolve_preflight_ip() {
+        local vm="$1"
+        local configured="$2"
+        local discovered=""
+
+        if probe_ssh_endpoint "$configured"; then
+            printf '%s\n' "$configured"
+            return 0
+        fi
+
+        discovered="$(discover_vm_ipv4 "$vm" || true)"
+        if [ -n "$discovered" ]; then
+            printf '%s\n' "$discovered"
+            return 0
+        fi
+
+        printf '%s\n' "$configured"
+    }
+
     print_step "Preflight: validating RHIS VM state and internal SSH reachability"
     print_step "Preflight targets: ${vm_specs[*]}"
     target_count="${#vm_specs[@]}"
     for spec in "${vm_specs[@]}"; do
         vm_name="${spec%%:*}"
-        target_ip="${spec#*:}"
+        configured_ip="${spec#*:}"
 
         if ! sudo virsh dominfo "$vm_name" >/dev/null 2>&1; then
             missing_vms+=("${vm_name}")
@@ -1771,7 +1831,12 @@ preflight_config_as_code_targets() {
             continue
         fi
 
-        if ! timeout 3 bash -lc "cat < /dev/tcp/${target_ip}/22" >/dev/null 2>&1; then
+        target_ip="$(resolve_preflight_ip "${vm_name}" "${configured_ip}")"
+        if [ "$target_ip" != "$configured_ip" ]; then
+            print_step "Preflight target update: ${vm_name} configured=${configured_ip} discovered=${target_ip}"
+        fi
+
+        if ! probe_ssh_endpoint "$target_ip"; then
             unreachable_target=1
         fi
     done
@@ -1798,8 +1863,9 @@ preflight_config_as_code_targets() {
             all_ready=1
             for spec in "${vm_specs[@]}"; do
                 vm_name="${spec%%:*}"
-                target_ip="${spec#*:}"
-                if timeout 3 bash -lc "cat < /dev/tcp/${target_ip}/22" >/dev/null 2>&1; then
+                configured_ip="${spec#*:}"
+                target_ip="$(resolve_preflight_ip "${vm_name}" "${configured_ip}")"
+                if probe_ssh_endpoint "$target_ip"; then
                     reached=1
                 else
                     reached=0
@@ -1887,7 +1953,7 @@ print_rhis_health_summary() {
             state="undefined"
         fi
 
-        if timeout 2 bash -lc "cat < /dev/tcp/${ip}/22" >/dev/null 2>&1; then
+        if probe_ssh_endpoint "$ip"; then
             echo "  - ${vm} (${ip}) state=${state:-unknown} ssh=up"
         else
             echo "  - ${vm} (${ip}) state=${state:-unknown} ssh=down"
@@ -3096,6 +3162,8 @@ ensure_ssh_keys() {
 preflight_download_aap_bundle() {
     local bundle_dest="${AAP_BUNDLE_DIR}/aap-bundle.tar.gz"
 
+    print_step "AAP bundle host path: ${bundle_dest}"
+
     if [ -f "${bundle_dest}" ]; then
         print_success "AAP bundle already staged: ${bundle_dest}"
         return 0
@@ -3366,6 +3434,8 @@ create_aap_credentials() {
 # completes (signaled via a marker file), then stops automatically.
 serve_aap_bundle() {
     local bundle_dest="${AAP_BUNDLE_DIR}/aap-bundle.tar.gz"
+
+    print_step "AAP bundle file expected for HTTP serving: ${bundle_dest}"
 
     if [ ! -f "${bundle_dest}" ]; then
         print_warning "AAP bundle not found at ${bundle_dest}; HTTP server not started."
@@ -3753,6 +3823,16 @@ register_rhsm() {
 
 register_rhsm
 subscription-manager refresh || true
+
+# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
+if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
+    dnf install -y rhc >/dev/null 2>&1 || true
+    if command -v rhc >/dev/null 2>&1; then
+        if ! rhc status >/dev/null 2>&1; then
+            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
 
 # 3. Repositories
 subscription-manager repos --disable="*"
@@ -4464,6 +4544,19 @@ cat > /etc/hosts <<HOSTS
 {{IDM_IP}} {{IDM_HOSTNAME}} {{IDM_SHORT}}
 HOSTS
 
+# 1.1 SSH baseline for automation and internal preflight
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UseDNS no
+EOF_SSHD
+systemctl enable --now sshd || true
+systemctl restart sshd || true
+firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
+
 # 2. Registration (retry until network/RHSM are reachable)
 register_rhsm() {
     local try
@@ -4478,6 +4571,16 @@ register_rhsm() {
 
 register_rhsm
 subscription-manager refresh || true
+
+# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
+if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
+    dnf install -y rhc >/dev/null 2>&1 || true
+    if command -v rhc >/dev/null 2>&1; then
+        if ! rhc status >/dev/null 2>&1; then
+            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
 
 # 3. Repositories
 subscription-manager repos --disable="*"
@@ -4506,19 +4609,7 @@ if [ ! -x /root/aap-setup/setup.sh ]; then
 fi
 echo "Bundle extracted. Ready for SSH callback." >> /var/log/aap-setup-ready.log
 
-# 4. SSH setup — enable root login and inject host public key for SSH callback
-mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
-PermitRootLogin yes
-PasswordAuthentication yes
-PubkeyAuthentication yes
-UseDNS no
-EOF_SSHD
-systemctl enable --now sshd || true
-systemctl restart sshd || true
-firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-firewall-cmd --reload >/dev/null 2>&1 || true
-
+# 4. SSH callback key injection
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
 cat >> /root/.ssh/authorized_keys <<SSH_KEYS
@@ -4810,6 +4901,16 @@ register_rhsm() {
 
 register_rhsm
 subscription-manager refresh || true
+
+# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
+if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
+    dnf install -y rhc >/dev/null 2>&1 || true
+    if command -v rhc >/dev/null 2>&1; then
+        if ! rhc status >/dev/null 2>&1; then
+            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
 
 # 3. Hostname
 hostnamectl set-hostname "${IDM_HOSTNAME}"
