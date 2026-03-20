@@ -86,6 +86,9 @@ RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY="${RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY:-1}"
 # Retry only failed config-as-code phases once (IdM/Satellite/AAP).
 # Set to 0/false/no/off to disable.
 RHIS_RETRY_FAILED_PHASES_ONCE="${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
+# Internal SSH readiness wait for config-as-code preflight
+RHIS_INTERNAL_SSH_WAIT_TIMEOUT="${RHIS_INTERNAL_SSH_WAIT_TIMEOUT:-1800}"
+RHIS_INTERNAL_SSH_WAIT_INTERVAL="${RHIS_INTERNAL_SSH_WAIT_INTERVAL:-10}"
 
 # Automation Hub + AAP bundle pre-flight HTTP-serve variables
 HUB_TOKEN="${HUB_TOKEN:-}"
@@ -116,6 +119,7 @@ ADMIN_PASS="${ADMIN_PASS:-}"  # loaded from vault; fallback set in normalize_sha
 ROOT_PASS="${ROOT_PASS:-}"
 DOMAIN="${DOMAIN:-}"
 REALM="${REALM:-}"
+INTERNAL_NETWORK="${INTERNAL_NETWORK:-10.168.0.0}"
 NETMASK="${NETMASK:-255.255.0.0}"
 INTERNAL_GW="${INTERNAL_GW:-10.168.0.1}"
 
@@ -126,6 +130,9 @@ IDM_IP="${IDM_IP:-10.168.128.3}"
 SAT_HOSTNAME="${SAT_HOSTNAME:-}"
 AAP_HOSTNAME="${AAP_HOSTNAME:-}"
 IDM_HOSTNAME="${IDM_HOSTNAME:-}"
+SAT_ALIAS="${SAT_ALIAS:-satellite}"
+AAP_ALIAS="${AAP_ALIAS:-aap}"
+IDM_ALIAS="${IDM_ALIAS:-idm}"
 
 # Satellite defaults
 SAT_ORG="${SAT_ORG:-REDHAT}"
@@ -718,6 +725,15 @@ to_upper() {
     printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+derive_gateway_from_network() {
+    local network_addr="${1:-}"
+    if printf '%s' "$network_addr" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        printf '%s\n' "$network_addr" | sed -E 's/\.[0-9]+$/\.1/'
+        return 0
+    fi
+    printf '%s\n' "10.168.0.1"
+}
+
 is_unresolved_template_value() {
     local value="${1:-}"
     case "$value" in
@@ -767,8 +783,9 @@ normalize_shared_env_vars() {
     ADMIN_PASS="${ADMIN_PASS:-r3dh4t7!}"  # fallback only if vault did not supply a value
     ROOT_PASS="${ADMIN_PASS}"
 
+    INTERNAL_NETWORK="${INTERNAL_NETWORK:-10.168.0.0}"
     NETMASK="${NETMASK:-${SAT_NETMASK:-${AAP_NETMASK:-${IDM_NETMASK:-255.255.0.0}}}}"
-    INTERNAL_GW="${INTERNAL_GW:-${SAT_GW:-${AAP_GW:-${IDM_GW:-10.168.0.1}}}}"
+    INTERNAL_GW="${INTERNAL_GW:-${SAT_GW:-${AAP_GW:-${IDM_GW:-$(derive_gateway_from_network "${INTERNAL_NETWORK}")}}}}"
 
     SAT_IP="${SAT_IP:-10.168.128.1}"
     AAP_IP="${AAP_IP:-10.168.128.2}"
@@ -794,6 +811,9 @@ normalize_shared_env_vars() {
     SAT_HOSTNAME="${SAT_HOSTNAME:-satellite-618.${DOMAIN}}"
     AAP_HOSTNAME="${AAP_HOSTNAME:-aap-26.${DOMAIN}}"
     IDM_HOSTNAME="${IDM_HOSTNAME:-idm.${DOMAIN}}"
+    SAT_ALIAS="${SAT_ALIAS:-satellite}"
+    AAP_ALIAS="${AAP_ALIAS:-aap}"
+    IDM_ALIAS="${IDM_ALIAS:-idm}"
 
     SAT_REALM="${SAT_REALM:-$REALM}"
     IDM_REALM="${IDM_REALM:-$REALM}"
@@ -947,9 +967,12 @@ validate_resolved_kickstart_inputs() {
     local failed=0
     local var_name value
     local -a required_vars=(
-        DOMAIN
+        DOMAIN INTERNAL_NETWORK
         SAT_IP AAP_IP IDM_IP
+        SAT_NETMASK AAP_NETMASK IDM_NETMASK
+        SAT_GW AAP_GW IDM_GW
         SAT_HOSTNAME AAP_HOSTNAME IDM_HOSTNAME
+        SAT_ORG SAT_LOC
         RH_USER RH_PASS RH_ISO_URL
         AAP_BUNDLE_URL RH_OFFLINE_TOKEN HUB_TOKEN
     )
@@ -1136,9 +1159,18 @@ reattach_vm_consoles() {
     return 0
 }
 
+get_vm_console_label() {
+    case "$1" in
+        satellite-618) printf '%s\n' "${SAT_HOSTNAME:-satellite-618}" ;;
+        aap-26)        printf '%s\n' "${AAP_HOSTNAME:-aap-26}" ;;
+        idm)           printf '%s\n' "${IDM_HOSTNAME:-idm}" ;;
+        *)             printf '%s\n' "$1" ;;
+    esac
+}
+
 launch_vm_console_monitors_auto() {
     local -a vms=("satellite-618" "aap-26" "idm")
-    local vm launched=0
+    local vm vm_label launched=0
     local term_pid
 
     stop_vm_console_monitors >/dev/null 2>&1 || true
@@ -1153,28 +1185,32 @@ launch_vm_console_monitors_auto() {
     if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
         if command -v gnome-terminal >/dev/null 2>&1; then
             for vm in "${vms[@]}"; do
-                gnome-terminal -- bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                vm_label="$(get_vm_console_label "${vm}")"
+                gnome-terminal --title="${vm_label}" -- bash -lc "printf '\033]0;%s\007' '${vm_label}'; echo '[${vm_label}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm_label}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
                 term_pid=$!
                 echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
             done
             launched=1
         elif command -v x-terminal-emulator >/dev/null 2>&1; then
             for vm in "${vms[@]}"; do
-                x-terminal-emulator -e bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                vm_label="$(get_vm_console_label "${vm}")"
+                x-terminal-emulator -e bash -lc "printf '\033]0;%s\007' '${vm_label}'; echo '[${vm_label}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm_label}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
                 term_pid=$!
                 echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
             done
             launched=1
         elif command -v konsole >/dev/null 2>&1; then
             for vm in "${vms[@]}"; do
-                konsole -e bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                vm_label="$(get_vm_console_label "${vm}")"
+                konsole --title "${vm_label}" -e bash -lc "printf '\033]0;%s\007' '${vm_label}'; echo '[${vm_label}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm_label}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
                 term_pid=$!
                 echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
             done
             launched=1
         elif command -v xterm >/dev/null 2>&1; then
             for vm in "${vms[@]}"; do
-                xterm -e bash -lc "echo '[${vm}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
+                vm_label="$(get_vm_console_label "${vm}")"
+                xterm -T "${vm_label}" -e bash -lc "printf '\033]0;%s\007' '${vm_label}'; echo '[${vm_label}] waiting for VM definition...'; while ! sudo virsh dominfo ${vm} >/dev/null 2>&1; do sleep 5; done; echo '[${vm_label}] connecting virsh console (Ctrl+] to detach)'; sudo virsh console ${vm} || true; exec bash" >/dev/null 2>&1 &
                 term_pid=$!
                 echo "$term_pid" >> "${RHIS_VM_MONITOR_PID_FILE}"
             done
@@ -1189,11 +1225,18 @@ launch_vm_console_monitors_auto() {
 
     # Headless fallback: detached tmux session (non-blocking)
     if command -v tmux >/dev/null 2>&1; then
+        local sat_label aap_label idm_label
+        sat_label="$(get_vm_console_label "satellite-618")"
+        aap_label="$(get_vm_console_label "aap-26")"
+        idm_label="$(get_vm_console_label "idm")"
         tmux has-session -t "$RHIS_VM_MONITOR_SESSION" 2>/dev/null && tmux kill-session -t "$RHIS_VM_MONITOR_SESSION"
-        tmux new-session -d -s "$RHIS_VM_MONITOR_SESSION" "bash -lc 'while ! sudo virsh dominfo satellite-618 >/dev/null 2>&1; do sleep 5; done; sudo virsh console satellite-618 || true'"
-        tmux split-window -h -t "$RHIS_VM_MONITOR_SESSION:0" "bash -lc 'while ! sudo virsh dominfo aap-26 >/dev/null 2>&1; do sleep 5; done; sudo virsh console aap-26 || true'"
-        tmux split-window -v -t "$RHIS_VM_MONITOR_SESSION:0.0" "bash -lc 'while ! sudo virsh dominfo idm >/dev/null 2>&1; do sleep 5; done; sudo virsh console idm || true'"
+        tmux new-session -d -s "$RHIS_VM_MONITOR_SESSION" -n "$sat_label" "bash -lc 'echo [${sat_label}] waiting for VM definition...; while ! sudo virsh dominfo satellite-618 >/dev/null 2>&1; do sleep 5; done; echo [${sat_label}] connecting virsh console \(Ctrl+\] to detach\); sudo virsh console satellite-618 || true'"
+        tmux split-window -h -t "$RHIS_VM_MONITOR_SESSION:0" "bash -lc 'echo [${aap_label}] waiting for VM definition...; while ! sudo virsh dominfo aap-26 >/dev/null 2>&1; do sleep 5; done; echo [${aap_label}] connecting virsh console \(Ctrl+\] to detach\); sudo virsh console aap-26 || true'"
+        tmux split-window -v -t "$RHIS_VM_MONITOR_SESSION:0.0" "bash -lc 'echo [${idm_label}] waiting for VM definition...; while ! sudo virsh dominfo idm >/dev/null 2>&1; do sleep 5; done; echo [${idm_label}] connecting virsh console \(Ctrl+\] to detach\); sudo virsh console idm || true'"
         tmux select-layout -t "$RHIS_VM_MONITOR_SESSION:0" tiled >/dev/null 2>&1 || true
+        tmux select-pane -t "$RHIS_VM_MONITOR_SESSION:0.0" -T "$sat_label" >/dev/null 2>&1 || true
+        tmux select-pane -t "$RHIS_VM_MONITOR_SESSION:0.1" -T "$aap_label" >/dev/null 2>&1 || true
+        tmux select-pane -t "$RHIS_VM_MONITOR_SESSION:0.2" -T "$idm_label" >/dev/null 2>&1 || true
         print_step "No GUI terminal detected. Started tmux console monitor session: $RHIS_VM_MONITOR_SESSION"
         print_step "Attach anytime with: tmux attach -t $RHIS_VM_MONITOR_SESSION"
         return 0
@@ -1408,22 +1451,39 @@ configure_libvirt_networks() {
         sudo virsh net-start external >/dev/null 2>&1 || true
         sudo virsh net-autostart external
     else
-        print_warning "Network 'default' not found; skipping rename to 'external'."
-        if sudo virsh net-info external >/dev/null 2>&1; then
-            sudo virsh net-start external >/dev/null 2>&1 || true
-            sudo virsh net-autostart external
-        fi
+                print_warning "Network 'default' not found; creating/ensuring network 'external'."
+                if ! sudo virsh net-info external >/dev/null 2>&1; then
+                        print_step "Creating network: external (NAT/DHCP fallback for first guest interface)"
+                        cat <<'EOF' | sudo tee /tmp/external.xml >/dev/null
+<network>
+    <name>external</name>
+    <forward mode='nat'/>
+    <bridge name='virbr-external' stp='on' delay='0'/>
+    <ip address='192.168.122.1' netmask='255.255.255.0'>
+        <dhcp>
+            <range start='192.168.122.2' end='192.168.122.254'/>
+        </dhcp>
+    </ip>
+</network>
+EOF
+                        sudo virsh net-define /tmp/external.xml
+                else
+                        print_step "Network 'external' already exists"
+                fi
+
+                sudo virsh net-start external >/dev/null 2>&1 || true
+                sudo virsh net-autostart external
     fi
 
-    # Create internal static network 10.168.0.0/16 with no DHCP
+        # Create internal static network with no DHCP
     if ! sudo virsh net-info internal >/dev/null 2>&1; then
-        print_step "Creating network: internal (10.168.0.0/16, static, no DHCP)"
-        cat <<'EOF' | sudo tee /tmp/internal.xml >/dev/null
+                print_step "Creating network: internal (${INTERNAL_NETWORK}/${NETMASK}, static, no DHCP)"
+                cat <<EOF | sudo tee /tmp/internal.xml >/dev/null
 <network>
   <name>internal</name>
   <bridge name='virbr-internal' stp='on' delay='0'/>
   <dns enable='no'/>
-  <ip address='10.168.0.1' netmask='255.255.0.0'/>
+    <ip address='${INTERNAL_GW}' netmask='${NETMASK}'/>
 </network>
 EOF
         sudo virsh net-define /tmp/internal.xml
@@ -1644,11 +1704,19 @@ preflight_config_as_code_targets() {
     local missing_vm=0
     local unreachable_target=0
     local vm_name vm_state target_ip
-    local -a vm_specs=(
-        "satellite-618:${SAT_IP}"
-        "aap-26:${AAP_IP}"
-        "idm:${IDM_IP}"
-    )
+    local wait_deadline now remaining
+    local all_ready reached
+    local -a vm_specs
+
+    if [ "$#" -gt 0 ]; then
+        vm_specs=("$@")
+    else
+        vm_specs=(
+            "satellite-618:${SAT_IP}"
+            "aap-26:${AAP_IP}"
+            "idm:${IDM_IP}"
+        )
+    fi
 
     if ! command -v virsh >/dev/null 2>&1; then
         print_warning "virsh not found; cannot verify RHIS VM state before config-as-code."
@@ -1656,6 +1724,7 @@ preflight_config_as_code_targets() {
     fi
 
     print_step "Preflight: validating RHIS VM state and internal SSH reachability"
+    print_step "Preflight targets: ${vm_specs[*]}"
     for spec in "${vm_specs[@]}"; do
         vm_name="${spec%%:*}"
         target_ip="${spec#*:}"
@@ -1674,7 +1743,7 @@ preflight_config_as_code_targets() {
         fi
 
         if ! timeout 3 bash -lc "cat < /dev/tcp/${target_ip}/22" >/dev/null 2>&1; then
-            print_warning "Internal SSH is not reachable for ${vm_name} at ${target_ip}:22"
+            print_warning "Internal SSH is not reachable yet for ${vm_name} at ${target_ip}:22"
             unreachable_target=1
         fi
     done
@@ -1686,12 +1755,70 @@ preflight_config_as_code_targets() {
     fi
 
     if [ "$unreachable_target" -ne 0 ]; then
-        print_warning "RHIS VMs exist, but their internal 10.168.0.0/16 network is not reachable yet."
-        print_warning "Rebuild the VMs so the updated kickstarts can apply the corrected internal NIC configuration."
-        return 1
+        print_step "Waiting for internal SSH readiness (timeout=${RHIS_INTERNAL_SSH_WAIT_TIMEOUT}s, interval=${RHIS_INTERNAL_SSH_WAIT_INTERVAL}s)"
+        wait_deadline=$(( $(date +%s) + RHIS_INTERNAL_SSH_WAIT_TIMEOUT ))
+
+        while true; do
+            all_ready=1
+            for spec in "${vm_specs[@]}"; do
+                vm_name="${spec%%:*}"
+                target_ip="${spec#*:}"
+                if timeout 3 bash -lc "cat < /dev/tcp/${target_ip}/22" >/dev/null 2>&1; then
+                    reached=1
+                else
+                    reached=0
+                    all_ready=0
+                fi
+                if [ "$reached" -eq 0 ]; then
+                    print_step "Still waiting: ${vm_name} (${target_ip}:22)"
+                fi
+            done
+
+            if [ "$all_ready" -eq 1 ]; then
+                break
+            fi
+
+            now="$(date +%s)"
+            if [ "$now" -ge "$wait_deadline" ]; then
+                print_warning "RHIS VMs exist, but internal SSH did not become reachable before timeout."
+                print_warning "Check VM console output and network config for the 10.168.0.0/16 interfaces."
+                return 1
+            fi
+
+            remaining=$(( wait_deadline - now ))
+            print_step "Internal SSH still converging; retrying in ${RHIS_INTERNAL_SSH_WAIT_INTERVAL}s (remaining ~${remaining}s)"
+            sleep "$RHIS_INTERNAL_SSH_WAIT_INTERVAL"
+        done
     fi
 
     print_success "Preflight passed: RHIS VMs are running and reachable on the internal network."
+    return 0
+}
+
+run_deferred_aap_callback() {
+    if ! [ "${AAP_HTTP_PID:-0}" -gt 0 ] 2>/dev/null; then
+        return 0
+    fi
+
+    AAP_SSH_CALLBACK_ENABLED=1
+    print_step "AAP VM is installing. SSH callback will begin as soon as the VM is reachable."
+    print_step "  You can monitor progress: sudo virsh console aap-26   (Ctrl+] to detach)"
+
+    if run_aap_setup_on_vm "aap-26"; then
+        print_success "AAP setup orchestration complete via SSH callback."
+        create_aap_credentials
+    else
+        print_warning "AAP setup failed or timed out. Check ${AAP_SETUP_LOG_LOCAL} for details."
+        AAP_SSH_CALLBACK_ENABLED=0
+        return 1
+    fi
+
+    if kill "${AAP_HTTP_PID}" 2>/dev/null; then
+        print_success "AAP bundle HTTP server stopped (PID ${AAP_HTTP_PID})."
+    fi
+    AAP_HTTP_PID=""
+    close_aap_bundle_firewall
+    AAP_SSH_CALLBACK_ENABLED=0
     return 0
 }
 
@@ -1703,7 +1830,7 @@ generate_rhis_inventory() {
 
     local controller_host
     local template_file
-    local controller_host_e host_int_ip_e installer_user_e sat_host_e sat_ip_e aap_host_e aap_ip_e idm_host_e idm_ip_e admin_user_e
+    local controller_host_e host_int_ip_e installer_user_e sat_host_e sat_alias_e sat_ip_e aap_host_e aap_alias_e aap_ip_e idm_host_e idm_alias_e idm_ip_e admin_user_e
     controller_host="$(hostname -f 2>/dev/null || hostname)"
 
     template_file="${RHIS_INVENTORY_DIR}/hosts.SAMPLE"
@@ -1711,10 +1838,13 @@ generate_rhis_inventory() {
     host_int_ip_e="$(sed_escape_replacement "${HOST_INT_IP:-192.168.122.1}")"
     installer_user_e="$(sed_escape_replacement "${INSTALLER_USER:-${USER}}")"
     sat_host_e="$(sed_escape_replacement "${SAT_HOSTNAME:-satellite}")"
+    sat_alias_e="$(sed_escape_replacement "${SAT_ALIAS:-satellite}")"
     sat_ip_e="$(sed_escape_replacement "${SAT_IP:-10.168.128.1}")"
     aap_host_e="$(sed_escape_replacement "${AAP_HOSTNAME:-aap}")"
+    aap_alias_e="$(sed_escape_replacement "${AAP_ALIAS:-aap}")"
     aap_ip_e="$(sed_escape_replacement "${AAP_IP:-10.168.128.2}")"
     idm_host_e="$(sed_escape_replacement "${IDM_HOSTNAME:-idm}")"
+    idm_alias_e="$(sed_escape_replacement "${IDM_ALIAS:-idm}")"
     idm_ip_e="$(sed_escape_replacement "${IDM_IP:-10.168.128.3}")"
     admin_user_e="$(sed_escape_replacement "${ADMIN_USER:-admin}")"
 
@@ -1724,10 +1854,13 @@ generate_rhis_inventory() {
             -e "s|{{HOST_INT_IP}}|${host_int_ip_e}|g" \
             -e "s|{{INSTALLER_USER}}|${installer_user_e}|g" \
             -e "s|{{SAT_HOSTNAME}}|${sat_host_e}|g" \
+            -e "s|{{SAT_ALIAS}}|${sat_alias_e}|g" \
             -e "s|{{SAT_IP}}|${sat_ip_e}|g" \
             -e "s|{{AAP_HOSTNAME}}|${aap_host_e}|g" \
+            -e "s|{{AAP_ALIAS}}|${aap_alias_e}|g" \
             -e "s|{{AAP_IP}}|${aap_ip_e}|g" \
             -e "s|{{IDM_HOSTNAME}}|${idm_host_e}|g" \
+            -e "s|{{IDM_ALIAS}}|${idm_alias_e}|g" \
             -e "s|{{IDM_IP}}|${idm_ip_e}|g" \
             -e "s|{{ADMIN_USER}}|${admin_user_e}|g" \
             "${template_file}" > "${RHIS_INVENTORY_DIR}/hosts"
@@ -1747,12 +1880,14 @@ ${controller_host} ansible_host=${HOST_INT_IP:-192.168.122.1} ansible_user=${INS
 
 [scenario_satellite]
 ${SAT_HOSTNAME:-satellite} ansible_host=${SAT_IP:-10.168.128.1} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${SAT_ALIAS:-satellite} ansible_host=${SAT_IP:-10.168.128.1} ansible_user=${ADMIN_USER:-admin} ansible_become=true
 
 [sat_primary:children]
 scenario_satellite
 
 [aap]
 ${AAP_HOSTNAME:-aap} ansible_host=${AAP_IP:-10.168.128.2} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${AAP_ALIAS:-aap} ansible_host=${AAP_IP:-10.168.128.2} ansible_user=${ADMIN_USER:-admin} ansible_become=true
 
 [aap_hosts:children]
 aap
@@ -1762,6 +1897,7 @@ aap
 
 [idm]
 ${IDM_HOSTNAME:-idm} ansible_host=${IDM_IP:-10.168.128.3} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${IDM_ALIAS:-idm} ansible_host=${IDM_IP:-10.168.128.3} ansible_user=${ADMIN_USER:-admin} ansible_become=true
 
 [idm_primary:children]
 idm
@@ -1887,7 +2023,8 @@ run_rhis_config_as_code() {
     normalize_shared_env_vars
     generate_rhis_inventory     || { print_warning "Inventory generation failed; skipping config-as-code."; return 1; }
     generate_rhis_host_vars     || { print_warning "host_vars generation failed; skipping config-as-code."; return 1; }
-    preflight_config_as_code_targets || return 1
+    print_step "Phase gate: waiting only for IdM and Satellite so foundational services can proceed first"
+    preflight_config_as_code_targets "idm:${IDM_IP}" "satellite-618:${SAT_IP}" || return 1
 
     # Pull latest image and ensure container is running with fresh mounts
     print_step "Ensuring RHIS provisioner container is running..."
@@ -2011,7 +2148,16 @@ run_rhis_config_as_code() {
     fi
 
     # ── 3. AAP ─────────────────────────────────────────────────────────────────
-    if ! run_phase_playbook "Phase 3/3 — Configuring AAP..." "aap" "/rhis/rhis-builder-aap/main.yml"; then
+    print_step "Phase gate: starting deferred AAP callback and readiness checks"
+    if ! run_deferred_aap_callback; then
+        aap_status="callback-failed"
+        any_failed=1
+        print_warning "AAP callback did not complete; skipping AAP config-as-code phase."
+    elif ! preflight_config_as_code_targets "aap-26:${AAP_IP}"; then
+        aap_status="ssh-unreachable"
+        any_failed=1
+        print_warning "AAP internal SSH is still not reachable; skipping AAP config-as-code phase."
+    elif ! run_phase_playbook "Phase 3/3 — Configuring AAP..." "aap" "/rhis/rhis-builder-aap/main.yml"; then
         aap_status="failed"
         any_failed=1
         print_warning "AAP config-as-code failed.  Check the output above."
@@ -2303,6 +2449,7 @@ load_ansible_env_file() {
     _load_env_key ADMIN_PASS      admin_pass
     _load_env_key DOMAIN          domain
     _load_env_key REALM           realm
+    _load_env_key INTERNAL_NETWORK internal_network
     _load_env_key NETMASK         netmask
     _load_env_key INTERNAL_GW     internal_gw
     _load_env_key RH_USER          rh_user
@@ -2327,12 +2474,15 @@ load_ansible_env_file() {
     _load_env_key AAP_GW           aap_gw
     _load_env_key IDM_GW           idm_gw
     _load_env_key SAT_HOSTNAME     sat_hostname
+    _load_env_key SAT_ALIAS        sat_alias
     _load_env_key SAT_DOMAIN       sat_domain
     _load_env_key SAT_ORG          sat_org
     _load_env_key SAT_LOC          sat_loc
     _load_env_key AAP_HOSTNAME     aap_hostname
+    _load_env_key AAP_ALIAS        aap_alias
     _load_env_key AAP_DOMAIN       aap_domain
     _load_env_key IDM_HOSTNAME     idm_hostname
+    _load_env_key IDM_ALIAS        idm_alias
     _load_env_key IDM_DOMAIN       idm_domain
     _load_env_key IDM_REALM        idm_realm
     _load_env_key IDM_ADMIN_PASS   idm_admin_pass
@@ -2360,6 +2510,7 @@ admin_user: "${ADMIN_USER:-}"
 admin_pass: "${ADMIN_PASS:-}"
 domain: "${DOMAIN:-}"
 realm: "${REALM:-}"
+internal_network: "${INTERNAL_NETWORK:-}"
 netmask: "${NETMASK:-}"
 internal_gw: "${INTERNAL_GW:-}"
 rh_user: "${RH_USER:-}"
@@ -2382,15 +2533,18 @@ sat_ip: "${SAT_IP:-}"
 sat_netmask: "${SAT_NETMASK:-}"
 sat_gw: "${SAT_GW:-}"
 sat_hostname: "${SAT_HOSTNAME:-}"
+sat_alias: "${SAT_ALIAS:-}"
 sat_domain: "${SAT_DOMAIN:-}"
 sat_realm: "${SAT_REALM:-}"
 sat_org: "${SAT_ORG:-}"
 sat_loc: "${SAT_LOC:-}"
 aap_hostname: "${AAP_HOSTNAME:-}"
+aap_alias: "${AAP_ALIAS:-}"
 aap_domain: "${AAP_DOMAIN:-}"
 aap_netmask: "${AAP_NETMASK:-}"
 aap_gw: "${AAP_GW:-}"
 idm_hostname: "${IDM_HOSTNAME:-}"
+idm_alias: "${IDM_ALIAS:-}"
 idm_domain: "${IDM_DOMAIN:-}"
 idm_realm: "${IDM_REALM:-}"
 idm_admin_pass: "${IDM_ADMIN_PASS:-}"
@@ -2427,9 +2581,9 @@ prompt_all_env_options_once() {
             return 0
         fi
 
-        global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL)"
+        global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM INTERNAL_NETWORK NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL)"
         echo ""
-        echo "=== Global (remaining missing: ${global_missing}/12) ==="
+        echo "=== Global (remaining missing: ${global_missing}/13) ==="
         if [ -z "${ADMIN_USER:-}" ]; then
             prompt_with_default ADMIN_USER "Shared Admin Username" "${ADMIN_USER:-admin}" 0 1 || return 1
             env_changed=1
@@ -2447,12 +2601,16 @@ prompt_all_env_options_once() {
             prompt_with_default REALM "Shared Kerberos Realm" "${REALM:-$realm_default}" 0 1 || return 1
             env_changed=1
         fi
+        if [ -z "${INTERNAL_NETWORK:-}" ]; then
+            prompt_with_default INTERNAL_NETWORK "Shared Internal Network" "${INTERNAL_NETWORK:-10.168.0.0}" 0 1 || return 1
+            env_changed=1
+        fi
         if [ -z "${NETMASK:-}" ]; then
             prompt_with_default NETMASK "Shared Internal Netmask" "${NETMASK:-255.255.0.0}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${INTERNAL_GW:-}" ]; then
-            prompt_with_default INTERNAL_GW "Shared Internal Gateway" "${INTERNAL_GW:-10.168.0.1}" 0 1 || return 1
+            prompt_with_default INTERNAL_GW "Shared Internal Gateway" "${INTERNAL_GW:-$(derive_gateway_from_network "${INTERNAL_NETWORK:-10.168.0.0}")}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${RH_USER:-}" ]; then
@@ -2480,15 +2638,31 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
 
-        sat_missing="$(count_missing_vars SAT_IP SAT_HOSTNAME SAT_ORG SAT_LOC)"
+        sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC)"
         echo ""
-        echo "=== Satellite (remaining missing: ${sat_missing}/4) ==="
+        echo "=== Satellite (remaining missing: ${sat_missing}/8) ==="
         if [ -z "${SAT_IP:-}" ]; then
             prompt_with_default SAT_IP "Satellite Internal IP (eth1)" "${SAT_IP:-10.168.128.1}" 0 1 || return 1
             env_changed=1
         fi
+        if [ -z "${SAT_NETMASK:-}" ]; then
+            prompt_with_default SAT_NETMASK "Satellite Internal Netmask" "${SAT_NETMASK:-$NETMASK}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${SAT_GW:-}" ]; then
+            prompt_with_default SAT_GW "Satellite Internal Gateway" "${SAT_GW:-$INTERNAL_GW}" 0 1 || return 1
+            env_changed=1
+        fi
         if needs_prompt_var SAT_HOSTNAME; then
             prompt_with_default SAT_HOSTNAME "Satellite Hostname (FQDN)" "${SAT_HOSTNAME:-satellite-618.${DOMAIN}}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${SAT_ALIAS:-}" ]; then
+            prompt_with_default SAT_ALIAS "Satellite Alias" "${SAT_ALIAS:-satellite}" 0 1 || return 1
+            env_changed=1
+        fi
+        if needs_prompt_var SAT_DOMAIN; then
+            prompt_with_default SAT_DOMAIN "Satellite Domain" "${SAT_DOMAIN:-$DOMAIN}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${SAT_ORG:-}" ]; then
@@ -2501,15 +2675,23 @@ prompt_all_env_options_once() {
         fi
         SAT_ADMIN_PASS="${ADMIN_PASS}"
 
-        aap_missing="$(count_missing_vars AAP_IP AAP_HOSTNAME AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
+        aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
         echo ""
-        echo "=== AAP (remaining missing: ${aap_missing}/5) ==="
+        echo "=== AAP (remaining missing: ${aap_missing}/7) ==="
         if [ -z "${AAP_IP:-}" ]; then
             prompt_with_default AAP_IP "AAP Internal IP (eth1)" "${AAP_IP:-10.168.128.2}" 0 1 || return 1
             env_changed=1
         fi
+        if [ -z "${AAP_NETMASK:-}" ]; then
+            prompt_with_default AAP_NETMASK "AAP Internal Netmask" "${AAP_NETMASK:-255.255.0.0}" 0 1 || return 1
+            env_changed=1
+        fi
         if needs_prompt_var AAP_HOSTNAME; then
             prompt_with_default AAP_HOSTNAME "AAP Hostname (FQDN)" "${AAP_HOSTNAME:-aap-26.${DOMAIN}}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${AAP_ALIAS:-}" ]; then
+            prompt_with_default AAP_ALIAS "AAP Alias" "${AAP_ALIAS:-aap}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${AAP_BUNDLE_URL:-}" ]; then
@@ -2526,15 +2708,23 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
 
-        idm_missing="$(count_missing_vars IDM_IP IDM_HOSTNAME IDM_DS_PASS)"
+        idm_missing="$(count_missing_vars IDM_IP IDM_NETMASK IDM_HOSTNAME IDM_ALIAS IDM_DS_PASS)"
         echo ""
-        echo "=== IdM (remaining missing: ${idm_missing}/3) ==="
+        echo "=== IdM (remaining missing: ${idm_missing}/5) ==="
         if [ -z "${IDM_IP:-}" ]; then
             prompt_with_default IDM_IP "IdM Internal IP (eth1)" "${IDM_IP:-10.168.128.3}" 0 1 || return 1
             env_changed=1
         fi
+        if [ -z "${IDM_NETMASK:-}" ]; then
+            prompt_with_default IDM_NETMASK "IdM Internal Netmask" "${IDM_NETMASK:-255.255.0.0}" 0 1 || return 1
+            env_changed=1
+        fi
         if needs_prompt_var IDM_HOSTNAME; then
             prompt_with_default IDM_HOSTNAME "IdM Hostname (FQDN)" "${IDM_HOSTNAME:-idm.${DOMAIN}}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${IDM_ALIAS:-}" ]; then
+            prompt_with_default IDM_ALIAS "IdM Alias" "${IDM_ALIAS:-idm}" 0 1 || return 1
             env_changed=1
         fi
         IDM_ADMIN_PASS="${ADMIN_PASS}"
@@ -2578,16 +2768,17 @@ prompt_all_env_options_once() {
     print_step "First run detected: collecting environment values and storing them in ansible-vault"
     echo "(Press Enter to accept the shown default where applicable.)"
 
-    global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL)"
+    global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM INTERNAL_NETWORK NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL)"
     echo ""
-    echo "=== Global (remaining missing: ${global_missing}/12) ==="
+    echo "=== Global (remaining missing: ${global_missing}/13) ==="
     prompt_with_default ADMIN_USER "Shared Admin Username" "${ADMIN_USER:-admin}" 0 1 || return 1
     prompt_with_default ADMIN_PASS "Shared Admin Password" "${ADMIN_PASS:-}" 1 1 || return 1
     prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-}" 0 1 || return 1
     realm_default="$(to_upper "${DOMAIN}")"
     prompt_with_default REALM "Shared Kerberos Realm" "${REALM:-$realm_default}" 0 1 || return 1
+    prompt_with_default INTERNAL_NETWORK "Shared Internal Network" "${INTERNAL_NETWORK:-10.168.0.0}" 0 1 || return 1
     prompt_with_default NETMASK "Shared Internal Netmask" "${NETMASK:-255.255.0.0}" 0 1 || return 1
-    prompt_with_default INTERNAL_GW "Shared Internal Gateway" "${INTERNAL_GW:-10.168.0.1}" 0 1 || return 1
+    prompt_with_default INTERNAL_GW "Shared Internal Gateway" "${INTERNAL_GW:-$(derive_gateway_from_network "${INTERNAL_NETWORK:-10.168.0.0}")}" 0 1 || return 1
 
     prompt_with_default RH_USER "Red Hat CDN Username" "${RH_USER:-}" 0 1 || return 1
     prompt_with_default RH_PASS "Red Hat CDN Password" "${RH_PASS:-}" 1 1 || return 1
@@ -2596,30 +2787,38 @@ prompt_all_env_options_once() {
     prompt_with_default HUB_TOKEN "Automation Hub token" "${HUB_TOKEN:-}" 1 1 || return 1
     prompt_with_default RH_ISO_URL "RHEL ISO URL" "${RH_ISO_URL:-}" 0 1 || return 1
 
-    sat_missing="$(count_missing_vars SAT_IP SAT_HOSTNAME SAT_ORG SAT_LOC)"
+    sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC)"
     echo ""
-    echo "=== Satellite (remaining missing: ${sat_missing}/4) ==="
+    echo "=== Satellite (remaining missing: ${sat_missing}/8) ==="
     prompt_with_default SAT_IP "Satellite Internal IP (eth1)" "${SAT_IP:-10.168.128.1}" 0 1 || return 1
+    prompt_with_default SAT_NETMASK "Satellite Internal Netmask" "${SAT_NETMASK:-$NETMASK}" 0 1 || return 1
+    prompt_with_default SAT_GW "Satellite Internal Gateway" "${SAT_GW:-$INTERNAL_GW}" 0 1 || return 1
     prompt_with_default SAT_HOSTNAME "Satellite Hostname (FQDN)" "${SAT_HOSTNAME:-satellite-618.${DOMAIN}}" 0 1 || return 1
+    prompt_with_default SAT_ALIAS "Satellite Alias" "${SAT_ALIAS:-satellite}" 0 1 || return 1
+    prompt_with_default SAT_DOMAIN "Satellite Domain" "${SAT_DOMAIN:-$DOMAIN}" 0 1 || return 1
     prompt_with_default SAT_ORG "Satellite Organization" "${SAT_ORG:-REDHAT}" 0 1 || return 1
     prompt_with_default SAT_LOC "Satellite Location" "${SAT_LOC:-CORE}" 0 1 || return 1
     SAT_ADMIN_PASS="${ADMIN_PASS}"
 
-    aap_missing="$(count_missing_vars AAP_IP AAP_HOSTNAME AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
+    aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
     echo ""
-    echo "=== AAP (remaining missing: ${aap_missing}/5) ==="
+    echo "=== AAP (remaining missing: ${aap_missing}/7) ==="
     prompt_with_default AAP_IP "AAP Internal IP (eth1)" "${AAP_IP:-10.168.128.2}" 0 1 || return 1
+    prompt_with_default AAP_NETMASK "AAP Internal Netmask" "${AAP_NETMASK:-255.255.0.0}" 0 1 || return 1
     prompt_with_default AAP_HOSTNAME "AAP Hostname (FQDN)" "${AAP_HOSTNAME:-aap-26.${DOMAIN}}" 0 1 || return 1
+    prompt_with_default AAP_ALIAS "AAP Alias" "${AAP_ALIAS:-aap}" 0 1 || return 1
     prompt_with_default AAP_BUNDLE_URL "AAP bundle URL" "${AAP_BUNDLE_URL:-}" 0 1 || return 1
     AAP_ADMIN_PASS="${ADMIN_PASS}"
     select_aap_inventory_templates || return 1
     ensure_aap_pg_database_if_needed || return 1
 
-    idm_missing="$(count_missing_vars IDM_IP IDM_HOSTNAME IDM_DS_PASS)"
+    idm_missing="$(count_missing_vars IDM_IP IDM_NETMASK IDM_HOSTNAME IDM_ALIAS IDM_DS_PASS)"
     echo ""
-    echo "=== IdM (remaining missing: ${idm_missing}/3) ==="
+    echo "=== IdM (remaining missing: ${idm_missing}/5) ==="
     prompt_with_default IDM_IP "IdM Internal IP (eth1)" "${IDM_IP:-10.168.128.3}" 0 1 || return 1
+    prompt_with_default IDM_NETMASK "IdM Internal Netmask" "${IDM_NETMASK:-255.255.0.0}" 0 1 || return 1
     prompt_with_default IDM_HOSTNAME "IdM Hostname (FQDN)" "${IDM_HOSTNAME:-idm.${DOMAIN}}" 0 1 || return 1
+    prompt_with_default IDM_ALIAS "IdM Alias" "${IDM_ALIAS:-idm}" 0 1 || return 1
     IDM_ADMIN_PASS="${ADMIN_PASS}"
             prompt_with_default IDM_DS_PASS "IdM Directory Service Password" "${IDM_DS_PASS:-}" 1 1 || return 1
 
@@ -3163,15 +3362,34 @@ get_vm_internal_mac() {
 }
 
 build_internal_kickstart_network_line() {
-    local device_id="$1"
-    local ip_addr="$2"
-    local netmask="$3"
-    local gateway="$4"
-    local hostname="$5"
+    local iface_name="$1"
+    local iface_mac="$2"
+    local ip_addr="$3"
+    local netmask="$4"
+    local gateway="$5"
+    local hostname="$6"
 
-    printf 'network --bootproto=static --device=%s --ip=%s --netmask=%s ' "$device_id" "$ip_addr" "$netmask"
+    printf '%%pre\n'
+    printf 'HOSTNAME=$(hostname)\n'
+    printf 'if [ -z "$HOSTNAME" ] || [ "$HOSTNAME" = "localhost" ]; then\n'
+    printf "    HOSTNAME=$(grep -oP 'hostname=\\K\\S+' /proc/cmdline 2>/dev/null || true)\n"
+    printf 'fi\n'
+    printf 'IP="%s"\n' "$ip_addr"
+    printf 'ROLE_HOSTNAME="%s"\n' "$hostname"
+    printf 'if [[ "$HOSTNAME" == *"%s"* ]] || [[ "$HOSTNAME" == *"%s"* ]]; then\n' "${SAT_ALIAS}" "${SAT_HOSTNAME%%.*}"
+    printf '    IP="%s"\n' "${SAT_IP}"
+    printf '    ROLE_HOSTNAME="%s"\n' "${SAT_HOSTNAME}"
+    printf 'elif [[ "$HOSTNAME" == *"%s"* ]] || [[ "$HOSTNAME" == *"%s"* ]]; then\n' "${AAP_ALIAS}" "${AAP_HOSTNAME%%.*}"
+    printf '    IP="%s"\n' "${AAP_IP}"
+    printf '    ROLE_HOSTNAME="%s"\n' "${AAP_HOSTNAME}"
+    printf 'elif [[ "$HOSTNAME" == *"%s"* ]] || [[ "$HOSTNAME" == *"%s"* ]]; then\n' "${IDM_ALIAS}" "${IDM_HOSTNAME%%.*}"
+    printf '    IP="%s"\n' "${IDM_IP}"
+    printf '    ROLE_HOSTNAME="%s"\n' "${IDM_HOSTNAME}"
+    printf 'fi\n'
+    printf "cat > /tmp/network-eth1 <<EOF_NETWORK_ETH1\n"
+    printf 'network --bootproto=static --device=%s --interfacename=%s:%s --ip=$IP --netmask=%s ' "$iface_name" "$iface_name" "$iface_mac" "$netmask"
     if [ -n "$hostname" ]; then
-        printf -- '--hostname=%s ' "$hostname"
+        printf -- '--hostname=$ROLE_HOSTNAME '
     fi
     if [ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ]; then
         printf -- '--gateway=%s ' "$gateway"
@@ -3179,6 +3397,33 @@ build_internal_kickstart_network_line() {
         printf -- '--nodefroute '
     fi
     printf -- '--activate --onboot=yes\n'
+    printf 'EOF_NETWORK_ETH1\n'
+    printf 'if [ -z "$IP" ]; then\n'
+    printf '    : > /tmp/network-eth1\n'
+    printf 'fi\n'
+    printf '%%end\n\n'
+}
+
+netmask_to_prefix() {
+    local netmask="$1"
+    local prefix=0
+    local octet
+    IFS='.' read -r -a octets <<< "$netmask"
+    for octet in "${octets[@]}"; do
+        case "$octet" in
+            255) prefix=$((prefix + 8)) ;;
+            254) prefix=$((prefix + 7)) ;;
+            252) prefix=$((prefix + 6)) ;;
+            248) prefix=$((prefix + 5)) ;;
+            240) prefix=$((prefix + 4)) ;;
+            224) prefix=$((prefix + 3)) ;;
+            192) prefix=$((prefix + 2)) ;;
+            128) prefix=$((prefix + 1)) ;;
+            0) ;;
+            *) echo "16"; return 0 ;;
+        esac
+    done
+    echo "$prefix"
 }
 
 prompt_satellite_618_details() {
@@ -3195,6 +3440,7 @@ prompt_satellite_618_details() {
 
     echo -e "--- Satellite Identity ---"
     set_or_prompt SAT_HOSTNAME "Hostname (FQDN): " || return 1
+    set_or_prompt SAT_ALIAS "Satellite Alias: " || return 1
     set_or_prompt SAT_DOMAIN "Domain Name: " || return 1
     set_or_prompt SAT_ORG "Organization Name: " || return 1
     set_or_prompt SAT_LOC "Location Name: " || return 1
@@ -3206,6 +3452,7 @@ generate_satellite_618_kickstart() {
     local ks_file="${KS_DIR}/satellite-618.ks"
     local tmpdir tmp_ks tmp_oem
     local sat_ext_mac sat_int_mac
+    local sat_prefix
 
     prompt_satellite_618_details || return 1
     ensure_iso_vars || return 1
@@ -3213,6 +3460,7 @@ generate_satellite_618_kickstart() {
 
     sat_ext_mac="$(get_vm_external_mac "satellite-618")"
     sat_int_mac="$(get_vm_internal_mac "satellite-618")"
+    sat_prefix="$(netmask_to_prefix "${SAT_NETMASK}")"
 
     tmpdir="$(mktemp -d)"
     tmp_ks="${tmpdir}/satellite-618.ks"
@@ -3231,11 +3479,13 @@ bootloader --append="net.ifnames=0 biosdevname=0"
 rootpw --plaintext "${ROOT_PASS}"
 user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
 
-network --bootproto=dhcp --device=${sat_ext_mac} --activate --onboot=yes
+network --bootproto=dhcp --device=eth0 --interfacename=eth0:${sat_ext_mac} --activate --onboot=yes
+
+%include /tmp/network-eth1
 
 HEADER
 
-    build_internal_kickstart_network_line "${sat_int_mac}" "${SAT_IP}" "${SAT_NETMASK}" "${SAT_GW}" "${SAT_HOSTNAME}" >> "$tmp_ks"
+    build_internal_kickstart_network_line "eth1" "${sat_int_mac}" "${SAT_IP}" "${SAT_NETMASK}" "${SAT_GW}" "${SAT_HOSTNAME}" >> "$tmp_ks"
     echo "" >> "$tmp_ks"
 
     # --- Partitioning (DEMO vs production best-practice) ---
@@ -3306,15 +3556,88 @@ PKGS_END
 %post --log=/root/ks-post.log
 set -euxo pipefail
 
-# 0. NetworkManager DNS rotation (dual network: eth0 DHCP + eth1 static)
-echo "[main]" > /etc/NetworkManager/conf.d/dns-rotation.conf
-echo "dns=systemd-resolved" >> /etc/NetworkManager/conf.d/dns-rotation.conf
-echo "rc-manager=auto" >> /etc/NetworkManager/conf.d/dns-rotation.conf
-systemctl restart NetworkManager || true
-sleep 5
-nmcli connection reload || true
+# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
+mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
+rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
 
-# 1. Registration (retry until network/RHSM are reachable)
+cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
+[connection]
+id=eth0
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ethernet]
+mac-address=${sat_ext_mac}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF_NM_ETH0
+
+cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
+[connection]
+id=eth1
+type=ethernet
+interface-name=eth1
+autoconnect=true
+
+[ethernet]
+mac-address=${sat_int_mac}
+
+[ipv4]
+method=manual
+addresses=${SAT_IP}/${sat_prefix}
+gateway=${SAT_GW}
+never-default=false
+
+[ipv6]
+method=ignore
+EOF_NM_ETH1
+
+if [ "${SAT_GW}" = "0.0.0.0" ] || [ -z "${SAT_GW}" ]; then
+    sed -i '/^gateway=/d' /etc/NetworkManager/system-connections/eth1.nmconnection
+    sed -i 's/^never-default=.*/never-default=true/' /etc/NetworkManager/system-connections/eth1.nmconnection
+fi
+
+chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
+
+cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
+[main]
+no-auto-default=${sat_ext_mac},${sat_int_mac}
+EOF_NM_MAIN
+
+systemctl enable NetworkManager || true
+
+# Ensure resolver file exists for registration/DNS lookups
+if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
+    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
+fi
+
+# 1. Local hosts mapping (temporary DNS-independent bootstrap)
+cat > /etc/hosts <<EOF
+127.0.0.1 localhost localhost.localdomain
+${SAT_IP} ${SAT_HOSTNAME} ${SAT_HOSTNAME%%.*}
+${AAP_IP} ${AAP_HOSTNAME} ${AAP_HOSTNAME%%.*}
+${IDM_IP} ${IDM_HOSTNAME} ${IDM_HOSTNAME%%.*}
+EOF
+
+# 1.1 SSH baseline for automation and internal preflight
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UseDNS no
+EOF_SSHD
+systemctl enable --now sshd || true
+systemctl restart sshd || true
+firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
+
+# 2. Registration (retry until network/RHSM are reachable)
 register_rhsm() {
     local try
     for try in \$(seq 1 10); do
@@ -3329,15 +3652,7 @@ register_rhsm() {
 register_rhsm
 subscription-manager refresh || true
 
-# 1.1 Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<EOF
-127.0.0.1 localhost localhost.localdomain
-${SAT_IP} ${SAT_HOSTNAME} ${SAT_HOSTNAME%%.*}
-${AAP_IP} ${AAP_HOSTNAME} ${AAP_HOSTNAME%%.*}
-${IDM_IP} ${IDM_HOSTNAME} ${IDM_HOSTNAME%%.*}
-EOF
-
-# 2. Repositories
+# 3. Repositories
 subscription-manager repos --disable="*"
 subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-10-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-10-x86_64-rpms"
 
@@ -3346,16 +3661,24 @@ for repo in \
     rhel-10-for-x86_64-appstream-rpms \
     satellite-6.18-for-rhel-10-x86_64-rpms \
     satellite-maintenance-6.18-for-rhel-10-x86_64-rpms; do
-    subscription-manager repos --list-enabled | grep -q "\$repo"
+    if ! subscription-manager repos --list-enabled | grep -q "\$repo"; then
+        echo "ERROR: Required Satellite repository not enabled: \$repo"
+        subscription-manager repos --list-enabled || true
+        exit 1
+    fi
 done
 
-# 3. Installation
+# 4. Satellite package installation
 dnf install -y satellite
+if ! rpm -q satellite >/dev/null 2>&1; then
+    echo "ERROR: Satellite package installation verification failed (rpm -q satellite)."
+    exit 1
+fi
 
-# 4. Satellite Installer
+# 5. Satellite Installer
 satellite-installer --scenario satellite --foreman-initial-organization "${SAT_ORG}" --foreman-initial-location "${SAT_LOC}" --foreman-initial-admin-username "${ADMIN_USER}" --foreman-initial-admin-password "${ADMIN_PASS}" --foreman-proxy-dns true --foreman-proxy-dns-interface eth1 --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface eth1 --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --enable-foreman-compute-ec2 --enable-foreman-compute-gce --enable-foreman-compute-azure --enable-foreman-compute-libvirt --enable-foreman-plugin-openscap --enable-foreman-proxy-plugin-openscap --register-with-insights true
 
-# 4.1 RHIS CMDB single-pane dashboard (Satellite + AAP + IdM + RHIS container endpoint)
+# 5.1 RHIS CMDB single-pane dashboard (Satellite + AAP + IdM + RHIS container endpoint)
 dnf install -y python3-pip sshpass
 python3 -m pip install --upgrade pip setuptools wheel || true
 python3 -m pip install ansible-cmdb || true
@@ -3470,6 +3793,15 @@ cat > /etc/sysctl.d/99-rhis-performance.conf <<'EOF'
 vm.swappiness = 10
 EOF
 sysctl -p /etc/sysctl.d/99-rhis-performance.conf || true
+
+# 6. Network verification snapshot (for ks-post.log troubleshooting)
+echo "===== RHIS NETWORK SNAPSHOT ====="
+date
+ip -4 addr show eth0 || true
+ip -4 addr show eth1 || true
+ip route show || true
+nmcli -f NAME,DEVICE,TYPE,STATE connection show || true
+echo "===== END RHIS NETWORK SNAPSHOT ====="
 %end
 POSTEOF
 
@@ -3760,6 +4092,7 @@ select_aap_inventory_templates() {
 
         case "${inv_choice}" in
             0)
+                command -v clear >/dev/null 2>&1 && clear
                 echo "  Exiting inventory selection."
                 return 1
                 ;;
@@ -3839,6 +4172,7 @@ prompt_aap_details() {
     set_or_prompt ADMIN_PASS  "Shared Admin Password: " 1 || return 1
     echo -e "\n--- AAP Identity ---"
     set_or_prompt AAP_HOSTNAME   "AAP Hostname (FQDN): "   || return 1
+    set_or_prompt AAP_ALIAS      "AAP Alias: "             || return 1
     set_or_prompt AAP_IP         "AAP Internal IP (eth1): " || return 1
     set_or_prompt AAP_NETMASK    "AAP Internal Netmask: "   || return 1
     set_or_prompt AAP_GW         "AAP Internal Gateway: "   || return 1
@@ -3861,6 +4195,7 @@ generate_aap_kickstart() {
     local aap_inventory_content
     local aap_inventory_growth_content
     local aap_ext_mac aap_int_mac
+    local aap_prefix
 
     prompt_aap_details || return 1
     ensure_iso_vars || return 1
@@ -3868,6 +4203,7 @@ generate_aap_kickstart() {
 
     aap_ext_mac="$(get_vm_external_mac "aap-26")"
     aap_int_mac="$(get_vm_internal_mac "aap-26")"
+    aap_prefix="$(netmask_to_prefix "${AAP_NETMASK}")"
 
     # Read the host's public key for SSH callback orchestration
     if [ ! -f "${AAP_SSH_PUBLIC_KEY}" ]; then
@@ -3895,11 +4231,13 @@ bootloader --append="net.ifnames=0 biosdevname=0"
 rootpw --plaintext "${ROOT_PASS}"
 user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
 
-network --bootproto=dhcp --device=${aap_ext_mac} --activate --onboot=yes
+network --bootproto=dhcp --device=eth0 --interfacename=eth0:${aap_ext_mac} --activate --onboot=yes
+
+%include /tmp/network-eth1
 
 HEADER
 
-    build_internal_kickstart_network_line "${aap_int_mac}" "${AAP_IP}" "${AAP_NETMASK}" "${AAP_GW}" "${AAP_HOSTNAME}" >> "$tmp_ks"
+    build_internal_kickstart_network_line "eth1" "${aap_int_mac}" "${AAP_IP}" "${AAP_NETMASK}" "${AAP_GW}" "${AAP_HOSTNAME}" >> "$tmp_ks"
     echo "" >> "$tmp_ks"
 
     # --- Partitioning (DEMO vs production best-practice) ---
@@ -3956,15 +4294,75 @@ PKGS
 %post --log=/root/ks-post.log
 set -euxo pipefail
 
-# 0. NetworkManager DNS rotation (dual network: eth0 DHCP + eth1 static)
-echo "[main]" > /etc/NetworkManager/conf.d/dns-rotation.conf
-echo "dns=systemd-resolved" >> /etc/NetworkManager/conf.d/dns-rotation.conf
-echo "rc-manager=auto" >> /etc/NetworkManager/conf.d/dns-rotation.conf
-systemctl restart NetworkManager || true
-sleep 5
-nmcli connection reload || true
+# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
+mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
+rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
 
-# 1. Registration (retry until network/RHSM are reachable)
+cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
+[connection]
+id=eth0
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ethernet]
+mac-address=${aap_ext_mac}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF_NM_ETH0
+
+cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
+[connection]
+id=eth1
+type=ethernet
+interface-name=eth1
+autoconnect=true
+
+[ethernet]
+mac-address=${aap_int_mac}
+
+[ipv4]
+method=manual
+addresses=${AAP_IP}/${aap_prefix}
+gateway=${AAP_GW}
+never-default=false
+
+[ipv6]
+method=ignore
+EOF_NM_ETH1
+
+if [ "${AAP_GW}" = "0.0.0.0" ] || [ -z "${AAP_GW}" ]; then
+    sed -i '/^gateway=/d' /etc/NetworkManager/system-connections/eth1.nmconnection
+    sed -i 's/^never-default=.*/never-default=true/' /etc/NetworkManager/system-connections/eth1.nmconnection
+fi
+
+chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
+
+cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
+[main]
+no-auto-default=${aap_ext_mac},${aap_int_mac}
+EOF_NM_MAIN
+
+systemctl enable NetworkManager || true
+
+# Ensure resolver file exists for registration/DNS lookups
+if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
+    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
+fi
+
+# 1. Local hosts mapping (temporary DNS-independent bootstrap)
+cat > /etc/hosts <<HOSTS
+127.0.0.1 localhost localhost.localdomain
+{{SAT_IP}} {{SAT_HOSTNAME}} {{SAT_SHORT}}
+{{AAP_IP}} {{AAP_HOSTNAME}} {{AAP_SHORT}}
+{{IDM_IP}} {{IDM_HOSTNAME}} {{IDM_SHORT}}
+HOSTS
+
+# 2. Registration (retry until network/RHSM are reachable)
 register_rhsm() {
     local try
     for try in \$(seq 1 10); do
@@ -3979,15 +4377,7 @@ register_rhsm() {
 register_rhsm
 subscription-manager refresh || true
 
-# 1.1 Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<HOSTS
-127.0.0.1 localhost localhost.localdomain
-{{SAT_IP}} {{SAT_HOSTNAME}} {{SAT_SHORT}}
-{{AAP_IP}} {{AAP_HOSTNAME}} {{AAP_SHORT}}
-{{IDM_IP}} {{IDM_HOSTNAME}} {{IDM_SHORT}}
-HOSTS
-
-# 2. Repositories
+# 3. Repositories
 subscription-manager repos --disable="*"
 subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms" --enable="ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms"
 
@@ -3995,7 +4385,11 @@ for repo in \
     rhel-10-for-x86_64-baseos-rpms \
     rhel-10-for-x86_64-appstream-rpms \
     ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms; do
-    subscription-manager repos --list-enabled | grep -q "\$repo"
+    if ! subscription-manager repos --list-enabled | grep -q "\$repo"; then
+        echo "ERROR: Required AAP repository not enabled: \$repo"
+        subscription-manager repos --list-enabled || true
+        exit 1
+    fi
 done
 
 # 3. Download the AAP bundle from the host HTTP server (started by run_rhis_install_sequence.sh)
@@ -4004,11 +4398,24 @@ echo "Bundle download starting at $(date)" >> /var/log/aap-setup-ready.log
 curl -fL --retry 5 --retry-delay 15 http://{{HOST_INT_IP}}:8080/aap-bundle.tar.gz -o /root/aap-bundle.tar.gz
 tar -xzf /root/aap-bundle.tar.gz -C /root/aap-setup --strip-components=1
 rm -f /root/aap-bundle.tar.gz
+if [ ! -x /root/aap-setup/setup.sh ]; then
+    echo "ERROR: AAP bundle extraction failed (missing /root/aap-setup/setup.sh)."
+    exit 1
+fi
 echo "Bundle extracted. Ready for SSH callback." >> /var/log/aap-setup-ready.log
 
 # 4. SSH setup — enable root login and inject host public key for SSH callback
-sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-systemctl enable sshd
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UseDNS no
+EOF_SSHD
+systemctl enable --now sshd || true
+systemctl restart sshd || true
+firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
 
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
@@ -4046,6 +4453,10 @@ cat > /root/aap-setup/inventory-growth <<INVENTORY_GROWTH
 ${aap_inventory_growth_content}
 INVENTORY_GROWTH
 chmod 600 /root/aap-setup/inventory-growth
+if [ ! -s /root/aap-setup/inventory ] || [ ! -s /root/aap-setup/inventory-growth ]; then
+    echo "ERROR: AAP inventory rendering failed (inventory files missing/empty)."
+    exit 1
+fi
 
 # 7. Performance baseline for virtual guests
 systemctl enable --now qemu-guest-agent || true
@@ -4056,6 +4467,15 @@ vm.swappiness = 10
 net.core.somaxconn = 4096
 EOF
 sysctl -p /etc/sysctl.d/99-rhis-performance.conf || true
+
+# 8. Network verification snapshot (for ks-post.log troubleshooting)
+echo "===== RHIS NETWORK SNAPSHOT ====="
+date
+ip -4 addr show eth0 || true
+ip -4 addr show eth1 || true
+ip route show || true
+nmcli -f NAME,DEVICE,TYPE,STATE connection show || true
+echo "===== END RHIS NETWORK SNAPSHOT ====="
 %end
 POSTEOF
 
@@ -4092,6 +4512,7 @@ prompt_idm_details() {
 
     echo -e "\n--- IdM Identity ---"
     set_or_prompt IDM_HOSTNAME   "IdM Hostname (FQDN): "               || return 1
+    set_or_prompt IDM_ALIAS      "IdM Alias: "                         || return 1
     set_or_prompt DOMAIN         "Shared Domain Name: "                || return 1
     IDM_ADMIN_PASS="${ADMIN_PASS}"
     set_or_prompt IDM_DS_PASS    "Directory Service Password: " 1      || return 1
@@ -4103,12 +4524,14 @@ generate_idm_kickstart() {
     local ks_file="${KS_DIR}/idm.ks"
     local tmp_ks
     local idm_ext_mac idm_int_mac
+    local idm_prefix
 
     prompt_idm_details || return 1
     ensure_iso_vars || return 1
 
     idm_ext_mac="$(get_vm_external_mac "idm")"
     idm_int_mac="$(get_vm_internal_mac "idm")"
+    idm_prefix="$(netmask_to_prefix "${IDM_NETMASK}")"
 
     tmp_ks="$(mktemp)"
 
@@ -4125,11 +4548,13 @@ bootloader --append="net.ifnames=0 biosdevname=0"
 rootpw --plaintext "${ROOT_PASS}"
 user --name="${ADMIN_USER}" --password="${ADMIN_PASS}" --plaintext --groups=wheel
 
-network --bootproto=dhcp --device=${idm_ext_mac} --activate --onboot=yes
+network --bootproto=dhcp --device=eth0 --interfacename=eth0:${idm_ext_mac} --activate --onboot=yes
+
+%include /tmp/network-eth1
 HEADER
 
     # --- eth1 (always static for internal provisioning/management network) ---
-    build_internal_kickstart_network_line "${idm_int_mac}" "${IDM_IP}" "${IDM_NETMASK}" "${IDM_GW}" "${IDM_HOSTNAME}" >> "$tmp_ks"
+    build_internal_kickstart_network_line "eth1" "${idm_int_mac}" "${IDM_IP}" "${IDM_NETMASK}" "${IDM_GW}" "${IDM_HOSTNAME}" >> "$tmp_ks"
     echo "" >> "$tmp_ks"
 
     # --- Partitioning (DEMO vs production best-practice) ---
@@ -4188,15 +4613,88 @@ PKGS
 %post --log=/root/ks-post.log
 set -euxo pipefail
 
-# 0. NetworkManager DNS rotation (dual network: eth0 DHCP +eth1 static)
-echo "[main]" > /etc/NetworkManager/conf.d/dns-rotation.conf
-echo "dns=systemd-resolved" >> /etc/NetworkManager/conf.d/dns-rotation.conf
-echo "rc-manager=auto" >> /etc/NetworkManager/conf.d/dns-rotation.conf
-systemctl restart NetworkManager || true
-sleep 5
-nmcli connection reload || true
+# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
+mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
+rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
 
-# 1. Registration (retry until network/RHSM are reachable)
+cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
+[connection]
+id=eth0
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ethernet]
+mac-address=${idm_ext_mac}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF_NM_ETH0
+
+cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
+[connection]
+id=eth1
+type=ethernet
+interface-name=eth1
+autoconnect=true
+
+[ethernet]
+mac-address=${idm_int_mac}
+
+[ipv4]
+method=manual
+addresses=${IDM_IP}/${idm_prefix}
+gateway=${IDM_GW}
+never-default=false
+
+[ipv6]
+method=ignore
+EOF_NM_ETH1
+
+if [ "${IDM_GW}" = "0.0.0.0" ] || [ -z "${IDM_GW}" ]; then
+    sed -i '/^gateway=/d' /etc/NetworkManager/system-connections/eth1.nmconnection
+    sed -i 's/^never-default=.*/never-default=true/' /etc/NetworkManager/system-connections/eth1.nmconnection
+fi
+
+chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
+
+cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
+[main]
+no-auto-default=${idm_ext_mac},${idm_int_mac}
+EOF_NM_MAIN
+
+systemctl enable NetworkManager || true
+
+# Ensure resolver file exists for registration/DNS lookups
+if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
+    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
+fi
+
+# 1. Local hosts mapping (temporary DNS-independent bootstrap)
+cat > /etc/hosts <<EOF
+127.0.0.1 localhost localhost.localdomain
+${SAT_IP} ${SAT_HOSTNAME} ${SAT_HOSTNAME%%.*}
+${AAP_IP} ${AAP_HOSTNAME} ${AAP_HOSTNAME%%.*}
+${IDM_IP} ${IDM_HOSTNAME} ${IDM_HOSTNAME%%.*}
+EOF
+
+# 1.1 SSH baseline for automation and internal preflight
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UseDNS no
+EOF_SSHD
+systemctl enable --now sshd || true
+systemctl restart sshd || true
+firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
+
+# 2. Registration (retry until network/RHSM are reachable)
 register_rhsm() {
     local try
     for try in \$(seq 1 10); do
@@ -4211,28 +4709,31 @@ register_rhsm() {
 register_rhsm
 subscription-manager refresh || true
 
-# 2. Hostname
+# 3. Hostname
 hostnamectl set-hostname "${IDM_HOSTNAME}"
 
-# 2.1 Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<EOF
-127.0.0.1 localhost localhost.localdomain
-${SAT_IP} ${SAT_HOSTNAME} ${SAT_HOSTNAME%%.*}
-${AAP_IP} ${AAP_HOSTNAME} ${AAP_HOSTNAME%%.*}
-${IDM_IP} ${IDM_HOSTNAME} ${IDM_HOSTNAME%%.*}
-EOF
-
-# 3. Repositories
+# 4. Repositories
 subscription-manager repos --disable="*"
 subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms"
 
 for repo in \
     rhel-10-for-x86_64-baseos-rpms \
     rhel-10-for-x86_64-appstream-rpms; do
-    subscription-manager repos --list-enabled | grep -q "\$repo"
+    if ! subscription-manager repos --list-enabled | grep -q "\$repo"; then
+        echo "ERROR: Required IdM repository not enabled: \$repo"
+        subscription-manager repos --list-enabled || true
+        exit 1
+    fi
 done
 
-# 4. IdM Server Installation (unattended)
+# 4.1 Verify required IdM packages from kickstart payload are present
+if ! rpm -q ipa-server ipa-server-dns bind-dyndb-ldap >/dev/null 2>&1; then
+    echo "ERROR: Required IdM packages missing after kickstart package phase."
+    rpm -qa | grep -E '^ipa-server|^bind-dyndb-ldap' || true
+    exit 1
+fi
+
+# 5. IdM Server Installation (unattended)
 ipa-server-install --unattended --realm="${IDM_REALM}" --domain="${IDM_DOMAIN}" --hostname="${IDM_HOSTNAME}" --admin-password="${IDM_ADMIN_PASS}" --ds-password="${IDM_DS_PASS}" --setup-dns --auto-forwarders --no-ntp
 
 # 5. Performance baseline for virtual guests
@@ -4243,6 +4744,15 @@ cat > /etc/sysctl.d/99-rhis-performance.conf <<'EOF'
 vm.swappiness = 10
 EOF
 sysctl -p /etc/sysctl.d/99-rhis-performance.conf || true
+
+# 6. Network verification snapshot (for ks-post.log troubleshooting)
+echo "===== RHIS NETWORK SNAPSHOT ====="
+date
+ip -4 addr show eth0 || true
+ip -4 addr show eth1 || true
+ip route show || true
+nmcli -f NAME,DEVICE,TYPE,STATE connection show || true
+echo "===== END RHIS NETWORK SNAPSHOT ====="
 %end
 POSTEOF
 
@@ -4479,9 +4989,14 @@ demokill_cleanup() {
     pkill -f "virt-manager" >/dev/null 2>&1 || true
     sleep 1
     if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        nohup virt-manager >/dev/null 2>&1 &
-        disown || true
-        print_success "virt-manager restarted"
+        if virsh -c qemu:///system list --all >/dev/null 2>&1; then
+            nohup virt-manager >/dev/null 2>&1 &
+            disown || true
+            print_success "virt-manager restarted"
+        else
+            print_warning "Skipping virt-manager auto-start: current user cannot access qemu:///system (polkit access denied)."
+            print_warning "Fix host policy (org.libvirt.unix.manage/monitor for libvirt group) to use virt-manager without sudo."
+        fi
     else
         print_warning "No desktop session detected; virt-manager not auto-started"
     fi
@@ -4592,26 +5107,8 @@ create_rhis_vms() {
         launch_vm_console_monitors_auto || true
     fi
 
-    # Post-boot callback orchestration: wait for AAP VM to boot, then run setup.sh remotely via SSH
-    if [ "${AAP_HTTP_PID}" -gt 0 ] 2>/dev/null; then
-        AAP_SSH_CALLBACK_ENABLED=1
-           # The VM runs anaconda, reboots, then %post downloads+extracts the 3.5 GB bundle.
-           # wait_for_vm_ssh polls up to 90 min — no fixed pre-sleep needed.
-           print_step "AAP VM is installing. SSH callback will begin as soon as the VM is reachable."
-           print_step "  You can monitor progress: sudo virsh console aap-26   (Ctrl+] to detach)"
-           if run_aap_setup_on_vm "aap-26"; then
-            print_success "AAP setup orchestration complete via SSH callback."
-            create_aap_credentials
-        else
-            print_warning "AAP setup failed or timed out. Check ${AAP_SETUP_LOG_LOCAL} for details."
-        fi
-
-        # Stop the HTTP server now that setup is done
-        if kill "${AAP_HTTP_PID}" 2>/dev/null; then
-            print_success "AAP bundle HTTP server stopped (PID ${AAP_HTTP_PID})."
-        fi
-        close_aap_bundle_firewall
-        AAP_SSH_CALLBACK_ENABLED=0
+    if [ "${AAP_HTTP_PID:-0}" -gt 0 ] 2>/dev/null; then
+        print_step "AAP callback is deferred until the AAP configuration phase so IdM/Satellite can proceed first."
     fi
 
     stop_vm_power_watchdog || true
@@ -4620,6 +5117,8 @@ create_rhis_vms() {
 
     # All VMs are running — trigger config-as-code via the provisioner container
     run_rhis_config_as_code || print_warning "Config-as-code phase did not complete cleanly. VMs are running; re-run manually if needed."
+    setup_rhis_ssh_mesh || print_warning "SSH mesh bootstrap did not complete cleanly; continuing."
+    validate_rhis_ssh_mesh || print_warning "SSH mesh validation reported failures; continuing."
 }
 
 # Fix the OS root password on all RHIS VMs using virsh set-user-password (via qemu-guest-agent).
@@ -4649,6 +5148,113 @@ fix_vm_root_passwords() {
             print_warning "Could not set root password on $vm (guest agent may not be ready yet)"
         fi
     done
+}
+
+setup_rhis_ssh_mesh() {
+    local root_pass ip pub
+    local -a node_ips all_pubs
+    local bootstrap_cmd append_cmd
+
+    root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+    if [ -z "$root_pass" ]; then
+        print_warning "Cannot bootstrap SSH mesh: root/admin password is unset."
+        return 1
+    fi
+
+    if ! command -v sshpass >/dev/null 2>&1; then
+        print_step "Installing sshpass for automated SSH trust bootstrap"
+        sudo dnf install -y sshpass >/dev/null 2>&1 || {
+            print_warning "Failed to install sshpass; skipping SSH mesh bootstrap."
+            return 1
+        }
+    fi
+
+    node_ips=("${SAT_IP}" "${AAP_IP}" "${IDM_IP}")
+
+    bootstrap_cmd='set -e; mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; if [ ! -f /root/.ssh/id_rsa ]; then ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa; fi; grep -q "^PermitRootLogin" /etc/ssh/sshd_config && sed -i "s/^PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config; grep -q "^PubkeyAuthentication" /etc/ssh/sshd_config && sed -i "s/^PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config; grep -q "^PasswordAuthentication" /etc/ssh/sshd_config && sed -i "s/^PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config || echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config; cat > /root/.ssh/config <<EOF
+Host *
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+EOF
+chmod 600 /root/.ssh/config; cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; systemctl enable --now sshd >/dev/null 2>&1 || true; systemctl restart sshd >/dev/null 2>&1 || true'
+
+    print_step "Bootstrapping root SSH config/keys on RHIS nodes"
+    for ip in "${node_ips[@]}"; do
+        sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$bootstrap_cmd" || {
+            print_warning "SSH bootstrap failed for ${ip}; skipping mesh setup."
+            return 1
+        }
+    done
+
+    print_step "Collecting node public keys for full mesh trust"
+    for ip in "${node_ips[@]}"; do
+        pub="$(sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" 'cat /root/.ssh/id_rsa.pub' 2>/dev/null || true)"
+        if [ -z "$pub" ]; then
+            print_warning "Could not read root SSH public key from ${ip}."
+            return 1
+        fi
+        all_pubs+=("$pub")
+    done
+
+    print_step "Distributing trusted keys to all nodes (root-to-root mesh)"
+    for ip in "${node_ips[@]}"; do
+        for pub in "${all_pubs[@]}"; do
+            append_cmd="printf '%s\n' '$pub' >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
+            sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$append_cmd" >/dev/null 2>&1 || {
+                print_warning "Failed to distribute SSH key to ${ip}."
+                return 1
+            }
+        done
+    done
+
+    print_success "RHIS SSH mesh configured: root SSH enabled with no strict host key checking across all nodes."
+    return 0
+}
+
+validate_rhis_ssh_mesh() {
+    local root_pass
+    local src_name src_ip dst_name dst_ip
+    local validation_cmd
+    local failures=0
+    local -a node_specs
+
+    root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+    if [ -z "$root_pass" ]; then
+        print_warning "Cannot validate SSH mesh: root/admin password is unset."
+        return 1
+    fi
+
+    node_specs=(
+        "${SAT_HOSTNAME}:${SAT_IP}"
+        "${AAP_HOSTNAME}:${AAP_IP}"
+        "${IDM_HOSTNAME}:${IDM_IP}"
+    )
+
+    print_step "Validating RHIS SSH mesh (root-to-root key auth across all nodes)"
+    for src in "${node_specs[@]}"; do
+        src_name="${src%%:*}"
+        src_ip="${src##*:}"
+        for dst in "${node_specs[@]}"; do
+            dst_name="${dst%%:*}"
+            dst_ip="${dst##*:}"
+            validation_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 root@${dst_ip} 'echo ok:${dst_name}'"
+            if sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
+                print_step "SSH mesh OK: ${src_name} -> ${dst_name}"
+            else
+                print_warning "SSH mesh FAILED: ${src_name} -> ${dst_name}"
+                failures=$((failures + 1))
+            fi
+        done
+    done
+
+    if [ "$failures" -ne 0 ]; then
+        print_warning "SSH mesh validation completed with ${failures} failure(s)."
+        return 1
+    fi
+
+    print_success "SSH mesh validation complete: all RHIS nodes can SSH to themselves and each other as root."
+    return 0
 }
 
 ensure_rhis_vms_powered_on() {
@@ -4731,8 +5337,10 @@ main() {
 
     # CLI-only fast path: DEMOKILL should never require env/vault prompts.
     if [ -n "${CLI_DEMOKILL:-}" ]; then
+        command -v clear >/dev/null 2>&1 && clear
         print_step "DEMOKILL requested from CLI; skipping credential prompts"
         demokill_cleanup || { print_warning "DEMOKILL failed"; exit 1; }
+        command -v clear >/dev/null 2>&1 && clear
         print_success "Run complete"
         exit 0
     fi
@@ -4772,7 +5380,11 @@ main() {
             6) generate_satellite_oemdrv_only ;;
             7) run_container_config_only || { print_warning "Container config-only workflow failed"; exit 1; } ;;
             8) show_live_status_dashboard ;;
-            0) echo "Exiting installation script"; exit 0 ;;
+            0)
+                command -v clear >/dev/null 2>&1 && clear
+                echo "Exiting installation script"
+                exit 0
+                ;;
         *) print_warning "Invalid choice. Please select 0-8." ;;
 		esac
 
