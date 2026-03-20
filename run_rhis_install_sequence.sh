@@ -1864,6 +1864,15 @@ preflight_config_as_code_targets() {
             for spec in "${vm_specs[@]}"; do
                 vm_name="${spec%%:*}"
                 configured_ip="${spec#*:}"
+
+                vm_state="$(sudo virsh domstate "$vm_name" 2>/dev/null | tr -d '[:space:]' || true)"
+                if [ "$vm_state" != "running" ]; then
+                    print_warning "${vm_name} became non-running during preflight (state=${vm_state:-unknown}); attempting start"
+                    sudo virsh start "$vm_name" >/dev/null 2>&1 || true
+                    all_ready=0
+                    continue
+                fi
+
                 target_ip="$(resolve_preflight_ip "${vm_name}" "${configured_ip}")"
                 if probe_ssh_endpoint "$target_ip"; then
                     reached=1
@@ -5317,13 +5326,13 @@ create_rhis_vms() {
         print_step "AAP callback is deferred until the AAP configuration phase so IdM/Satellite can proceed first."
     fi
 
-    stop_vm_power_watchdog || true
     ensure_rhis_vms_powered_on
     wait_for_post_vm_settle || true
 
     # All VMs are running — trigger config-as-code via the provisioner container
     print_phase 3 8 "Config-as-code orchestration"
     run_rhis_config_as_code || print_warning "Config-as-code phase did not complete cleanly. VMs are running; re-run manually if needed."
+    stop_vm_power_watchdog || true
     print_phase 4 8 "SSH mesh bootstrap"
     setup_rhis_ssh_mesh || print_warning "SSH mesh bootstrap did not complete cleanly; continuing."
     print_phase 5 8 "SSH mesh validation"
