@@ -104,6 +104,7 @@ Environment toggles:
 - `RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY=0` disables auto config-as-code after menu option `2`
 - `RHIS_RETRY_FAILED_PHASES_ONCE=0` disables automatic retry of failed config-as-code phases
 - `RHC_AUTO_CONNECT=0` disables automatic `rhc connect` during guest kickstart `%post`
+- `RHIS_POST_VM_SETTLE_GRACE=650` default guest settle window before SSH preflight checks
 - `RHIS_POST_VM_SETTLE_GRACE=<seconds>` guest settle window before SSH preflight (default `300`)
 - `RHIS_INTERNAL_SSH_WARN_GRACE=<seconds>` delay before per-host warning logs (default `600`)
 - `RHIS_INTERNAL_SSH_LOG_EVERY=<seconds>` periodic preflight progress log cadence (default `60`)

@@ -21,8 +21,11 @@ DIM='\033[2m'
 ISO_DIR="${ISO_DIR:-/var/lib/libvirt/images}"
 ISO_NAME="${ISO_NAME:-rhel-10-everything-x86_64-dvd.iso}"
 ISO_PATH="${ISO_PATH:-$ISO_DIR/$ISO_NAME}"
+SAT_ISO_NAME="${SAT_ISO_NAME:-rhel-9-everything-x86_64-dvd.iso}"
+SAT_ISO_PATH="${SAT_ISO_PATH:-$ISO_DIR/$SAT_ISO_NAME}"
 RH_TOKEN_URL="${RH_TOKEN_URL:-https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token}"
 RH_OSINFO="${RH_OSINFO:-linux2024}"
+SAT_RH_OSINFO="${SAT_RH_OSINFO:-rhel9.0}"
 VM_DIR="${VM_DIR:-/var/lib/libvirt/images}"
 KS_DIR="${KS_DIR:-/var/lib/libvirt/images/kickstarts}"
 OEMDRV_ISO="${OEMDRV_ISO:-$ISO_DIR/OEMDRV.iso}"
@@ -58,6 +61,8 @@ RHIS_HOST_VARS_DIR="${RHIS_HOST_VARS_DIR:-$SCRIPT_DIR/host_vars}"
 
 REPO_URL="${REPO_URL:-}"
 PRESEED_ENV_FILE="${PRESEED_ENV_FILE:-$SCRIPT_DIR/.env}"
+RH_ISO_URL="${RH_ISO_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/ec/ecc0e9b760247f0ef43100d88ed930a3a8a868545d5db6ad940c5c73be6fb047/rhel-10.1-x86_64-boot.iso?user=dfb5278729bd015d083f488da113c04b&_auth_=1773884550_69d13122ab14a5736321fe8cfe9c1c9d}"
+RH9_ISO_URL="${RH9_ISO_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/aa/aac774e5aba1c0275d50e0cc4e0e08eca660a116773280596e0bcb894d2da16d/rhel-9.7-x86_64-dvd.iso?user=dfb5278729bd015d083f488da113c04b&_auth_=1774126174_9c7dc7bd033124cd0884ec0b856f122e}"
 CLI_MENU_CHOICE=""
 CLI_NONINTERACTIVE=""
 RUN_ONCE="${RUN_ONCE:-0}"
@@ -90,7 +95,7 @@ RHIS_RETRY_FAILED_PHASES_ONCE="${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
 # Internal SSH readiness wait for config-as-code preflight
 RHIS_INTERNAL_SSH_WAIT_TIMEOUT="${RHIS_INTERNAL_SSH_WAIT_TIMEOUT:-1800}"
 RHIS_INTERNAL_SSH_WAIT_INTERVAL="${RHIS_INTERNAL_SSH_WAIT_INTERVAL:-10}"
-RHIS_POST_VM_SETTLE_GRACE="${RHIS_POST_VM_SETTLE_GRACE:-300}"
+RHIS_POST_VM_SETTLE_GRACE="${RHIS_POST_VM_SETTLE_GRACE:-650}"
 RHIS_INTERNAL_SSH_WARN_GRACE="${RHIS_INTERNAL_SSH_WARN_GRACE:-600}"
 RHIS_INTERNAL_SSH_LOG_EVERY="${RHIS_INTERNAL_SSH_LOG_EVERY:-60}"
 RHC_AUTO_CONNECT="${RHC_AUTO_CONNECT:-1}"
@@ -98,11 +103,12 @@ RHC_AUTO_CONNECT="${RHC_AUTO_CONNECT:-1}"
 # Automation Hub + AAP bundle pre-flight HTTP-serve variables
 HUB_TOKEN="${HUB_TOKEN:-}"
 HOST_INT_IP="${HOST_INT_IP:-192.168.122.1}"
-AAP_BUNDLE_URL="${AAP_BUNDLE_URL:-}"
+AAP_BUNDLE_URL="${AAP_BUNDLE_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/c9/c953da394644892ad66dabdc57fcb4e4022724501466a90904001526fe5660d3/ansible-automation-platform-containerized-setup-bundle-2.6-6-x86_64.tar.gz?user=dfb5278729bd015d083f488da113c04b&_auth_=1773884622_1b332b37fd083ba0f82e94d32ee65a51}"
 AAP_BUNDLE_DIR="${AAP_BUNDLE_DIR:-${VM_DIR}/aap-bundle}"
 AAP_HTTP_PID=""
 AAP_HTTP_LOG="${AAP_HTTP_LOG:-/tmp/aap-http-server-$(date +%s).log}"
 AAP_ANSIBLE_LOG_BASENAME="${AAP_ANSIBLE_LOG_BASENAME:-ansible-provisioner.log}"
+STAGED_VAULT_PASS_BASENAME="${STAGED_VAULT_PASS_BASENAME:-.vaultpass.container}"
 AAP_ADMIN_PASS="${AAP_ADMIN_PASS:-}"
 SAT_ADMIN_PASS="${SAT_ADMIN_PASS:-}"
 # AAP installer inventory template selection.
@@ -143,6 +149,18 @@ IDM_ALIAS="${IDM_ALIAS:-idm}"
 SAT_ORG="${SAT_ORG:-REDHAT}"
 SAT_LOC="${SAT_LOC:-CORE}"
 IDM_DS_PASS="${IDM_DS_PASS:-}"  # loaded from vault; fallback set in normalize_shared_env_vars
+SATELLITE_DISCONNECTED="${SATELLITE_DISCONNECTED:-false}"
+IPADM_PASSWORD="${IPADM_PASSWORD:-}"
+IPAADMIN_PASSWORD="${IPAADMIN_PASSWORD:-}"
+CDN_ORGANIZATION_ID="${CDN_ORGANIZATION_ID:-}"
+CDN_SAT_ACTIVATION_KEY="${CDN_SAT_ACTIVATION_KEY:-}"
+SAT_FIREWALLD_ZONE="${SAT_FIREWALLD_ZONE:-public}"
+SAT_FIREWALLD_INTERFACE="${SAT_FIREWALLD_INTERFACE:-eth1}"
+SAT_FIREWALLD_SERVICES_JSON='["ssh","http","https"]'
+# Required Satellite server repositories.  Your RHSM account MUST expose all
+# four IDs below before run_config_as_code() reaches the Satellite phase.
+# See assert_satellite_server_repos_available() for the pre-flight guard.
+SAT_REPOSITORY_IDS_JSON='["rhel-9-for-x86_64-baseos-rpms","rhel-9-for-x86_64-appstream-rpms","satellite-6.18-for-rhel-9-x86_64-rpms","satellite-maintenance-6.18-for-rhel-9-x86_64-rpms"]'
 
 # Disk I/O mode: "fast" (cache=none,discard=unmap,io=native — optimal for SSD/NVMe)
 #                "safe" (cache=writeback — conservative; use for spinning HDDs or shared storage)
@@ -167,26 +185,42 @@ AAP_SSH_CALLBACK_ENABLED="${AAP_SSH_CALLBACK_ENABLED:-0}"
 AAP_SSH_KEY_FAIL_FAST_ATTEMPTS="${AAP_SSH_KEY_FAIL_FAST_ATTEMPTS:-18}"
 
 # Function to print colored output
+sanitize_log_message() {
+    local message="$*"
+    printf '%s' "${message}" | sed -E \
+        -e 's#([?&](_auth_|auth|token|access_token|refresh_token|password|passwd|pass|api_key|apikey)=)[^&[:space:]]+#\1<redacted>#Ig' \
+        -e 's#(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+#\1<redacted>#Ig' \
+        -e 's#(--(password|passwd|token|secret|api-key|api_key|apikey)(=|[[:space:]]+))[^[:space:]]+#\1<redacted>#Ig' \
+        -e 's#((^|[[:space:]])(password|passwd|token|secret|api_key|apikey|offline_token|access_token|refresh_token)[[:space:]]*[:=][[:space:]]*)[^[:space:]]+#\1<redacted>#Ig'
+}
+
 print_step() {
-    echo -e "${BLUE}[STEP]${NC} $1"
+    local msg
+    msg="$(sanitize_log_message "$*")"
+    echo -e "${BLUE}[STEP]${NC} ${msg}"
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    local msg
+    msg="$(sanitize_log_message "$*")"
+    echo -e "${GREEN}[SUCCESS]${NC} ${msg}"
 }
 
 print_warning() {
+    local msg
+    msg="$(sanitize_log_message "$*")"
     if is_enabled "${RHIS_TEST_MODE:-0}"; then
         RHIS_TEST_WARNING_COUNT=$((RHIS_TEST_WARNING_COUNT + 1))
-        printf '%s\n' "$1" >> "${RHIS_TEST_WARNING_FILE}"
+        printf '%s\n' "${msg}" >> "${RHIS_TEST_WARNING_FILE}"
     fi
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo -e "${YELLOW}[WARNING]${NC} ${msg}"
 }
 
 print_phase() {
     local index="$1"
     local total="$2"
     local label="$3"
+    label="$(sanitize_log_message "${label}")"
     echo -e "${CYAN}[PHASE ${index}/${total}]${NC} ${BOLD}${label}${NC}"
 }
 
@@ -235,9 +269,299 @@ mask_secret() {
     printf '%s***%s\n' "${value:0:2}" "${value: -2}"
 }
 
+mask_url_secret() {
+    local value="${1:-}"
+    local base=""
+
+    if [ -z "$value" ]; then
+        echo "(unset)"
+        return 0
+    fi
+
+    # Strip query/hash to avoid leaking auth tokens in logs.
+    base="${value%%\?*}"
+    base="${base%%#*}"
+    if [ "$base" != "$value" ]; then
+        printf '%s?<redacted>\n' "$base"
+        return 0
+    fi
+
+    printf '%s\n' "$base"
+}
+
 sed_escape_replacement() {
     # Escape chars that are special in sed replacement context: &, |, \
     printf '%s' "${1:-}" | sed -e 's/[&|\\]/\\&/g'
+}
+
+kickstart_nogpg_policy_block() {
+    cat <<'EOF'
+# RHIS policy: disable package signature checks for all dnf/yum repo operations.
+mkdir -p /etc/dnf
+if [ -f /etc/dnf/dnf.conf ]; then
+    if ! grep -q '^gpgcheck=0$' /etc/dnf/dnf.conf; then
+        cat >> /etc/dnf/dnf.conf <<'EOF_DNF_GPG'
+
+# RHIS override: disable GPG checks
+gpgcheck=0
+repo_gpgcheck=0
+localpkg_gpgcheck=0
+EOF_DNF_GPG
+    fi
+fi
+[ -e /etc/yum.conf ] || ln -sf /etc/dnf/dnf.conf /etc/yum.conf
+EOF
+}
+
+kickstart_ssh_baseline_block() {
+    cat <<'EOF'
+# 1.1 SSH baseline for automation and internal preflight
+mkdir -p /etc/ssh/sshd_config.d
+mkdir -p /etc/ssh/ssh_config.d
+cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+X11Forwarding yes
+UseDNS no
+EOF_SSHD
+
+cat > /etc/ssh/ssh_config.d/99-rhis-client.conf <<'EOF_SSH'
+Host *
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ForwardX11 yes
+EOF_SSH
+
+systemctl enable --now sshd || true
+systemctl restart sshd || true
+systemctl disable --now firewalld >/dev/null 2>&1 || true
+setenforce 0 >/dev/null 2>&1 || true
+if [ -f /etc/selinux/config ]; then
+    sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config || true
+fi
+EOF
+}
+
+kickstart_user_sudo_bootstrap_block() {
+    cat <<'EOF'
+# 1.2 Ensure installer/admin user has passwordless sudo and virtualization groups
+target_user="${INSTALLER_USER:-${ADMIN_USER}}"
+if [ "${INSTALLER_USER:-${ADMIN_USER}}" != "${ADMIN_USER}" ] && ! id "${INSTALLER_USER:-${ADMIN_USER}}" >/dev/null 2>&1; then
+    useradd -m -G wheel "${INSTALLER_USER:-${ADMIN_USER}}" || true
+    echo "${INSTALLER_USER:-${ADMIN_USER}}:${ADMIN_PASS}" | chpasswd || true
+fi
+for grp in libvirt qemu kvm wheel; do
+    getent group "$grp" >/dev/null 2>&1 || groupadd -f "$grp" || true
+done
+usermod -aG libvirt,qemu,kvm,wheel "$target_user" || true
+sed -i -E 's/^#?[[:space:]]*%wheel[[:space:]]+ALL=\(ALL\)[[:space:]]+ALL/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers || true
+printf '%s\n' "$target_user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/90-rhis-nopasswd
+chmod 0440 /etc/sudoers.d/90-rhis-nopasswd
+visudo -cf /etc/sudoers >/dev/null 2>&1 || true
+EOF
+}
+
+kickstart_rhsm_register_block() {
+    local include_org_id="${1:-0}"
+
+    cat <<'EOF'
+# 2. Registration (retry until network/RHSM are reachable)
+register_rhsm() {
+    local try
+    for try in $(seq 1 10); do
+EOF
+
+    if [ "$include_org_id" = "1" ]; then
+        cat <<'EOF'
+        if [ -n "${CDN_ORGANIZATION_ID:-}" ]; then
+            subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --org="${CDN_ORGANIZATION_ID}" --auto-attach --force && return 0
+        else
+            subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
+        fi
+EOF
+    else
+        cat <<'EOF'
+        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
+EOF
+    fi
+
+    cat <<'EOF'
+        subscription-manager unregister >/dev/null 2>&1 || true
+        subscription-manager clean >/dev/null 2>&1 || true
+        sleep 15
+    done
+    return 1
+}
+
+register_rhsm
+subscription-manager refresh || true
+EOF
+}
+
+kickstart_rhc_connect_block() {
+    cat <<'EOF'
+# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
+if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
+    dnf install -y --nogpgcheck rhc >/dev/null 2>&1 || true
+    if command -v rhc >/dev/null 2>&1; then
+        if ! rhc status >/dev/null 2>&1; then
+            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+EOF
+}
+
+kickstart_repo_enable_verify_block() {
+    local role_label="$1"
+    shift
+    local -a repos=("$@")
+    local i
+
+    printf '%s\n' '# 3. Repositories'
+    printf '%s' 'subscription-manager repos --disable="*"'
+    printf '\n'
+    printf '%s' 'subscription-manager repos'
+    for i in "${repos[@]}"; do
+        printf ' --enable="%s"' "$i"
+    done
+    printf '\n\n'
+
+    printf '%s\n' 'for repo in \\'
+    for ((i=0; i<${#repos[@]}; i++)); do
+        if [ "$i" -lt $(( ${#repos[@]} - 1 )) ]; then
+            printf '    %s \\\n' "${repos[$i]}"
+        else
+            printf '    %s; do\n' "${repos[$i]}"
+        fi
+    done
+
+    printf '%s\n' '    if ! subscription-manager repos --list-enabled | grep -q "$repo"; then'
+    printf '        echo "ERROR: Required %s repository not enabled: $repo"\n' "$role_label"
+    printf '%s\n' '        subscription-manager repos --list-enabled || true'
+    printf '%s\n' '        exit 1'
+    printf '%s\n' '    fi'
+    printf '%s\n' 'done'
+}
+
+kickstart_networkmanager_dual_nic_block() {
+    local ext_mac="$1"
+    local int_mac="$2"
+    local int_ip="$3"
+    local int_prefix="$4"
+    local int_gw="$5"
+
+    cat <<EOF
+# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
+mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
+rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
+
+cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
+[connection]
+id=eth0
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ethernet]
+mac-address=${ext_mac}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF_NM_ETH0
+
+cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
+[connection]
+id=eth1
+type=ethernet
+interface-name=eth1
+autoconnect=true
+
+[ethernet]
+mac-address=${int_mac}
+
+[ipv4]
+# Internal management network — static IP, no default route.
+# eth0 (DHCP) is the sole default route for internet access.
+# Intra-cluster VMs are on the same /16 subnet so no gateway is needed.
+method=manual
+addresses=${int_ip}/${int_prefix}
+never-default=true
+
+[ipv6]
+method=ignore
+EOF_NM_ETH1
+
+chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
+
+cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
+[main]
+no-auto-default=${ext_mac},${int_mac}
+EOF_NM_MAIN
+
+systemctl enable NetworkManager || true
+
+# Ensure resolver file exists for registration/DNS lookups
+if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
+    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
+fi
+EOF
+}
+
+kickstart_hosts_mapping_block() {
+    local sat_ip="$1"
+    local sat_host="$2"
+    local sat_short="$3"
+    local aap_ip="$4"
+    local aap_host="$5"
+    local aap_short="$6"
+    local idm_ip="$7"
+    local idm_host="$8"
+    local idm_short="$9"
+
+    cat <<EOF
+# 1. Local hosts mapping (temporary DNS-independent bootstrap)
+cat > /etc/hosts <<EOF
+127.0.0.1 localhost localhost.localdomain
+${sat_ip} ${sat_host} ${sat_short}
+${aap_ip} ${aap_host} ${aap_short}
+${idm_ip} ${idm_host} ${idm_short}
+EOF
+EOF
+}
+
+kickstart_trust_bootstrap_keys_block() {
+    local include_target_user_copy="${1:-1}"
+
+    cat <<'EOF'
+# 1.3 Trust installer/orchestration/container SSH keys for root and installer user
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+cat >> /root/.ssh/authorized_keys <<'SSH_KEYS'
+${bootstrap_ssh_keys}
+SSH_KEYS
+sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys || true
+chmod 600 /root/.ssh/authorized_keys
+EOF
+
+    if [ "$include_target_user_copy" = "1" ]; then
+        cat <<'EOF'
+if id "$target_user" >/dev/null 2>&1; then
+    target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+    [ -n "$target_home" ] || target_home="/home/$target_user"
+    install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"
+    cat > "$target_home/.ssh/authorized_keys" <<'SSH_KEYS'
+${bootstrap_ssh_keys}
+SSH_KEYS
+    chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"
+    chmod 600 "$target_home/.ssh/authorized_keys"
+fi
+EOF
+    fi
 }
 
 print_runtime_configuration() {
@@ -245,7 +569,8 @@ print_runtime_configuration() {
     echo "  PRESEED_ENV_FILE=${PRESEED_ENV_FILE}"
     echo "  NONINTERACTIVE=${NONINTERACTIVE:-0}"
     echo "  MENU_CHOICE=${MENU_CHOICE:-'(unset)'}"
-    echo "  RH_ISO_URL=${RH_ISO_URL:-'(unset)'}"
+    echo "  RH_ISO_URL=$(mask_url_secret "${RH_ISO_URL:-}")"
+    echo "  RH9_ISO_URL=$(mask_url_secret "${RH9_ISO_URL:-}")"
     echo "  RH_OFFLINE_TOKEN=$(mask_secret "${RH_OFFLINE_TOKEN:-}")"
     echo "  RH_ACCESS_TOKEN=$(mask_secret "${RH_ACCESS_TOKEN:-}")"
     echo "  RH_PASS=$(mask_secret "${RH_PASS:-}")"
@@ -255,7 +580,7 @@ print_runtime_configuration() {
     echo "  DEMO_MODE=${DEMO_MODE:-0}"
     echo "  HUB_TOKEN=$(mask_secret "${HUB_TOKEN:-}")"
     echo "  HOST_INT_IP=${HOST_INT_IP:-'(unset)'}"
-    echo "  AAP_BUNDLE_URL=${AAP_BUNDLE_URL:-'(unset)'}"
+    echo "  AAP_BUNDLE_URL=$(mask_url_secret "${AAP_BUNDLE_URL:-}")"
     echo "  AAP_INVENTORY_TEMPLATE=${AAP_INVENTORY_TEMPLATE:-'(unset)'}"
     echo "  AAP_INVENTORY_GROWTH_TEMPLATE=${AAP_INVENTORY_GROWTH_TEMPLATE:-'(unset)'}"
     echo "  AAP_PG_DATABASE=${AAP_PG_DATABASE:-'(unset)'}"
@@ -265,6 +590,7 @@ print_runtime_configuration() {
     echo "  AAP_ANSIBLE_LOG=${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
     echo "  RHIS_RETRY_FAILED_PHASES_ONCE=${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
     echo "  RHC_AUTO_CONNECT=${RHC_AUTO_CONNECT:-1}"
+    echo "  NETWORKS_ACTIVE=SAT(${SAT_IP:-10.168.128.1}/${SAT_NETMASK:-255.255.0.0} gw:${SAT_GW:-10.168.0.1}) AAP(${AAP_IP:-10.168.128.2}/${AAP_NETMASK:-255.255.0.0} gw:${AAP_GW:-10.168.0.1}) IDM(${IDM_IP:-10.168.128.3}/${IDM_NETMASK:-255.255.0.0} gw:${IDM_GW:-10.168.0.1})"
 }
 
 generate_rhis_ansible_cfg() {
@@ -836,6 +1162,9 @@ normalize_shared_env_vars() {
     # Do not infer it from per-system service/admin passwords.
     ADMIN_PASS="${ADMIN_PASS:-r3dh4t7!}"  # fallback only if vault did not supply a value
     ROOT_PASS="${ADMIN_PASS}"
+    IDM_ADMIN_PASS="${IDM_ADMIN_PASS:-${ADMIN_PASS}}"
+    IPADM_PASSWORD="${IPADM_PASSWORD:-${IDM_ADMIN_PASS:-${ADMIN_PASS}}}"
+    IPAADMIN_PASSWORD="${IPAADMIN_PASSWORD:-${IDM_ADMIN_PASS:-${ADMIN_PASS}}}"
 
     INTERNAL_NETWORK="${INTERNAL_NETWORK:-10.168.0.0}"
     NETMASK="${NETMASK:-${SAT_NETMASK:-${AAP_NETMASK:-${IDM_NETMASK:-255.255.0.0}}}}"
@@ -848,9 +1177,21 @@ normalize_shared_env_vars() {
     SAT_ORG="${SAT_ORG:-REDHAT}"
     SAT_LOC="${SAT_LOC:-CORE}"
 
+    case "${SATELLITE_DISCONNECTED:-false}" in
+        1|true|TRUE|yes|YES|on|ON)
+            SATELLITE_DISCONNECTED="true"
+            ;;
+        *)
+            SATELLITE_DISCONNECTED="false"
+            ;;
+    esac
+
     SAT_DOMAIN="${SAT_DOMAIN:-$DOMAIN}"
     AAP_DOMAIN="${AAP_DOMAIN:-$DOMAIN}"
     IDM_DOMAIN="${IDM_DOMAIN:-$DOMAIN}"
+    SAT_FIREWALLD_ZONE="${SAT_FIREWALLD_ZONE:-public}"
+    SAT_FIREWALLD_INTERFACE="${SAT_FIREWALLD_INTERFACE:-eth1}"
+    SAT_FIREWALLD_SERVICES_JSON="${SAT_FIREWALLD_SERVICES_JSON:-[\"ssh\",\"http\",\"https\"]}"
 
     if is_unresolved_template_value "${SAT_HOSTNAME:-}"; then
         SAT_HOSTNAME=""
@@ -1027,7 +1368,7 @@ validate_resolved_kickstart_inputs() {
         SAT_GW AAP_GW IDM_GW
         SAT_HOSTNAME AAP_HOSTNAME IDM_HOSTNAME
         SAT_ORG SAT_LOC
-        RH_USER RH_PASS RH_ISO_URL
+        RH_USER RH_PASS RH_ISO_URL RH9_ISO_URL
         AAP_BUNDLE_URL RH_OFFLINE_TOKEN HUB_TOKEN
     )
 
@@ -1406,7 +1747,7 @@ ensure_node() {
     fi
 
     print_warning "Node.js not found. Attempting installation..."
-    sudo dnf install -y nodejs npm
+    sudo dnf install -y --nogpgcheck nodejs npm
     command -v node >/dev/null 2>&1
 }
 
@@ -1439,7 +1780,7 @@ ensure_selinux() {
 ensure_firewalld() {
     if ! command -v firewall-cmd >/dev/null 2>&1; then
         print_warning "firewalld not found. Attempting installation..."
-        sudo dnf install -y firewalld
+        sudo dnf install -y --nogpgcheck firewalld
     fi
 
     sudo systemctl enable --now firewalld
@@ -1615,7 +1956,7 @@ ensure_rootless_podman() {
 
     if ! command -v podman >/dev/null 2>&1; then
         print_warning "Podman not found. Installing..."
-        sudo dnf install -y podman shadow-utils slirp4netns fuse-overlayfs
+        sudo dnf install -y --nogpgcheck podman shadow-utils slirp4netns fuse-overlayfs
     fi
 
     if ! grep -q "^${USER}:" /etc/subuid; then
@@ -1696,7 +2037,7 @@ ensure_container_running() {
     echo "Ansible fact cache      : ${RHIS_ANSIBLE_FACT_CACHE_HOST}"
     echo "Run a playbook example  : podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook \\"
     echo "    --inventory /rhis/vars/external_inventory/hosts \\" 
-    echo "    --user ansiblerunner --ask-pass --ask-vault-password \\"
+    echo "    --user ansiblerunner --ask-pass --ask-vault-pass \\" 
     echo "    --extra-vars 'vault_dir=/rhis/vars/vault/' \\"
     echo "    --limit idm_primary /rhis/rhis-builder-idm/main.yml"
 }
@@ -1921,12 +2262,12 @@ preflight_config_as_code_targets() {
 }
 
 wait_for_post_vm_settle() {
-    local grace="${1:-${RHIS_POST_VM_SETTLE_GRACE:-300}}"
+    local grace="${1:-${RHIS_POST_VM_SETTLE_GRACE:-650}}"
     local remaining
-    local original_grace elapsed
+    local original_grace elapsed percent filled bar
 
     case "$grace" in
-        ''|*[!0-9]*) grace=300 ;;
+        ''|*[!0-9]*) grace=650 ;;
     esac
 
     if [ "$grace" -le 0 ]; then
@@ -1941,10 +2282,17 @@ wait_for_post_vm_settle() {
             remaining=60
         fi
         elapsed=$(( original_grace - grace ))
-        print_step "Initial settle countdown: elapsed=${elapsed}s total=${original_grace}s remaining=${grace}s"
+        percent=$(( elapsed * 100 / original_grace ))
+        filled=$(( percent / 5 ))
+        printf -v bar '%*s' "$filled" ''
+        bar="${bar// /#}"
+        printf -v bar '%-20s' "$bar"
+        print_step "Initial settle progress: [${bar}] ${percent}%% (${elapsed}s/${original_grace}s)"
         sleep "$remaining"
         grace=$((grace - remaining))
     done
+
+    print_step "Initial settle progress: [####################] 100%% (${original_grace}s/${original_grace}s)"
 }
 
 print_rhis_health_summary() {
@@ -2122,6 +2470,7 @@ EOF
 ansible_become_pass: "{{ global_admin_password | default('') }}"
 aap_admin_user: "${ADMIN_USER:-admin}"
 aap_admin_password: "{{ aap_admin_pass | default(global_admin_password) | default('') }}"
+platform_deployment_type: "container"
 EOF
 
     # IdM
@@ -2168,7 +2517,7 @@ run_container_playbook() {
         podman_user_args=(--user 0)
         print_step "Vault password file requires container root access; executing playbook as root."
     else
-        vault_arg=(--ask-vault-password)
+        vault_arg=(--ask-vault-pass)
     fi
 
     print_step "Ansible log: ${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
@@ -2194,6 +2543,10 @@ run_rhis_config_as_code() {
     local idm_status="not-run"
     local satellite_status="not-run"
     local aap_status="not-run"
+    local idm_auth_fallback_status="not-needed"
+    local satellite_auth_fallback_status="not-needed"
+    local aap_auth_fallback_status="not-needed"
+    local phase_auth_fallback_status="not-needed"
     local any_failed=0
 
     load_ansible_env_file || true
@@ -2224,9 +2577,9 @@ run_rhis_config_as_code() {
     local staged_vault_pass_file=""
 
     cleanup_staged_vaultpass() {
-        if [ -n "${staged_vault_pass_host:-}" ] && [ -f "${staged_vault_pass_host}" ]; then
-            rm -f "${staged_vault_pass_host}" || true
-        fi
+        # Keep a stable staged vaultpass file so manual reruns can reuse:
+        #   --vault-password-file /rhis/vars/vault/.vaultpass.container
+        return 0
     }
 
     if podman exec "${RHIS_CONTAINER_NAME}" test -r "${vault_pass_file}" 2>/dev/null; then
@@ -2238,7 +2591,7 @@ run_rhis_config_as_code() {
     else
         # Attempt to stage a short-lived container-readable copy in the mounted vault dir.
         if [ -r "${ANSIBLE_VAULT_PASS_FILE}" ]; then
-            staged_vault_pass_host="${ANSIBLE_ENV_DIR}/.vaultpass.container.$$.$RANDOM"
+            staged_vault_pass_host="${ANSIBLE_ENV_DIR}/${STAGED_VAULT_PASS_BASENAME}"
             cp -f "${ANSIBLE_VAULT_PASS_FILE}" "${staged_vault_pass_host}" 2>/dev/null || staged_vault_pass_host=""
             if [ -n "${staged_vault_pass_host}" ] && [ -f "${staged_vault_pass_host}" ]; then
                 chmod 0644 "${staged_vault_pass_host}" 2>/dev/null || true
@@ -2268,7 +2621,7 @@ run_rhis_config_as_code() {
             print_warning "Fix permissions/ownership on ${ANSIBLE_VAULT_PASS_FILE} and retry."
             return 1
         else
-            vault_arg=(--ask-vault-password)
+            vault_arg=(--ask-vault-pass)
             use_interactive_vault_prompt=1
             print_warning "Vault password file not readable in container at ${vault_pass_file}."
             print_warning "Falling back to interactive vault password prompt for config-as-code phases."
@@ -2276,7 +2629,16 @@ run_rhis_config_as_code() {
     fi
 
     local inv="--inventory /rhis/vars/external_inventory/hosts"
-    local evars="--extra-vars @${vault_file}"
+    local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false}}"
+    local manual_vault_arg="${vault_arg[*]}"
+    if [ -z "${manual_vault_arg}" ]; then
+        manual_vault_arg="--ask-vault-pass"
+    fi
+
+    print_manual_rerun_template() {
+        print_warning "Manual rerun template (works for all groups):"
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+    }
 
     print_step "Ansible log: ${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
     print_step "Ansible config: ${RHIS_ANSIBLE_CFG_HOST}"
@@ -2285,98 +2647,810 @@ run_rhis_config_as_code() {
         local phase_label="$1"
         local phase_limit="$2"
         local phase_playbook="$3"
+        local -a phase_args=()
+
+        phase_args=("${extra_args[@]}")
+
+        # IdM collection expects ipadm_password in some install paths.
+        if [ "${phase_limit}" = "idm" ] && [ -n "${IPADM_PASSWORD:-}" ]; then
+            phase_args+=( -e "ipadm_password=${IPADM_PASSWORD}" )
+            phase_args+=( -e "ipaadmin_password=${IPAADMIN_PASSWORD:-${IPADM_PASSWORD}}" )
+        fi
+
+        # Satellite collection expects sat_repository_ids and (optionally) CDN activation vars.
+        if [ "${phase_limit}" = "scenario_satellite" ]; then
+            phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON}}" )
+            if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+                phase_args+=( -e "cdn_organization_id=${CDN_ORGANIZATION_ID}" )
+                phase_args+=( -e "cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}" )
+            else
+                phase_args+=( --skip-tags "tags_satellite_pre_cdn_registration" )
+            fi
+
+            if ! podman exec "${RHIS_CONTAINER_NAME}" test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 2>/dev/null; then
+                phase_args+=( --skip-tags "tags_satellite_pre_chrony" )
+                print_warning "chrony.j2 is missing in rhis-builder-satellite; skipping tags_satellite_pre_chrony for this run."
+            fi
+        fi
 
         print_step "${phase_label}"
         if [ "$use_interactive_vault_prompt" = "1" ]; then
             podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
                 ansible-playbook ${inv} "${vault_arg[@]}" ${evars} \
                 --limit "${phase_limit}" \
+                "${phase_args[@]}" \
                 "${phase_playbook}"
         else
             podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
                 ansible-playbook ${inv} "${vault_arg[@]}" ${evars} \
                 --limit "${phase_limit}" \
+                "${phase_args[@]}" \
                 "${phase_playbook}"
         fi
     }
 
+    run_phase_playbook_with_auth_fallback() {
+        local phase_label="$1"
+        local phase_limit="$2"
+        local phase_playbook="$3"
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local -a fallback_phase_args=()
+
+        fallback_phase_args=("${extra_args[@]}")
+        if [ "${phase_limit}" = "idm" ] && [ -n "${IPADM_PASSWORD:-}" ]; then
+            fallback_phase_args+=( -e "ipadm_password=${IPADM_PASSWORD}" )
+            fallback_phase_args+=( -e "ipaadmin_password=${IPAADMIN_PASSWORD:-${IPADM_PASSWORD}}" )
+        fi
+        if [ "${phase_limit}" = "scenario_satellite" ]; then
+            fallback_phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON}}" )
+            if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+                fallback_phase_args+=( -e "cdn_organization_id=${CDN_ORGANIZATION_ID}" )
+                fallback_phase_args+=( -e "cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}" )
+            else
+                fallback_phase_args+=( --skip-tags "tags_satellite_pre_cdn_registration" )
+            fi
+
+            if ! podman exec "${RHIS_CONTAINER_NAME}" test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 2>/dev/null; then
+                fallback_phase_args+=( --skip-tags "tags_satellite_pre_chrony" )
+                print_warning "chrony.j2 is missing in rhis-builder-satellite; skipping tags_satellite_pre_chrony for fallback run."
+            fi
+        fi
+
+        phase_auth_fallback_status="not-needed"
+
+        if run_phase_playbook "$phase_label" "$phase_limit" "$phase_playbook"; then
+            phase_auth_fallback_status="not-needed"
+            return 0
+        fi
+
+        if [ -z "$root_auth_pass" ]; then
+            print_warning "Auth fallback skipped for ${phase_label}: ROOT_PASS/ADMIN_PASS is unset."
+            phase_auth_fallback_status="unavailable"
+            return 1
+        fi
+
+        print_warning "${phase_label} failed on first attempt; retrying once with root SSH auth fallback."
+        phase_auth_fallback_status="used"
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible-playbook ${inv} "${vault_arg[@]}" ${evars} \
+                --limit "${phase_limit}" \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                "${fallback_phase_args[@]}" \
+                "${phase_playbook}"
+            if [ "$?" -eq 0 ]; then
+                phase_auth_fallback_status="used/succeeded"
+                return 0
+            fi
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible-playbook ${inv} "${vault_arg[@]}" ${evars} \
+                --limit "${phase_limit}" \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                "${fallback_phase_args[@]}" \
+                "${phase_playbook}"
+            if [ "$?" -eq 0 ]; then
+                phase_auth_fallback_status="used/succeeded"
+                return 0
+            fi
+        fi
+
+        phase_auth_fallback_status="used/failed"
+        return 1
+    }
+
+    # -------------------------------------------------------------------------
+    # assert_satellite_server_repos_available
+    # -------------------------------------------------------------------------
+    # Connects to the Satellite host and validates that every repo ID listed in
+    # SAT_REPOSITORY_IDS_JSON is visible via subscription-manager.  Fails fast
+    # with a human-readable remediation guide when any server repo is absent.
+    # Returns 0 when all repos are present or when the host is unreachable
+    # (non-blocking soft-fail with a warning so a later SSH failure surfaces the
+    # real problem instead of a duplicate pre-flight error).
+    # -------------------------------------------------------------------------
+    assert_satellite_server_repos_available() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local check_cmd='source /etc/os-release >/dev/null 2>&1 || true; printf "OS_MAJOR=%s\n" "${VERSION_ID%%.*}"; subscription-manager repos --list 2>/dev/null | awk "/^Repo ID/{print \$NF}" | sort'
+        local repos_out=""
+        local -a missing=()
+        local -a required_repos=()
+        local sat_os_major=""
+
+        # Parse the JSON array into a bash array without requiring jq.
+        local raw="${SAT_REPOSITORY_IDS_JSON}"
+        raw="${raw//[/}" ; raw="${raw//]/}" ; raw="${raw//\"/}"
+        IFS=',' read -ra required_repos <<< "${raw}"
+
+        print_step "Pre-flight: verifying RHSM repo entitlements on Satellite host (${SAT_HOSTNAME:-satellite})..."
+
+        # First try vault credentials.
+        repos_out=$(podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" \
+            "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+            ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
+            -m ansible.builtin.shell \
+            -a "${check_cmd}" \
+            --one-line 2>/dev/null) || true
+
+        # Fall back to root password if vault auth yielded nothing.
+        if [ -z "${repos_out}" ] && [ -n "${root_auth_pass}" ]; then
+            repos_out=$(podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" \
+                "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m ansible.builtin.shell \
+                -a "${check_cmd}" \
+                --one-line 2>/dev/null) || true
+        fi
+
+        if [ -z "${repos_out}" ]; then
+            print_warning "Could not reach Satellite host to verify repo entitlements; proceeding (will fail later if repos absent)."
+            return 0
+        fi
+
+        sat_os_major="$(printf '%s\n' "${repos_out}" | awk -F= '/OS_MAJOR=/{print $2; exit}')"
+        if [ -n "${sat_os_major}" ] && [ "${sat_os_major}" != "9" ]; then
+            print_warning "Satellite host is not running RHEL 9 (detected major=${sat_os_major})."
+            print_warning "Satellite 6.18 workflow in this installer is pinned to RHEL 9 repos/media."
+            return 1
+        fi
+
+        for repo_id in "${required_repos[@]}"; do
+            repo_id="${repo_id// /}"     # trim whitespace from JSON parse
+            [ -z "${repo_id}" ] && continue
+            if ! echo "${repos_out}" | grep -qF "${repo_id}"; then
+                missing+=( "${repo_id}" )
+            fi
+        done
+
+        if [ "${#missing[@]}" -eq 0 ]; then
+            print_success "All required Satellite repos confirmed in RHSM entitlement."
+            return 0
+        fi
+
+        echo -e "${RED}${BOLD}════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${RED}${BOLD}  ✘  SATELLITE PRE-FLIGHT FAILED — entitlement repos missing${NC}"
+        echo -e "${RED}${BOLD}════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "${RED}  The following repo IDs are NOT currently exposed via RHSM${NC}"
+        echo -e "${RED}  on Satellite host: ${SAT_HOSTNAME:-satellite}${NC}"
+        echo ""
+        for r in "${missing[@]}"; do
+            echo -e "${RED}    ✗  ${r}${NC}"
+        done
+        echo ""
+        echo -e "${BOLD}  Your RHSM account MUST expose ALL of these repo IDs before${NC}"
+        echo -e "${BOLD}  this Satellite installation can proceed:${NC}"
+        echo ""
+        for r in "${required_repos[@]}"; do
+            r="${r// /}" ; [ -z "${r}" ] && continue
+            echo    "    •  ${r}"
+        done
+        echo ""
+        echo -e "${BOLD}  How to resolve:${NC}"
+        echo    "  1. Log into https://access.redhat.com/management/subscriptions"
+        echo    "     and confirm your account has a Red Hat Satellite Server"
+        echo    "     subscription (SKU: MCT0370 or similar Smart Management SKU)."
+        echo    "  2. If using an activation key, set CDN_ORGANIZATION_ID and"
+        echo    "     CDN_SAT_ACTIVATION_KEY before re-running so the Satellite"
+        echo    "     host attaches via a key that includes 'Smart Management'."
+        echo    "  3. Otherwise run directly on ${SAT_HOSTNAME:-your Satellite host}:"
+        echo    "       subscription-manager attach --auto"
+        echo    "     then verify with:"
+        echo    "       subscription-manager repos --list | grep satellite-6.18"
+        echo    "     Expected output should include:"
+        echo    "       satellite-6.18-for-rhel-9-x86_64-rpms"
+        echo    "       satellite-maintenance-6.18-for-rhel-9-x86_64-rpms"
+        echo -e "${RED}${BOLD}════════════════════════════════════════════════════════════════${NC}"
+        return 1
+    }
+
+    ensure_managed_nodes_registered() {
+        local register_target="idm:scenario_satellite:aap"
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local reg_shell='subscription-manager identity >/dev/null 2>&1 || subscription-manager register --username="{{ rh_user }}" --password="{{ rh_pass }}" --force; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; if [ -d /etc/pki/rpm-gpg ]; then for k in /etc/pki/rpm-gpg/*; do [ -f "$k" ] && rpm --import "$k" >/dev/null 2>&1 || true; done; fi; dnf clean metadata >/dev/null 2>&1 || true'
+
+        if [ -z "${RH_USER:-}" ] || [ -z "${RH_PASS:-}" ]; then
+            print_warning "Skipping RHSM registration precheck: RH_USER/RH_PASS is not set."
+            return 0
+        fi
+
+        print_step "Ensuring RHSM registration on IdM/Satellite/AAP before config-as-code phases"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${reg_shell}"
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${reg_shell}"
+            fi
+
+            if [ "$?" -eq 0 ]; then
+                print_success "RHSM registration precheck complete for IdM/Satellite/AAP."
+                return 0
+            fi
+
+            print_warning "RHSM registration precheck failed with root auth; retrying once with inventory credentials."
+        fi
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${reg_shell}"
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${reg_shell}"
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            print_success "RHSM registration precheck complete for IdM/Satellite/AAP."
+            return 0
+        fi
+
+        if [ -z "$root_auth_pass" ]; then
+            print_warning "RHSM registration precheck failed and ROOT_PASS/ADMIN_PASS is unset for fallback."
+            return 1
+        fi
+
+        print_warning "RHSM registration precheck failed on first attempt; retrying with root SSH auth fallback."
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m shell \
+                -a "${reg_shell}"
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m shell \
+                -a "${reg_shell}"
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            print_success "RHSM registration precheck succeeded with root auth fallback."
+            return 0
+        fi
+
+        print_warning "RHSM registration precheck failed; package/repository tasks may fail until hosts are registered."
+        return 1
+    }
+
+    ensure_idm_fqdn_resolution() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local fqdn_shell="f='${IDM_HOSTNAME}'; h='${IDM_ALIAS:-idm}'; ip='${IDM_IP}'; [ -n \"\$ip\" ] || ip=\"\$(hostname -I 2>/dev/null | awk '{print \$1}')\"; if [ -n \"\$f\" ] && [ -n \"\$ip\" ] && ! getent hosts \"\$f\" >/dev/null 2>&1; then echo \"\$ip \$f \$h\" >> /etc/hosts; fi; getent hosts \"\$f\" >/dev/null 2>&1"
+
+        print_step "Ensuring IdM host can resolve its own FQDN before idm_pre checks"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${fqdn_shell}"
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${fqdn_shell}"
+            fi
+
+            if [ "$?" -eq 0 ]; then
+                print_success "IdM FQDN resolution precheck passed."
+                return 0
+            fi
+
+            print_warning "IdM FQDN precheck failed with root auth; retrying once with inventory credentials."
+        fi
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${fqdn_shell}"
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${fqdn_shell}"
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            print_success "IdM FQDN resolution precheck passed."
+            return 0
+        fi
+
+        if [ -z "$root_auth_pass" ]; then
+            print_warning "IdM FQDN precheck failed and ROOT_PASS/ADMIN_PASS is unset for fallback."
+            return 1
+        fi
+
+        print_warning "IdM FQDN precheck failed on first attempt; retrying with root SSH auth fallback."
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m shell \
+                -a "${fqdn_shell}"
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m shell \
+                -a "${fqdn_shell}"
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            print_success "IdM FQDN resolution precheck succeeded with root auth fallback."
+            return 0
+        fi
+
+        print_warning "IdM FQDN resolution precheck failed; idm_pre DNS assertions may fail."
+        return 1
+    }
+
+    ensure_idm_internet_resolution() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local net_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true; fi; getent hosts redhat.com >/dev/null 2>&1'
+
+        print_step "Pre-flight: ensuring IdM can resolve public internet names (redhat.com)"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${net_shell}"
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${net_shell}"
+            fi
+
+            if [ "$?" -eq 0 ]; then
+                print_success "IdM internet resolution precheck passed."
+                return 0
+            fi
+        fi
+
+        print_warning "IdM internet resolution precheck could not be confirmed; idm_pre internet assertions may still fail."
+        return 1
+    }
+
+    remediate_satellite_repo_entitlements() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local sat_shell='set -e; subscription-manager identity >/dev/null 2>&1 || subscription-manager register --username="{{ rh_user }}" --password="{{ rh_pass }}" --force || true; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; subscription-manager repos --disable="*" >/dev/null 2>&1 || true; subscription-manager repos --enable="rhel-9-for-x86_64-baseos-rpms" --enable="rhel-9-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-9-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-9-x86_64-rpms" >/dev/null 2>&1 || true; subscription-manager repos --list >/dev/null 2>&1'
+
+        print_step "Pre-flight: attempting Satellite RHSM attach and repo enable remediation"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${sat_shell}" >/dev/null 2>&1 || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${sat_shell}" >/dev/null 2>&1 || true
+            fi
+        else
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${sat_shell}" >/dev/null 2>&1 || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${sat_shell}" >/dev/null 2>&1 || true
+            fi
+        fi
+
+        return 0
+    }
+
+    # Print IdM network state (routes, resolver, internet check) after a failure
+    # so the root cause is immediately visible without manual SSH.
+    dump_idm_network_diagnostics() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local diag_shell='echo "=== ip route ==="; ip route show; echo "=== /etc/resolv.conf ==="; cat /etc/resolv.conf; echo "=== internet resolution ==="; getent hosts redhat.com && echo "PASS: redhat.com resolves" || echo "FAIL: redhat.com does NOT resolve"'
+
+        print_step "Diagnostics: collecting IdM network state after failure"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${diag_shell}" || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${diag_shell}" || true
+            fi
+        else
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
+            fi
+        fi
+
+        return 0
+    }
+
+    # Print Satellite RHSM identity, status, and enabled repos after a failure
+    # so entitlement and repo issues are immediately visible.
+    dump_satellite_rhsm_diagnostics() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local diag_shell='echo "=== subscription-manager identity ==="; subscription-manager identity || echo "(not registered)"; echo "=== subscription-manager status ==="; subscription-manager status || true; echo "=== enabled repos ==="; subscription-manager repos --list-enabled || echo "(none or error)"'
+
+        print_step "Diagnostics: collecting Satellite RHSM state after failure"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${diag_shell}" || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${diag_shell}" || true
+            fi
+        else
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
+            fi
+        fi
+
+        return 0
+    }
+
+    # Ensure all managed hosts are fully up to date before any config-as-code
+    # phase runs. Prefer root-auth execution when ROOT_PASS/ADMIN_PASS exists.
+    # If root auth is unavailable, fall back to inventory credentials.
+    # Non-fatal (|| true) so a single host issue does not abort everything.
+    ensure_all_hosts_upgraded() {
+        local upgrade_target="idm:aap"
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local upgrade_shell='if subscription-manager identity >/dev/null 2>&1; then echo "Upgrade preflight: registered=yes"; else echo "Upgrade preflight: registered=no"; subscription-manager register --username="{{ rh_user }}" --password="{{ rh_pass }}" --force; fi; subscription-manager refresh; dnf -y --nogpgcheck upgrade subscription-manager; subscription-manager refresh; (dnf -y --nogpgcheck group install "Base" || dnf -y --nogpgcheck groupinstall "Base"); dnf install -y --nogpgcheck yum-utils; dnf autoremove -y; dnf clean all; dnf -y --nogpgcheck upgrade'
+
+        print_step "Pre-flight: ensuring RHSM registration and running the requested DNF upgrade sequence on IdM/AAP hosts..."
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${upgrade_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${upgrade_shell}"
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${upgrade_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${upgrade_shell}"
+            fi
+
+            if [ "$?" -eq 0 ]; then
+                print_success "IdM/AAP hosts upgraded successfully."
+                return 0
+            fi
+
+            print_warning "dnf upgrade failed with root auth; skipping inventory-credential retry to avoid known admin auth noise."
+            print_warning "Root-auth connectivity summary (expected IdM/AAP reachable as root):"
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${upgrade_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m ansible.builtin.ping \
+                    --one-line 2>/dev/null || true
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${upgrade_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m ansible.builtin.ping \
+                    --one-line 2>/dev/null || true
+            fi
+            return 1
+        fi
+
+        print_warning "ROOT_PASS/ADMIN_PASS is unset; attempting upgrade with inventory credentials."
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${upgrade_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${upgrade_shell}"
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${upgrade_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${upgrade_shell}"
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            print_success "IdM/AAP hosts upgraded successfully."
+            return 0
+        fi
+
+        print_warning "Upgrade preflight failed with inventory credentials; continuing."
+        return 1
+    }
+
+    reboot_managed_hosts_after_upgrade() {
+        local reboot_target="idm:aap"
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local reboot_shell='nohup bash -c "sleep 2; systemctl reboot" >/dev/null 2>&1 &'
+
+        [ -n "$root_auth_pass" ] || {
+            print_warning "Skipping post-upgrade reboot: ROOT_PASS/ADMIN_PASS is unset."
+            return 1
+        }
+
+        print_step "Post-upgrade: rebooting IdM/AAP before continuing"
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${reboot_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m shell \
+                -a "${reboot_shell}" >/dev/null 2>&1 || true
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${reboot_target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -e "ansible_user=root" \
+                -e "ansible_password=${root_auth_pass}" \
+                -e "ansible_become=false" \
+                -e "ansible_become_password=${root_auth_pass}" \
+                -m shell \
+                -a "${reboot_shell}" >/dev/null 2>&1 || true
+        fi
+
+        sleep 15
+        print_step "Post-upgrade: waiting for IdM and Satellite to return after reboot"
+        preflight_config_as_code_targets "idm:${IDM_IP}" "satellite-618:${SAT_IP}" || return 1
+        print_success "Post-upgrade reboot complete; IdM and Satellite are reachable again."
+        return 0
+    }
+
+    ensure_managed_nodes_registered || true
+    ensure_idm_fqdn_resolution || true
+    ensure_idm_internet_resolution || true
+    if ensure_all_hosts_upgraded; then
+        reboot_managed_hosts_after_upgrade || true
+    fi
+
     # ── 1. IdM — must be ready first (Satellite/AAP enroll against it) ─────────
-    if ! run_phase_playbook "Phase 1/3 — Configuring IdM..." "idm" "/rhis/rhis-builder-idm/main.yml"; then
+    if ! run_phase_playbook_with_auth_fallback "Phase 1/3 — Configuring IdM..." "idm" "/rhis/rhis-builder-idm/main.yml"; then
+        idm_auth_fallback_status="${phase_auth_fallback_status}"
         idm_status="failed"
         any_failed=1
         print_warning "IdM config-as-code failed.  Check the output above."
+        dump_idm_network_diagnostics || true
         print_warning "You can re-run manually:"
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${evars} --limit idm /rhis/rhis-builder-idm/main.yml"
+        print_manual_rerun_template
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit idm /rhis/rhis-builder-idm/main.yml"
     else
+        idm_auth_fallback_status="${phase_auth_fallback_status}"
         idm_status="success"
         print_success "IdM configuration complete."
     fi
+    print_step "Auth fallback (IdM): ${idm_auth_fallback_status}"
 
     # ── 2. Satellite ───────────────────────────────────────────────────────────
-    if ! run_phase_playbook "Phase 2/3 — Configuring Satellite..." "scenario_satellite" "/rhis/rhis-builder-satellite/main.yml"; then
+    remediate_satellite_repo_entitlements || true
+    if ! assert_satellite_server_repos_available; then
+        satellite_status="entitlement-missing"
+        any_failed=1
+        print_warning "Skipping Satellite phase: required RHSM server repos are not available."
+        dump_satellite_rhsm_diagnostics || true
+        print_warning "Resolve the entitlement issue above and re-run."
+    elif ! run_phase_playbook_with_auth_fallback "Phase 2/3 — Configuring Satellite..." "scenario_satellite" "/rhis/rhis-builder-satellite/main.yml"; then
+        satellite_auth_fallback_status="${phase_auth_fallback_status}"
         satellite_status="failed"
         any_failed=1
         print_warning "Satellite config-as-code failed.  Check the output above."
+        dump_satellite_rhsm_diagnostics || true
         print_warning "You can re-run manually:"
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${evars} --limit scenario_satellite /rhis/rhis-builder-satellite/main.yml"
+        print_manual_rerun_template
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit scenario_satellite /rhis/rhis-builder-satellite/main.yml"
     else
+        satellite_auth_fallback_status="${phase_auth_fallback_status}"
         satellite_status="success"
         print_success "Satellite configuration complete."
     fi
+    print_step "Auth fallback (Satellite): ${satellite_auth_fallback_status}"
 
     # ── 3. AAP ─────────────────────────────────────────────────────────────────
     print_step "Phase gate: starting deferred AAP callback and readiness checks"
     if ! run_deferred_aap_callback; then
         aap_status="callback-failed"
+        aap_auth_fallback_status="not-needed"
         any_failed=1
         print_warning "AAP callback did not complete; skipping AAP config-as-code phase."
     elif ! preflight_config_as_code_targets "aap-26:${AAP_IP}"; then
         aap_status="ssh-unreachable"
+        aap_auth_fallback_status="not-needed"
         any_failed=1
         print_warning "AAP internal SSH is still not reachable; skipping AAP config-as-code phase."
-    elif ! run_phase_playbook "Phase 3/3 — Configuring AAP..." "aap" "/rhis/rhis-builder-aap/main.yml"; then
+    elif ! run_phase_playbook_with_auth_fallback "Phase 3/3 — Configuring AAP..." "aap" "/rhis/rhis-builder-aap/main.yml"; then
+        aap_auth_fallback_status="${phase_auth_fallback_status}"
         aap_status="failed"
         any_failed=1
         print_warning "AAP config-as-code failed.  Check the output above."
         print_warning "You can re-run manually:"
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${evars} --limit aap /rhis/rhis-builder-aap/main.yml"
+        print_manual_rerun_template
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit aap /rhis/rhis-builder-aap/main.yml"
     else
+        aap_auth_fallback_status="${phase_auth_fallback_status}"
         aap_status="success"
         print_success "AAP configuration complete."
     fi
+    print_step "Auth fallback (AAP): ${aap_auth_fallback_status}"
 
     if [ "$any_failed" -ne 0 ] && is_enabled "${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"; then
         print_step "Retry mode enabled: re-running only failed phases once"
         any_failed=0
 
         if [ "$idm_status" = "failed" ]; then
-            if run_phase_playbook "Retry — IdM" "idm" "/rhis/rhis-builder-idm/main.yml"; then
+            if run_phase_playbook_with_auth_fallback "Retry — IdM" "idm" "/rhis/rhis-builder-idm/main.yml"; then
                 idm_status="success-after-retry"
                 print_success "IdM succeeded on retry."
             else
                 any_failed=1
                 print_warning "IdM retry failed."
             fi
+            idm_auth_fallback_status="${phase_auth_fallback_status}"
+            print_step "Auth fallback (IdM retry): ${idm_auth_fallback_status}"
         fi
 
         if [ "$satellite_status" = "failed" ]; then
-            if run_phase_playbook "Retry — Satellite" "scenario_satellite" "/rhis/rhis-builder-satellite/main.yml"; then
+            if run_phase_playbook_with_auth_fallback "Retry — Satellite" "scenario_satellite" "/rhis/rhis-builder-satellite/main.yml"; then
                 satellite_status="success-after-retry"
                 print_success "Satellite succeeded on retry."
             else
                 any_failed=1
                 print_warning "Satellite retry failed."
             fi
+            satellite_auth_fallback_status="${phase_auth_fallback_status}"
+            print_step "Auth fallback (Satellite retry): ${satellite_auth_fallback_status}"
         fi
 
         if [ "$aap_status" = "failed" ]; then
-            if run_phase_playbook "Retry — AAP" "aap" "/rhis/rhis-builder-aap/main.yml"; then
+            if run_phase_playbook_with_auth_fallback "Retry — AAP" "aap" "/rhis/rhis-builder-aap/main.yml"; then
                 aap_status="success-after-retry"
                 print_success "AAP succeeded on retry."
             else
                 any_failed=1
                 print_warning "AAP retry failed."
             fi
+            aap_auth_fallback_status="${phase_auth_fallback_status}"
+            print_step "Auth fallback (AAP retry): ${aap_auth_fallback_status}"
         fi
     fi
 
@@ -2394,7 +3468,7 @@ run_rhis_config_as_code() {
     echo ""
     echo "To re-run any component:"
     echo "  podman exec -it ${RHIS_CONTAINER_NAME} /bin/bash"
-    echo "  ansible-playbook ${inv} ${evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+    echo "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
 
     cleanup_staged_vaultpass
 
@@ -2459,6 +3533,7 @@ setup_virt_manager() {
     enable_virt_manager_resize_guest
     configure_libvirt_networks
     download_rhel10_iso || true
+    download_rhel9_iso || true
 
     read -r -p "Create Satellite/AAP VMs now? [Y/n]: " build_vms
     case "${build_vms:-Y}" in
@@ -2471,11 +3546,11 @@ setup_virt_manager() {
     esac
 
     print_step "Installing build dependency tooling for virtualization packages"
-    sudo dnf install -y yum-utils
+    sudo dnf install -y --nogpgcheck yum-utils
     sudo yum-builddep -y virt-install qemu-img libvirt-client libvirt virt-manager
 
     print_step "Installing virt-manager and dependencies"
-    sudo dnf install virt-manager virt-viewer libvirt qemu-kvm -y
+    sudo dnf install -y --nogpgcheck virt-manager virt-viewer libvirt qemu-kvm
 
     print_step "Enabling libvirtd service"
     sudo systemctl enable libvirtd
@@ -2522,7 +3597,7 @@ ensure_iso_vars() {
 
 ensure_jq() {
 	if command -v jq >/dev/null 2>&1; then return 0; fi
-	sudo dnf install -y jq
+    sudo dnf install -y --nogpgcheck jq
 	return $?
 }
 
@@ -2534,7 +3609,7 @@ ensure_ansible_vault() {
     fi
 
     print_warning "ansible-vault not found. Attempting to install ansible-core..."
-    sudo dnf install -y ansible-core >/dev/null 2>&1 || {
+    sudo dnf install -y --nogpgcheck ansible-core >/dev/null 2>&1 || {
         print_warning "Could not install ansible-core. Please install ansible-vault and re-run."
         return 1
     }
@@ -2617,6 +3692,35 @@ _load_env_key() {
     return 0
 }
 
+# Read one nested networks field from env.yml into a bash variable (no-op if already set).
+# Expected shape:
+# networks:
+#   satellite:
+#     ip: "10.168.128.1"
+#     mask: "255.255.0.0"
+#     gateway: "10.168.0.1"
+_load_env_network_field() {
+    local var_name="$1" node_name="$2" field_name="$3" val
+    [ -n "${!var_name:-}" ] && return 0
+
+    val="$(printf '%s\n' "$ANSIBLE_ENV_CONTENT" | awk -v node="$node_name" -v field="$field_name" '
+        /^networks:[[:space:]]*$/ { in_networks=1; next }
+        in_networks && /^[^[:space:]]/ { in_networks=0 }
+        in_networks && $0 ~ ("^  " node ":[[:space:]]*$") { in_node=1; next }
+        in_networks && in_node && $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_node=0 }
+        in_networks && in_node && $0 ~ ("^    " field ":[[:space:]]*") {
+            line=$0
+            sub("^    " field ":[[:space:]]*\"?", "", line)
+            sub("\"?[[:space:]]*$", "", line)
+            print line
+            exit
+        }
+    ')"
+
+    [ -n "$val" ] && printf -v "$var_name" '%s' "$val"
+    return 0
+}
+
 # Load all RHIS credentials from ~/.ansible/conf/env.yml.
 # Only populates variables currently unset — preseed / CLI values always win.
 load_ansible_env_file() {
@@ -2636,6 +3740,14 @@ load_ansible_env_file() {
     _load_env_key HUB_TOKEN        hub_token
     _load_env_key SAT_ADMIN_PASS   sat_admin_pass
     _load_env_key AAP_ADMIN_PASS   aap_admin_pass
+    _load_env_key SATELLITE_DISCONNECTED satellite_disconnected
+    _load_env_key IPADM_PASSWORD   ipadm_password
+    _load_env_key IPAADMIN_PASSWORD ipaadmin_password
+    _load_env_key CDN_ORGANIZATION_ID cdn_organization_id
+    _load_env_key CDN_SAT_ACTIVATION_KEY cdn_sat_activation_key
+    _load_env_key SAT_FIREWALLD_ZONE sat_firewalld_zone
+    _load_env_key SAT_FIREWALLD_INTERFACE sat_firewalld_interface
+    _load_env_key SAT_FIREWALLD_SERVICES_JSON sat_firewalld_services_json
     _load_env_key INSTALLER_USER   installer_user
     _load_env_key AAP_INVENTORY_TEMPLATE aap_inventory_template
     _load_env_key AAP_INVENTORY_GROWTH_TEMPLATE aap_inventory_growth_template
@@ -2650,6 +3762,17 @@ load_ansible_env_file() {
     _load_env_key SAT_GW           sat_gw
     _load_env_key AAP_GW           aap_gw
     _load_env_key IDM_GW           idm_gw
+
+    # Backward/forward compatibility: support nested networks mapping as a source.
+    _load_env_network_field SAT_IP satellite ip
+    _load_env_network_field SAT_NETMASK satellite mask
+    _load_env_network_field SAT_GW satellite gateway
+    _load_env_network_field AAP_IP aap ip
+    _load_env_network_field AAP_NETMASK aap mask
+    _load_env_network_field AAP_GW aap gateway
+    _load_env_network_field IDM_IP idm ip
+    _load_env_network_field IDM_NETMASK idm mask
+    _load_env_network_field IDM_GW idm gateway
     _load_env_key SAT_HOSTNAME     sat_hostname
     _load_env_key SAT_ALIAS        sat_alias
     _load_env_key SAT_DOMAIN       sat_domain
@@ -2667,6 +3790,7 @@ load_ansible_env_file() {
     _load_env_key HOST_INT_IP      host_int_ip
     _load_env_key AAP_BUNDLE_URL   aap_bundle_url
     _load_env_key RH_ISO_URL       rh_iso_url
+    _load_env_key RH9_ISO_URL      rh9_iso_url
     normalize_shared_env_vars
 }
 
@@ -2699,6 +3823,14 @@ aap_ip: "${AAP_IP:-}"
 idm_ip: "${IDM_IP:-}"
 aap_admin_pass: "${AAP_ADMIN_PASS:-}"
 sat_admin_pass: "${SAT_ADMIN_PASS:-}"
+satellite_disconnected: ${SATELLITE_DISCONNECTED:-false}
+ipadm_password: "${IPADM_PASSWORD:-}"
+ipaadmin_password: "${IPAADMIN_PASSWORD:-}"
+cdn_organization_id: "${CDN_ORGANIZATION_ID:-}"
+cdn_sat_activation_key: "${CDN_SAT_ACTIVATION_KEY:-}"
+sat_firewalld_zone: "${SAT_FIREWALLD_ZONE:-public}"
+sat_firewalld_interface: "${SAT_FIREWALLD_INTERFACE:-eth1}"
+sat_firewalld_services_json: '${SAT_FIREWALLD_SERVICES_JSON:-["ssh","http","https"]}'
 # Alias used by rhis-builder host_vars templates ({{ global_admin_password }})
 global_admin_password: "${ADMIN_PASS:-}"
 # The local username running this script — consumed by installer host_vars
@@ -2728,9 +3860,26 @@ idm_admin_pass: "${IDM_ADMIN_PASS:-}"
 idm_ds_pass: "${IDM_DS_PASS:-}"
 idm_netmask: "${IDM_NETMASK:-}"
 idm_gw: "${IDM_GW:-}"
+
+# Canonical network mapping (new format). Flat keys are retained above for compatibility.
+networks:
+    satellite:
+        ip: "${SAT_IP:-}"
+        mask: "${SAT_NETMASK:-}"
+        gateway: "${SAT_GW:-}"
+    aap:
+        ip: "${AAP_IP:-}"
+        mask: "${AAP_NETMASK:-}"
+        gateway: "${AAP_GW:-}"
+    idm:
+        ip: "${IDM_IP:-}"
+        mask: "${IDM_NETMASK:-}"
+        gateway: "${IDM_GW:-}"
+
 host_int_ip: "${HOST_INT_IP:-}"
 aap_bundle_url: "${AAP_BUNDLE_URL:-}"
 rh_iso_url: "${RH_ISO_URL:-}"
+rh9_iso_url: "${RH9_ISO_URL:-}"
 RHIS_ENV_EOF
     chmod 600 "$tmp_env"
 
@@ -2758,9 +3907,9 @@ prompt_all_env_options_once() {
             return 0
         fi
 
-        global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM INTERNAL_NETWORK NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL)"
+        global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM INTERNAL_NETWORK NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL RH9_ISO_URL HOST_INT_IP)"
         echo ""
-        echo "=== Global (remaining missing: ${global_missing}/13) ==="
+        echo "=== Global (remaining missing: ${global_missing}/15) ==="
         if [ -z "${ADMIN_USER:-}" ]; then
             prompt_with_default ADMIN_USER "Shared Admin Username" "${ADMIN_USER:-admin}" 0 1 || return 1
             env_changed=1
@@ -2811,7 +3960,15 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
         if [ -z "${RH_ISO_URL:-}" ]; then
-            prompt_with_default RH_ISO_URL "RHEL ISO URL" "${RH_ISO_URL:-}" 0 1 || return 1
+            prompt_with_default RH_ISO_URL "RHEL 10 ISO URL (AAP/IdM)" "${RH_ISO_URL:-}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${RH9_ISO_URL:-}" ]; then
+            prompt_with_default RH9_ISO_URL "RHEL 9 ISO URL (Satellite)" "${RH9_ISO_URL:-}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${HOST_INT_IP:-}" ]; then
+            prompt_with_default HOST_INT_IP "Host bridge IP for guest HTTP callbacks" "${HOST_INT_IP:-192.168.122.1}" 0 1 || return 1
             env_changed=1
         fi
 
@@ -2852,15 +4009,19 @@ prompt_all_env_options_once() {
         fi
         SAT_ADMIN_PASS="${ADMIN_PASS}"
 
-        aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
+        aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_GW AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
         echo ""
-        echo "=== AAP (remaining missing: ${aap_missing}/7) ==="
+        echo "=== AAP (remaining missing: ${aap_missing}/8) ==="
         if [ -z "${AAP_IP:-}" ]; then
             prompt_with_default AAP_IP "AAP Internal IP (eth1)" "${AAP_IP:-10.168.128.2}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${AAP_NETMASK:-}" ]; then
-            prompt_with_default AAP_NETMASK "AAP Internal Netmask" "${AAP_NETMASK:-255.255.0.0}" 0 1 || return 1
+            prompt_with_default AAP_NETMASK "AAP Internal Netmask" "${AAP_NETMASK:-$NETMASK}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${AAP_GW:-}" ]; then
+            prompt_with_default AAP_GW "AAP Internal Gateway" "${AAP_GW:-$INTERNAL_GW}" 0 1 || return 1
             env_changed=1
         fi
         if needs_prompt_var AAP_HOSTNAME; then
@@ -2885,15 +4046,19 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
 
-        idm_missing="$(count_missing_vars IDM_IP IDM_NETMASK IDM_HOSTNAME IDM_ALIAS IDM_DS_PASS)"
+        idm_missing="$(count_missing_vars IDM_IP IDM_NETMASK IDM_GW IDM_HOSTNAME IDM_ALIAS IDM_DS_PASS)"
         echo ""
-        echo "=== IdM (remaining missing: ${idm_missing}/5) ==="
+        echo "=== IdM (remaining missing: ${idm_missing}/6) ==="
         if [ -z "${IDM_IP:-}" ]; then
             prompt_with_default IDM_IP "IdM Internal IP (eth1)" "${IDM_IP:-10.168.128.3}" 0 1 || return 1
             env_changed=1
         fi
         if [ -z "${IDM_NETMASK:-}" ]; then
-            prompt_with_default IDM_NETMASK "IdM Internal Netmask" "${IDM_NETMASK:-255.255.0.0}" 0 1 || return 1
+            prompt_with_default IDM_NETMASK "IdM Internal Netmask" "${IDM_NETMASK:-$NETMASK}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${IDM_GW:-}" ]; then
+            prompt_with_default IDM_GW "IdM Internal Gateway" "${IDM_GW:-$INTERNAL_GW}" 0 1 || return 1
             env_changed=1
         fi
         if needs_prompt_var IDM_HOSTNAME; then
@@ -2939,15 +4104,16 @@ prompt_all_env_options_once() {
         RH_ACCESS_TOKEN=""
         HUB_TOKEN=""
         RH_ISO_URL=""
+        RH9_ISO_URL=""
         AAP_BUNDLE_URL=""
     fi
 
     print_step "First run detected: collecting environment values and storing them in ansible-vault"
     echo "(Press Enter to accept the shown default where applicable.)"
 
-    global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM INTERNAL_NETWORK NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL)"
+    global_missing="$(count_missing_vars ADMIN_USER ADMIN_PASS DOMAIN REALM INTERNAL_NETWORK NETMASK INTERNAL_GW RH_USER RH_PASS RH_OFFLINE_TOKEN RH_ACCESS_TOKEN HUB_TOKEN RH_ISO_URL RH9_ISO_URL HOST_INT_IP)"
     echo ""
-    echo "=== Global (remaining missing: ${global_missing}/13) ==="
+    echo "=== Global (remaining missing: ${global_missing}/15) ==="
     prompt_with_default ADMIN_USER "Shared Admin Username" "${ADMIN_USER:-admin}" 0 1 || return 1
     prompt_with_default ADMIN_PASS "Shared Admin Password" "${ADMIN_PASS:-}" 1 1 || return 1
     prompt_with_default DOMAIN "Shared Domain" "${DOMAIN:-}" 0 1 || return 1
@@ -2962,7 +4128,9 @@ prompt_all_env_options_once() {
     prompt_with_default RH_OFFLINE_TOKEN "Red Hat Offline Token" "${RH_OFFLINE_TOKEN:-}" 1 1 || return 1
     prompt_with_default RH_ACCESS_TOKEN "Red Hat Access Token" "${RH_ACCESS_TOKEN:-}" 1 1 || return 1
     prompt_with_default HUB_TOKEN "Automation Hub token" "${HUB_TOKEN:-}" 1 1 || return 1
-    prompt_with_default RH_ISO_URL "RHEL ISO URL" "${RH_ISO_URL:-}" 0 1 || return 1
+    prompt_with_default RH_ISO_URL "RHEL 10 ISO URL (AAP/IdM)" "${RH_ISO_URL:-}" 0 1 || return 1
+    prompt_with_default RH9_ISO_URL "RHEL 9 ISO URL (Satellite)" "${RH9_ISO_URL:-}" 0 1 || return 1
+    prompt_with_default HOST_INT_IP "Host bridge IP for guest HTTP callbacks" "${HOST_INT_IP:-192.168.122.1}" 0 1 || return 1
 
     sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC)"
     echo ""
@@ -2977,11 +4145,12 @@ prompt_all_env_options_once() {
     prompt_with_default SAT_LOC "Satellite Location" "${SAT_LOC:-CORE}" 0 1 || return 1
     SAT_ADMIN_PASS="${ADMIN_PASS}"
 
-    aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
+    aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_GW AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
     echo ""
-    echo "=== AAP (remaining missing: ${aap_missing}/7) ==="
+    echo "=== AAP (remaining missing: ${aap_missing}/8) ==="
     prompt_with_default AAP_IP "AAP Internal IP (eth1)" "${AAP_IP:-10.168.128.2}" 0 1 || return 1
-    prompt_with_default AAP_NETMASK "AAP Internal Netmask" "${AAP_NETMASK:-255.255.0.0}" 0 1 || return 1
+    prompt_with_default AAP_NETMASK "AAP Internal Netmask" "${AAP_NETMASK:-$NETMASK}" 0 1 || return 1
+    prompt_with_default AAP_GW "AAP Internal Gateway" "${AAP_GW:-$INTERNAL_GW}" 0 1 || return 1
     prompt_with_default AAP_HOSTNAME "AAP Hostname (FQDN)" "${AAP_HOSTNAME:-aap-26.${DOMAIN}}" 0 1 || return 1
     prompt_with_default AAP_ALIAS "AAP Alias" "${AAP_ALIAS:-aap}" 0 1 || return 1
     prompt_with_default AAP_BUNDLE_URL "AAP bundle URL" "${AAP_BUNDLE_URL:-}" 0 1 || return 1
@@ -2989,11 +4158,12 @@ prompt_all_env_options_once() {
     select_aap_inventory_templates || return 1
     ensure_aap_pg_database_if_needed || return 1
 
-    idm_missing="$(count_missing_vars IDM_IP IDM_NETMASK IDM_HOSTNAME IDM_ALIAS IDM_DS_PASS)"
+    idm_missing="$(count_missing_vars IDM_IP IDM_NETMASK IDM_GW IDM_HOSTNAME IDM_ALIAS IDM_DS_PASS)"
     echo ""
-    echo "=== IdM (remaining missing: ${idm_missing}/5) ==="
+    echo "=== IdM (remaining missing: ${idm_missing}/6) ==="
     prompt_with_default IDM_IP "IdM Internal IP (eth1)" "${IDM_IP:-10.168.128.3}" 0 1 || return 1
-    prompt_with_default IDM_NETMASK "IdM Internal Netmask" "${IDM_NETMASK:-255.255.0.0}" 0 1 || return 1
+    prompt_with_default IDM_NETMASK "IdM Internal Netmask" "${IDM_NETMASK:-$NETMASK}" 0 1 || return 1
+    prompt_with_default IDM_GW "IdM Internal Gateway" "${IDM_GW:-$INTERNAL_GW}" 0 1 || return 1
     prompt_with_default IDM_HOSTNAME "IdM Hostname (FQDN)" "${IDM_HOSTNAME:-idm.${DOMAIN}}" 0 1 || return 1
     prompt_with_default IDM_ALIAS "IdM Alias" "${IDM_ALIAS:-idm}" 0 1 || return 1
     IDM_ADMIN_PASS="${ADMIN_PASS}"
@@ -3004,15 +4174,17 @@ prompt_all_env_options_once() {
     print_success "Bootstrap complete. Future runs will reuse encrypted values from $ANSIBLE_ENV_FILE"
 }
 
-# If env.yml already has credentials, offer to reuse them before prompting.
-# Non-interactive mode always loads silently.
+# Centralized prompt entrypoint used by provisioning flows.
+# Ensures first-run bootstrap and missing-value prompting both execute.
 prompt_use_existing_env() {
-    if [ ! -f "$ANSIBLE_ENV_FILE" ]; then
-        return 0
+    prompt_all_env_options_once || return 1
+
+    if [ -f "$ANSIBLE_ENV_FILE" ]; then
+        load_ansible_env_file || return 1
+        print_step "Loaded existing encrypted credentials from $ANSIBLE_ENV_FILE"
     fi
 
-    load_ansible_env_file || return 1
-    print_step "Loaded existing encrypted credentials from $ANSIBLE_ENV_FILE"
+    return 0
 }
 
 retire_preseed_env_file() {
@@ -3089,18 +4261,46 @@ prompt_for_rh_iso_auth() {
 				return 1
 			fi
 
-			[ -n "${RH_ISO_URL:-}" ] || read -r -p "Paste direct RHEL 10 Everything ISO URL: " RH_ISO_URL
+            [ -n "${RH_ISO_URL:-}" ] || read -r -p "Paste direct RHEL 10 Everything ISO URL: " RH_ISO_URL
 			;;
 		*)
             print_step "Open: https://access.redhat.com/downloads/content/rhel"
             if command -v xdg-open >/dev/null 2>&1; then
                 xdg-open "https://access.redhat.com/downloads/content/rhel" >/dev/null 2>&1 || true
             fi
-			[ -n "${RH_ISO_URL:-}" ] || read -r -p "Paste direct RHEL 10 Everything ISO URL: " RH_ISO_URL
+                [ -n "${RH_ISO_URL:-}" ] || read -r -p "Paste direct RHEL 10 Everything ISO URL: " RH_ISO_URL
 			;;
 	esac
 
 	[ -n "${RH_ISO_URL:-}" ]
+}
+
+prompt_for_satellite_rhel9_iso_auth() {
+    if [ -n "${RH9_ISO_URL:-}" ]; then
+        if [ -z "${RH_ACCESS_TOKEN:-}" ] && [ -n "${RH_OFFLINE_TOKEN:-}" ]; then
+            get_rh_access_token_from_offline_token "$RH_OFFLINE_TOKEN" || {
+                print_warning "Failed to get access token from preseeded offline token."
+                return 1
+            }
+        fi
+        return 0
+    fi
+
+    if is_noninteractive; then
+        if [ -n "${RH_OFFLINE_TOKEN:-}" ]; then
+            get_rh_access_token_from_offline_token "$RH_OFFLINE_TOKEN" || {
+                print_warning "Failed to get access token from preseeded offline token."
+                return 1
+            }
+        fi
+
+        print_warning "NONINTERACTIVE mode requires RH9_ISO_URL to be set."
+        return 1
+    fi
+
+    print_step "Satellite 6.18 requires RHEL 9 install media."
+    [ -n "${RH9_ISO_URL:-}" ] || read -r -p "Paste direct RHEL 9 Everything ISO URL (Satellite): " RH9_ISO_URL
+    [ -n "${RH9_ISO_URL:-}" ]
 }
 
 download_rhel10_iso() {
@@ -3148,6 +4348,86 @@ download_rhel10_iso() {
 	fi
 }
 
+download_rhel9_iso() {
+    print_step "Preparing RHEL 9 Everything ISO download for Satellite"
+    ensure_iso_vars
+
+    if [ -f "$SAT_ISO_PATH" ]; then
+        if file "$SAT_ISO_PATH" | grep -q "ISO 9660"; then
+            print_success "Satellite ISO already exists and is valid: $SAT_ISO_PATH"
+            return 0
+        else
+            print_warning "Satellite ISO exists but is NOT valid (likely HTML error page). Removing and re-downloading..."
+            sudo rm -f "$SAT_ISO_PATH"
+        fi
+    fi
+
+    [ -n "${RH9_ISO_URL:-}" ] || prompt_for_satellite_rhel9_iso_auth || {
+        print_warning "RHEL 9 ISO URL/auth not provided. Skipping Satellite ISO download."
+        return 1
+    }
+
+    [ -n "${RH9_ISO_URL:-}" ] || {
+        print_warning "RH9_ISO_URL is empty. Skipping Satellite ISO download."
+        return 1
+    }
+
+    print_step "Downloading Satellite RHEL 9 ISO to: $SAT_ISO_PATH"
+    if [ -n "${RH_ACCESS_TOKEN:-}" ]; then
+        sudo curl -fL --retry 5 --retry-delay 5 \
+            -H "Authorization: Bearer ${RH_ACCESS_TOKEN}" \
+            -o "$SAT_ISO_PATH" "$RH9_ISO_URL"
+    else
+        sudo curl -fL --retry 5 --retry-delay 5 -o "$SAT_ISO_PATH" "$RH9_ISO_URL"
+    fi
+
+    if file "$SAT_ISO_PATH" | grep -q "ISO 9660"; then
+        sudo chmod 644 "$SAT_ISO_PATH"
+        print_success "RHEL 9 Satellite ISO downloaded and validated: $SAT_ISO_PATH"
+    else
+        print_warning "Downloaded Satellite file is not a valid ISO (may be HTML error). Removing."
+        sudo rm -f "$SAT_ISO_PATH"
+        return 1
+    fi
+}
+
+assert_kickstart_install_iso_is_valid() {
+    local role_label="${1:-system}"
+    local iso_path="${2:-}"
+    local iso_base=""
+
+    if [ -z "${iso_path}" ]; then
+        print_warning "${role_label} install media path is empty."
+        return 1
+    fi
+
+    iso_base="$(basename "${iso_path}" | tr '[:upper:]' '[:lower:]')"
+
+    # Kickstart installs packages from media during Anaconda.
+    # Boot ISOs do not contain full package payload and will fail with
+    # 'Error setting up software source / selection'.
+    if [[ "${iso_base}" == *"boot.iso" ]]; then
+        print_warning "${role_label} kickstart requires a full install ISO (DVD/Everything), not a boot ISO."
+        print_warning "Current media looks like boot ISO: ${iso_path}"
+        print_warning "Please set a full DVD/Everything ISO URL/path and re-run."
+        return 1
+    fi
+
+    return 0
+}
+
+assert_satellite_install_iso_is_valid() {
+    assert_kickstart_install_iso_is_valid "Satellite 6.18 (RHEL 9)" "${1:-${SAT_ISO_PATH:-}}"
+}
+
+assert_aap_install_iso_is_valid() {
+    assert_kickstart_install_iso_is_valid "AAP 2.6 (RHEL 10)" "${1:-${ISO_PATH:-}}"
+}
+
+assert_idm_install_iso_is_valid() {
+    assert_kickstart_install_iso_is_valid "IdM (RHEL 10)" "${1:-${ISO_PATH:-}}"
+}
+
 # Ensure SSH key pair exists for AAP VM post-boot callback orchestration.
 ensure_ssh_keys() {
     if [ -f "${AAP_SSH_PRIVATE_KEY}" ] && [ -f "${AAP_SSH_PUBLIC_KEY}" ]; then
@@ -3163,6 +4443,31 @@ ensure_ssh_keys() {
     chmod 600 "${AAP_SSH_PRIVATE_KEY}"
     chmod 644 "${AAP_SSH_PUBLIC_KEY}"
     print_success "SSH keys generated: ${AAP_SSH_KEY_DIR}"
+}
+
+# Collect public SSH keys that should be trusted by freshly installed guests.
+# Sources (best-effort):
+#   1. The installing machine user's existing SSH public keys
+#   2. The RHIS AAP orchestration key generated by ensure_ssh_keys()
+#   3. The RHIS provisioner container root public key, if available
+collect_bootstrap_public_keys() {
+    local key_file
+    local container_pub=""
+
+    {
+        for key_file in \
+            "${HOME}/.ssh/id_ed25519.pub" \
+            "${HOME}/.ssh/id_rsa.pub" \
+            "${AAP_SSH_PUBLIC_KEY}"; do
+            [ -r "${key_file}" ] && cat "${key_file}"
+        done
+
+        if command -v podman >/dev/null 2>&1 \
+            && podman container exists "${RHIS_CONTAINER_NAME}" >/dev/null 2>&1; then
+            container_pub="$(podman exec "${RHIS_CONTAINER_NAME}" sh -lc 'cat /root/.ssh/id_ed25519.pub 2>/dev/null || cat /root/.ssh/id_rsa.pub 2>/dev/null || true' 2>/dev/null || true)"
+            [ -n "${container_pub}" ] && printf '%s\n' "${container_pub}"
+        fi
+    } | awk 'NF && !seen[$0]++'
 }
 
 # Download the AAP containerized bundle tarball to AAP_BUNDLE_DIR so it can be
@@ -3495,7 +4800,7 @@ ensure_virtualization_tools() {
         :
     else
         print_step "Installing virtualization tooling (virt-install, qemu-img, libvirt client)"
-        sudo dnf install -y virt-install qemu-img libvirt-client || return 1
+        sudo dnf install -y --nogpgcheck virt-install qemu-img libvirt-client || return 1
 
         command -v virt-install >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1 || return 1
 	fi
@@ -3572,11 +4877,9 @@ build_internal_kickstart_network_line() {
     if [ -n "$hostname" ]; then
         printf -- '--hostname=$ROLE_HOSTNAME '
     fi
-    if [ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ]; then
-        printf -- '--gateway=%s ' "$gateway"
-    else
-        printf -- '--nodefroute '
-    fi
+    # eth1 is always the internal management NIC — never install a default route;
+    # eth0 (DHCP) remains the sole default route for internet access.
+    printf -- '--nodefroute '
     printf -- '--activate --onboot=yes\n'
     printf 'EOF_NETWORK_ETH1\n'
     printf 'if [ -z "$IP" ]; then\n'
@@ -3634,14 +4937,39 @@ generate_satellite_618_kickstart() {
     local tmpdir tmp_ks tmp_oem
     local sat_ext_mac sat_int_mac
     local sat_prefix
+    local bootstrap_ssh_keys
+    local ks_nogpg_policy
+    local ks_ssh_baseline
+    local ks_user_sudo_bootstrap
+    local ks_rhsm_register
+    local ks_rhc_connect
+    local ks_repo_enable_verify
+    local ks_nm_dual_nic
+    local ks_hosts_mapping
+    local ks_trust_bootstrap_keys
 
     prompt_satellite_618_details || return 1
     ensure_iso_vars || return 1
     ensure_iso_tools || return 1
+    ensure_ssh_keys || return 1
 
     sat_ext_mac="$(get_vm_external_mac "satellite-618")"
     sat_int_mac="$(get_vm_internal_mac "satellite-618")"
     sat_prefix="$(netmask_to_prefix "${SAT_NETMASK}")"
+    bootstrap_ssh_keys="$(collect_bootstrap_public_keys)"
+    ks_nogpg_policy="$(kickstart_nogpg_policy_block)"
+    ks_ssh_baseline="$(kickstart_ssh_baseline_block)"
+    ks_user_sudo_bootstrap="$(kickstart_user_sudo_bootstrap_block)"
+    ks_rhsm_register="$(kickstart_rhsm_register_block 1)"
+    ks_rhc_connect="$(kickstart_rhc_connect_block)"
+    ks_repo_enable_verify="$(kickstart_repo_enable_verify_block "Satellite" \
+        "rhel-9-for-x86_64-baseos-rpms" \
+        "rhel-9-for-x86_64-appstream-rpms" \
+        "satellite-6.18-for-rhel-9-x86_64-rpms" \
+        "satellite-maintenance-6.18-for-rhel-9-x86_64-rpms")"
+    ks_nm_dual_nic="$(kickstart_networkmanager_dual_nic_block "${sat_ext_mac}" "${sat_int_mac}" "${SAT_IP}" "${sat_prefix}" "${SAT_GW}")"
+    ks_hosts_mapping="$(kickstart_hosts_mapping_block "${SAT_IP}" "${SAT_HOSTNAME}" "${SAT_HOSTNAME%%.*}" "${AAP_IP}" "${AAP_HOSTNAME}" "${AAP_HOSTNAME%%.*}" "${IDM_IP}" "${IDM_HOSTNAME}" "${IDM_HOSTNAME%%.*}")"
+    ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 1)"
 
     tmpdir="$(mktemp -d)"
     tmp_ks="${tmpdir}/satellite-618.ks"
@@ -3655,6 +4983,8 @@ text
 reboot
 keyboard us
 lang en_US.UTF-8
+selinux --permissive
+firewall --disabled
 bootloader --append="net.ifnames=0 biosdevname=0"
 
 rootpw --plaintext "${ROOT_PASS}"
@@ -3735,132 +5065,30 @@ PKGS_END
     # --- Post-install (variable expansion required) ---
     cat >> "$tmp_ks" <<POSTEOF
 %post --log=/root/ks-post.log
-set -euxo pipefail
+set -euo pipefail
 
-# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
-mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
-rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
+${ks_nogpg_policy}
 
-cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
-[connection]
-id=eth0
-type=ethernet
-interface-name=eth0
-autoconnect=true
+echo "Starting Satellite Pre-work..."
 
-[ethernet]
-mac-address=${sat_ext_mac}
+${ks_nm_dual_nic}
 
-[ipv4]
-method=auto
+${ks_hosts_mapping}
 
-[ipv6]
-method=auto
-EOF_NM_ETH0
+${ks_ssh_baseline}
 
-cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
-[connection]
-id=eth1
-type=ethernet
-interface-name=eth1
-autoconnect=true
+${ks_user_sudo_bootstrap}
 
-[ethernet]
-mac-address=${sat_int_mac}
+${ks_trust_bootstrap_keys}
 
-[ipv4]
-method=manual
-addresses=${SAT_IP}/${sat_prefix}
-gateway=${SAT_GW}
-never-default=false
+${ks_rhsm_register}
 
-[ipv6]
-method=ignore
-EOF_NM_ETH1
+${ks_rhc_connect}
 
-if [ "${SAT_GW}" = "0.0.0.0" ] || [ -z "${SAT_GW}" ]; then
-    sed -i '/^gateway=/d' /etc/NetworkManager/system-connections/eth1.nmconnection
-    sed -i 's/^never-default=.*/never-default=true/' /etc/NetworkManager/system-connections/eth1.nmconnection
-fi
-
-chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
-
-cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
-[main]
-no-auto-default=${sat_ext_mac},${sat_int_mac}
-EOF_NM_MAIN
-
-systemctl enable NetworkManager || true
-
-# Ensure resolver file exists for registration/DNS lookups
-if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
-    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
-fi
-
-# 1. Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<EOF
-127.0.0.1 localhost localhost.localdomain
-${SAT_IP} ${SAT_HOSTNAME} ${SAT_HOSTNAME%%.*}
-${AAP_IP} ${AAP_HOSTNAME} ${AAP_HOSTNAME%%.*}
-${IDM_IP} ${IDM_HOSTNAME} ${IDM_HOSTNAME%%.*}
-EOF
-
-# 1.1 SSH baseline for automation and internal preflight
-mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
-PermitRootLogin yes
-PasswordAuthentication yes
-PubkeyAuthentication yes
-UseDNS no
-EOF_SSHD
-systemctl enable --now sshd || true
-systemctl restart sshd || true
-firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-firewall-cmd --reload >/dev/null 2>&1 || true
-
-# 2. Registration (retry until network/RHSM are reachable)
-register_rhsm() {
-    local try
-    for try in \$(seq 1 10); do
-        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
-        subscription-manager unregister >/dev/null 2>&1 || true
-        subscription-manager clean >/dev/null 2>&1 || true
-        sleep 15
-    done
-    return 1
-}
-
-register_rhsm
-subscription-manager refresh || true
-
-# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
-if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
-    dnf install -y rhc >/dev/null 2>&1 || true
-    if command -v rhc >/dev/null 2>&1; then
-        if ! rhc status >/dev/null 2>&1; then
-            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
-        fi
-    fi
-fi
-
-# 3. Repositories
-subscription-manager repos --disable="*"
-subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-10-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-10-x86_64-rpms"
-
-for repo in \
-    rhel-10-for-x86_64-baseos-rpms \
-    rhel-10-for-x86_64-appstream-rpms \
-    satellite-6.18-for-rhel-10-x86_64-rpms \
-    satellite-maintenance-6.18-for-rhel-10-x86_64-rpms; do
-    if ! subscription-manager repos --list-enabled | grep -q "\$repo"; then
-        echo "ERROR: Required Satellite repository not enabled: \$repo"
-        subscription-manager repos --list-enabled || true
-        exit 1
-    fi
-done
+${ks_repo_enable_verify}
 
 # 4. Satellite package installation
-dnf install -y satellite
+dnf install -y --nogpgcheck satellite
 if ! rpm -q satellite >/dev/null 2>&1; then
     echo "ERROR: Satellite package installation verification failed (rpm -q satellite)."
     exit 1
@@ -3870,7 +5098,7 @@ fi
 satellite-installer --scenario satellite --foreman-initial-organization "${SAT_ORG}" --foreman-initial-location "${SAT_LOC}" --foreman-initial-admin-username "${ADMIN_USER}" --foreman-initial-admin-password "${ADMIN_PASS}" --foreman-proxy-dns true --foreman-proxy-dns-interface eth1 --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface eth1 --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --enable-foreman-compute-ec2 --enable-foreman-compute-gce --enable-foreman-compute-azure --enable-foreman-compute-libvirt --enable-foreman-plugin-openscap --enable-foreman-proxy-plugin-openscap --register-with-insights true
 
 # 5.1 RHIS CMDB single-pane dashboard (Satellite + AAP + IdM + RHIS container endpoint)
-dnf install -y python3-pip sshpass
+dnf install -y --nogpgcheck python3-pip sshpass
 python3 -m pip install --upgrade pip setuptools wheel || true
 python3 -m pip install ansible-cmdb || true
 
@@ -3984,6 +5212,8 @@ cat > /etc/sysctl.d/99-rhis-performance.conf <<'EOF'
 vm.swappiness = 10
 EOF
 sysctl -p /etc/sysctl.d/99-rhis-performance.conf || true
+
+echo "Post-install configuration complete."
 
 # 6. Network verification snapshot (for ks-post.log troubleshooting)
 echo "===== RHIS NETWORK SNAPSHOT ====="
@@ -4387,6 +5617,16 @@ generate_aap_kickstart() {
     local aap_inventory_growth_content
     local aap_ext_mac aap_int_mac
     local aap_prefix
+    local bootstrap_ssh_keys
+    local ks_nogpg_policy
+    local ks_ssh_baseline
+    local ks_user_sudo_bootstrap
+    local ks_rhsm_register
+    local ks_rhc_connect
+    local ks_repo_enable_verify
+    local ks_nm_dual_nic
+    local ks_hosts_mapping
+    local ks_trust_bootstrap_keys
 
     prompt_aap_details || return 1
     ensure_iso_vars || return 1
@@ -4395,6 +5635,18 @@ generate_aap_kickstart() {
     aap_ext_mac="$(get_vm_external_mac "aap-26")"
     aap_int_mac="$(get_vm_internal_mac "aap-26")"
     aap_prefix="$(netmask_to_prefix "${AAP_NETMASK}")"
+    ks_nogpg_policy="$(kickstart_nogpg_policy_block)"
+    ks_ssh_baseline="$(kickstart_ssh_baseline_block)"
+    ks_user_sudo_bootstrap="$(kickstart_user_sudo_bootstrap_block)"
+    ks_rhsm_register="$(kickstart_rhsm_register_block 0)"
+    ks_rhc_connect="$(kickstart_rhc_connect_block)"
+    ks_repo_enable_verify="$(kickstart_repo_enable_verify_block "AAP" \
+        "rhel-10-for-x86_64-baseos-rpms" \
+        "rhel-10-for-x86_64-appstream-rpms" \
+        "ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms")"
+    ks_nm_dual_nic="$(kickstart_networkmanager_dual_nic_block "${aap_ext_mac}" "${aap_int_mac}" "${AAP_IP}" "${aap_prefix}" "${AAP_GW}")"
+    ks_hosts_mapping="$(kickstart_hosts_mapping_block "{{SAT_IP}}" "{{SAT_HOSTNAME}}" "{{SAT_SHORT}}" "{{AAP_IP}}" "{{AAP_HOSTNAME}}" "{{AAP_SHORT}}" "{{IDM_IP}}" "{{IDM_HOSTNAME}}" "{{IDM_SHORT}}")"
+    ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 0)"
 
     # Read the host's public key for SSH callback orchestration
     if [ ! -f "${AAP_SSH_PUBLIC_KEY}" ]; then
@@ -4402,6 +5654,7 @@ generate_aap_kickstart() {
         return 1
     fi
     aap_ssh_pub_key="$(cat "${AAP_SSH_PUBLIC_KEY}")"
+    bootstrap_ssh_keys="$(collect_bootstrap_public_keys)"
 
     select_aap_inventory_templates || return 1
     aap_inventory_content="$(render_aap_inventory_template "${AAP_INVENTORY_TEMPLATE}")" || return 1
@@ -4417,6 +5670,8 @@ text
 reboot
 keyboard us
 lang en_US.UTF-8
+selinux --permissive
+firewall --disabled
 bootloader --append="net.ifnames=0 biosdevname=0"
 
 rootpw --plaintext "${ROOT_PASS}"
@@ -4483,130 +5738,27 @@ PKGS
         # --- Post-install: write kickstart %post and substitute placeholders ---
         cat >> "$tmp_ks" <<POSTEOF
 %post --log=/root/ks-post.log
-set -euxo pipefail
+set -euo pipefail
 
-# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
-mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
-rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
+${ks_nogpg_policy}
 
-cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
-[connection]
-id=eth0
-type=ethernet
-interface-name=eth0
-autoconnect=true
+${ks_nm_dual_nic}
 
-[ethernet]
-mac-address=${aap_ext_mac}
+${ks_hosts_mapping}
 
-[ipv4]
-method=auto
+${ks_ssh_baseline}
 
-[ipv6]
-method=auto
-EOF_NM_ETH0
+${ks_user_sudo_bootstrap}
 
-cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
-[connection]
-id=eth1
-type=ethernet
-interface-name=eth1
-autoconnect=true
+${ks_trust_bootstrap_keys}
 
-[ethernet]
-mac-address=${aap_int_mac}
+${ks_rhsm_register}
 
-[ipv4]
-method=manual
-addresses=${AAP_IP}/${aap_prefix}
-gateway=${AAP_GW}
-never-default=false
+${ks_rhc_connect}
 
-[ipv6]
-method=ignore
-EOF_NM_ETH1
+${ks_repo_enable_verify}
 
-if [ "${AAP_GW}" = "0.0.0.0" ] || [ -z "${AAP_GW}" ]; then
-    sed -i '/^gateway=/d' /etc/NetworkManager/system-connections/eth1.nmconnection
-    sed -i 's/^never-default=.*/never-default=true/' /etc/NetworkManager/system-connections/eth1.nmconnection
-fi
-
-chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
-
-cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
-[main]
-no-auto-default=${aap_ext_mac},${aap_int_mac}
-EOF_NM_MAIN
-
-systemctl enable NetworkManager || true
-
-# Ensure resolver file exists for registration/DNS lookups
-if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
-    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
-fi
-
-# 1. Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<HOSTS
-127.0.0.1 localhost localhost.localdomain
-{{SAT_IP}} {{SAT_HOSTNAME}} {{SAT_SHORT}}
-{{AAP_IP}} {{AAP_HOSTNAME}} {{AAP_SHORT}}
-{{IDM_IP}} {{IDM_HOSTNAME}} {{IDM_SHORT}}
-HOSTS
-
-# 1.1 SSH baseline for automation and internal preflight
-mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
-PermitRootLogin yes
-PasswordAuthentication yes
-PubkeyAuthentication yes
-UseDNS no
-EOF_SSHD
-systemctl enable --now sshd || true
-systemctl restart sshd || true
-firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-firewall-cmd --reload >/dev/null 2>&1 || true
-
-# 2. Registration (retry until network/RHSM are reachable)
-register_rhsm() {
-    local try
-    for try in \$(seq 1 10); do
-        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
-        subscription-manager unregister >/dev/null 2>&1 || true
-        subscription-manager clean >/dev/null 2>&1 || true
-        sleep 15
-    done
-    return 1
-}
-
-register_rhsm
-subscription-manager refresh || true
-
-# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
-if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
-    dnf install -y rhc >/dev/null 2>&1 || true
-    if command -v rhc >/dev/null 2>&1; then
-        if ! rhc status >/dev/null 2>&1; then
-            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
-        fi
-    fi
-fi
-
-# 3. Repositories
-subscription-manager repos --disable="*"
-subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms" --enable="ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms"
-
-for repo in \
-    rhel-10-for-x86_64-baseos-rpms \
-    rhel-10-for-x86_64-appstream-rpms \
-    ansible-automation-platform-2.6-for-rhel-10-x86_64-rpms; do
-    if ! subscription-manager repos --list-enabled | grep -q "\$repo"; then
-        echo "ERROR: Required AAP repository not enabled: \$repo"
-        subscription-manager repos --list-enabled || true
-        exit 1
-    fi
-done
-
-# 3. Download the AAP bundle from the host HTTP server (started by run_rhis_install_sequence.sh)
+# 4. Download the AAP bundle from the host HTTP server (started by run_rhis_install_sequence.sh)
 mkdir -p /root/aap-setup
 echo "Bundle download starting at $(date)" >> /var/log/aap-setup-ready.log
 curl -fL --retry 5 --retry-delay 15 http://{{HOST_INT_IP}}:8080/aap-bundle.tar.gz -o /root/aap-bundle.tar.gz
@@ -4618,18 +5770,29 @@ if [ ! -x /root/aap-setup/setup.sh ]; then
 fi
 echo "Bundle extracted. Ready for SSH callback." >> /var/log/aap-setup-ready.log
 
-# 4. SSH callback key injection
+# 5. SSH callback key injection
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
 cat >> /root/.ssh/authorized_keys <<SSH_KEYS
 {{AAP_SSH_PUB_KEY}}
 SSH_KEYS
+sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys || true
 chmod 600 /root/.ssh/authorized_keys
+if id "$target_user" >/dev/null 2>&1; then
+    target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+    [ -n "$target_home" ] || target_home="/home/$target_user"
+    install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"
+    cat > "$target_home/.ssh/authorized_keys" <<'SSH_KEYS'
+${bootstrap_ssh_keys}
+SSH_KEYS
+    chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"
+    chmod 600 "$target_home/.ssh/authorized_keys"
+fi
 
 # Log setup readiness for debugging
 echo "[aap-setup] Bundle ready at /root/aap-setup on $(date)" >> /var/log/aap-setup-ready.log
 
-# 5. Automation Hub credentials so the containerized installer can pull collections
+# 6. Automation Hub credentials so the containerized installer can pull collections
 cat > /root/.ansible.cfg <<ANSIBLECFG
 [defaults]
 galaxy_server_list = automation_hub
@@ -4641,7 +5804,7 @@ token={{HUB_TOKEN}}
 ANSIBLECFG
 chmod 600 /root/.ansible.cfg
 
-# 6. Installer inventories rendered from Jinja2 templates selected at prompt/CLI
+# 7. Installer inventories rendered from Jinja2 templates selected at prompt/CLI
 cat > /root/aap-setup/inventory <<INVENTORY
 ${aap_inventory_content}
 INVENTORY
@@ -4660,7 +5823,15 @@ if [ ! -s /root/aap-setup/inventory ] || [ ! -s /root/aap-setup/inventory-growth
     exit 1
 fi
 
-# 7. Performance baseline for virtual guests
+echo "Rendered AAP inventory file: /root/aap-setup/inventory"
+echo "Preview (first 20 lines, passwords masked):"
+sed -E 's/([A-Za-z0-9_]*password[[:space:]]*=[[:space:]]*).*/\1***REDACTED***/I' /root/aap-setup/inventory | head -n 20 || true
+
+echo "Rendered AAP inventory file: /root/aap-setup/inventory-growth"
+echo "Preview (first 20 lines, passwords masked):"
+sed -E 's/([A-Za-z0-9_]*password[[:space:]]*=[[:space:]]*).*/\1***REDACTED***/I' /root/aap-setup/inventory-growth | head -n 20 || true
+
+# 8. Performance baseline for virtual guests
 systemctl enable --now qemu-guest-agent || true
 systemctl enable --now tuned || true
 tuned-adm profile virtual-guest || true
@@ -4670,7 +5841,7 @@ net.core.somaxconn = 4096
 EOF
 sysctl -p /etc/sysctl.d/99-rhis-performance.conf || true
 
-# 8. Network verification snapshot (for ks-post.log troubleshooting)
+# 9. Network verification snapshot (for ks-post.log troubleshooting)
 echo "===== RHIS NETWORK SNAPSHOT ====="
 date
 ip -4 addr show eth0 || true
@@ -4727,13 +5898,36 @@ generate_idm_kickstart() {
     local tmp_ks
     local idm_ext_mac idm_int_mac
     local idm_prefix
+    local bootstrap_ssh_keys
+    local ks_nogpg_policy
+    local ks_ssh_baseline
+    local ks_user_sudo_bootstrap
+    local ks_rhsm_register
+    local ks_rhc_connect
+    local ks_repo_enable_verify
+    local ks_nm_dual_nic
+    local ks_hosts_mapping
+    local ks_trust_bootstrap_keys
 
     prompt_idm_details || return 1
     ensure_iso_vars || return 1
+    ensure_ssh_keys || return 1
 
     idm_ext_mac="$(get_vm_external_mac "idm")"
     idm_int_mac="$(get_vm_internal_mac "idm")"
     idm_prefix="$(netmask_to_prefix "${IDM_NETMASK}")"
+    bootstrap_ssh_keys="$(collect_bootstrap_public_keys)"
+    ks_nogpg_policy="$(kickstart_nogpg_policy_block)"
+    ks_ssh_baseline="$(kickstart_ssh_baseline_block)"
+    ks_user_sudo_bootstrap="$(kickstart_user_sudo_bootstrap_block)"
+    ks_rhsm_register="$(kickstart_rhsm_register_block 0)"
+    ks_rhc_connect="$(kickstart_rhc_connect_block)"
+    ks_repo_enable_verify="$(kickstart_repo_enable_verify_block "IdM" \
+        "rhel-10-for-x86_64-baseos-rpms" \
+        "rhel-10-for-x86_64-appstream-rpms")"
+    ks_nm_dual_nic="$(kickstart_networkmanager_dual_nic_block "${idm_ext_mac}" "${idm_int_mac}" "${IDM_IP}" "${idm_prefix}" "${IDM_GW}")"
+    ks_hosts_mapping="$(kickstart_hosts_mapping_block "${SAT_IP}" "${SAT_HOSTNAME}" "${SAT_HOSTNAME%%.*}" "${AAP_IP}" "${AAP_HOSTNAME}" "${AAP_HOSTNAME%%.*}" "${IDM_IP}" "${IDM_HOSTNAME}" "${IDM_HOSTNAME%%.*}")"
+    ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 1)"
 
     tmp_ks="$(mktemp)"
 
@@ -4745,6 +5939,8 @@ text
 reboot
 keyboard us
 lang en_US.UTF-8
+selinux --permissive
+firewall --disabled
 bootloader --append="net.ifnames=0 biosdevname=0"
 
 rootpw --plaintext "${ROOT_PASS}"
@@ -4813,130 +6009,29 @@ PKGS
     # --- Post-install (variable expansion required) ---
     cat >> "$tmp_ks" <<POSTEOF
 %post --log=/root/ks-post.log
-set -euxo pipefail
+set -euo pipefail
 
-# 0. Deterministic NetworkManager keyfiles (persisted for first boot)
-mkdir -p /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
-rm -f /etc/NetworkManager/system-connections/*.nmconnection || true
+${ks_nogpg_policy}
 
-cat > /etc/NetworkManager/system-connections/eth0.nmconnection <<'EOF_NM_ETH0'
-[connection]
-id=eth0
-type=ethernet
-interface-name=eth0
-autoconnect=true
+${ks_nm_dual_nic}
 
-[ethernet]
-mac-address=${idm_ext_mac}
+${ks_hosts_mapping}
 
-[ipv4]
-method=auto
+${ks_ssh_baseline}
 
-[ipv6]
-method=auto
-EOF_NM_ETH0
+${ks_user_sudo_bootstrap}
 
-cat > /etc/NetworkManager/system-connections/eth1.nmconnection <<'EOF_NM_ETH1'
-[connection]
-id=eth1
-type=ethernet
-interface-name=eth1
-autoconnect=true
+${ks_trust_bootstrap_keys}
 
-[ethernet]
-mac-address=${idm_int_mac}
+${ks_rhsm_register}
 
-[ipv4]
-method=manual
-addresses=${IDM_IP}/${idm_prefix}
-gateway=${IDM_GW}
-never-default=false
-
-[ipv6]
-method=ignore
-EOF_NM_ETH1
-
-if [ "${IDM_GW}" = "0.0.0.0" ] || [ -z "${IDM_GW}" ]; then
-    sed -i '/^gateway=/d' /etc/NetworkManager/system-connections/eth1.nmconnection
-    sed -i 's/^never-default=.*/never-default=true/' /etc/NetworkManager/system-connections/eth1.nmconnection
-fi
-
-chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection /etc/NetworkManager/system-connections/eth1.nmconnection
-
-cat > /etc/NetworkManager/conf.d/10-rhis-no-auto-default.conf <<'EOF_NM_MAIN'
-[main]
-no-auto-default=${idm_ext_mac},${idm_int_mac}
-EOF_NM_MAIN
-
-systemctl enable NetworkManager || true
-
-# Ensure resolver file exists for registration/DNS lookups
-if [ ! -s /etc/resolv.conf ] && [ -f /run/NetworkManager/resolv.conf ]; then
-    ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf || true
-fi
-
-# 1. Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<EOF
-127.0.0.1 localhost localhost.localdomain
-${SAT_IP} ${SAT_HOSTNAME} ${SAT_HOSTNAME%%.*}
-${AAP_IP} ${AAP_HOSTNAME} ${AAP_HOSTNAME%%.*}
-${IDM_IP} ${IDM_HOSTNAME} ${IDM_HOSTNAME%%.*}
-EOF
-
-# 1.1 SSH baseline for automation and internal preflight
-mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-rhis-root.conf <<'EOF_SSHD'
-PermitRootLogin yes
-PasswordAuthentication yes
-PubkeyAuthentication yes
-UseDNS no
-EOF_SSHD
-systemctl enable --now sshd || true
-systemctl restart sshd || true
-firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-firewall-cmd --reload >/dev/null 2>&1 || true
-
-# 2. Registration (retry until network/RHSM are reachable)
-register_rhsm() {
-    local try
-    for try in \$(seq 1 10); do
-        subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
-        subscription-manager unregister >/dev/null 2>&1 || true
-        subscription-manager clean >/dev/null 2>&1 || true
-        sleep 15
-    done
-    return 1
-}
-
-register_rhsm
-subscription-manager refresh || true
-
-# 2.1 Red Hat Hybrid Cloud Console registration (rhc)
-if [ "${RHC_AUTO_CONNECT:-1}" = "1" ]; then
-    dnf install -y rhc >/dev/null 2>&1 || true
-    if command -v rhc >/dev/null 2>&1; then
-        if ! rhc status >/dev/null 2>&1; then
-            rhc connect --username="${RH_USER}" --password="${RH_PASS}" >/dev/null 2>&1 || true
-        fi
-    fi
-fi
+${ks_rhc_connect}
 
 # 3. Hostname
 hostnamectl set-hostname "${IDM_HOSTNAME}"
 
 # 4. Repositories
-subscription-manager repos --disable="*"
-subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" --enable="rhel-10-for-x86_64-appstream-rpms"
-
-for repo in \
-    rhel-10-for-x86_64-baseos-rpms \
-    rhel-10-for-x86_64-appstream-rpms; do
-    if ! subscription-manager repos --list-enabled | grep -q "\$repo"; then
-        echo "ERROR: Required IdM repository not enabled: \$repo"
-        subscription-manager repos --list-enabled || true
-        exit 1
-    fi
-done
+${ks_repo_enable_verify}
 
 # 4.1 Verify required IdM packages from kickstart payload are present
 if ! rpm -q ipa-server ipa-server-dns bind-dyndb-ldap >/dev/null 2>&1; then
@@ -5030,6 +6125,7 @@ create_vm_if_missing() {
 	local vcpus="${5:-2}"
 	local ks_file="${6:-}"
     local ks_boot_location="${7:-}"
+    local install_iso_path="${8:-${ISO_PATH}}"
     local extra_args
     local external_mac
     local internal_mac
@@ -5055,8 +6151,8 @@ create_vm_if_missing() {
         sudo qemu-img create -f qcow2 "$disk_path" "$disk_size" || { print_warning "qemu-img failed"; return 1; }
 	fi
 
-	if [ ! -f "${ISO_PATH:-}" ]; then
-		print_warning "ISO not found at ${ISO_PATH:-}. Aborting VM create for ${vm_name}."
+    if [ ! -f "${install_iso_path:-}" ]; then
+        print_warning "ISO not found at ${install_iso_path:-}. Aborting VM create for ${vm_name}."
 		return 1
 	fi
 	# Only require OEMDRV ISO for VMs booting via hd:LABEL=OEMDRV (e.g. Satellite)
@@ -5096,7 +6192,7 @@ create_vm_if_missing() {
         --network "network=internal,model=virtio${internal_mac:+,mac=${internal_mac}}"
         --graphics "vnc,listen=127.0.0.1"
         --video vga
-        --location "${ISO_PATH}"
+        --location "${install_iso_path}"
     )
 
     # Add os-variant only if one is resolved/supported on this host.
@@ -5285,6 +6381,10 @@ create_rhis_vms() {
     ensure_virtualization_tools || return 1
     ensure_iso_vars
     download_rhel10_iso || return 1
+    download_rhel9_iso || return 1
+    assert_satellite_install_iso_is_valid "${SAT_ISO_PATH}" || return 1
+    assert_aap_install_iso_is_valid "${ISO_PATH}" || return 1
+    assert_idm_install_iso_is_valid "${ISO_PATH}" || return 1
     fix_qemu_permissions
     create_libvirt_storage_pool || return 1
 
@@ -5300,7 +6400,7 @@ create_rhis_vms() {
     # The VM will curl it from there during %post via the HTTP server below.
     preflight_download_aap_bundle || print_warning "AAP bundle preflight skipped. Ensure aap-bundle.tar.gz is in ${AAP_BUNDLE_DIR} before the VM runs %post."
 
-    create_vm_if_missing "satellite-618" "${VM_DIR}/satellite-618.qcow2" "$sat_disk" "$sat_ram" "$sat_vcpu" "${KS_DIR}/satellite-618.ks" "hd:LABEL=OEMDRV:/ks.cfg" || return 1
+    create_vm_if_missing "satellite-618" "${VM_DIR}/satellite-618.qcow2" "$sat_disk" "$sat_ram" "$sat_vcpu" "${KS_DIR}/satellite-618.ks" "hd:LABEL=OEMDRV:/ks.cfg" "${SAT_ISO_PATH}" || return 1
 
     # Start the HTTP server before the AAP VM boots so the bundle is available
     # when anaconda runs %post.
@@ -5374,19 +6474,22 @@ fix_vm_root_passwords() {
 }
 
 setup_rhis_ssh_mesh() {
-    local root_pass ip pub
+    local root_pass installer_user installer_pass ip pub login_user login_pass
+    local remote_home=""
     local -a node_ips all_pubs
     local bootstrap_cmd append_cmd
 
     root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-    if [ -z "$root_pass" ]; then
-        print_warning "Cannot bootstrap SSH mesh: root/admin password is unset."
+    installer_user="${INSTALLER_USER:-${ADMIN_USER}}"
+    installer_pass="${ADMIN_PASS:-}"
+    if [ -z "$installer_pass" ] && [ -z "$root_pass" ]; then
+        print_warning "Cannot bootstrap SSH mesh: installer/admin and root passwords are both unset."
         return 1
     fi
 
     if ! command -v sshpass >/dev/null 2>&1; then
         print_step "Installing sshpass for automated SSH trust bootstrap"
-        sudo dnf install -y sshpass >/dev/null 2>&1 || {
+        sudo dnf install -y --nogpgcheck sshpass >/dev/null 2>&1 || {
             print_warning "Failed to install sshpass; skipping SSH mesh bootstrap."
             return 1
         }
@@ -5394,57 +6497,80 @@ setup_rhis_ssh_mesh() {
 
     node_ips=("${SAT_IP}" "${AAP_IP}" "${IDM_IP}")
 
-    bootstrap_cmd='set -e; mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; if [ ! -f /root/.ssh/id_rsa ]; then ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa; fi; grep -q "^PermitRootLogin" /etc/ssh/sshd_config && sed -i "s/^PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config; grep -q "^PubkeyAuthentication" /etc/ssh/sshd_config && sed -i "s/^PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config; grep -q "^PasswordAuthentication" /etc/ssh/sshd_config && sed -i "s/^PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config || echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config; cat > /root/.ssh/config <<EOF
+    bootstrap_cmd='set -e; target_user="'"${installer_user}"'"; target_home="$(getent passwd "$target_user" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/$target_user"; install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"; if [ ! -f "$target_home/.ssh/id_rsa" ]; then sudo -u "$target_user" ssh-keygen -q -t rsa -b 4096 -N "" -f "$target_home/.ssh/id_rsa"; fi; touch "$target_home/.ssh/authorized_keys"; chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"; chmod 600 "$target_home/.ssh/authorized_keys"; cat > "$target_home/.ssh/config" <<EOF
 Host *
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
 EOF
-chmod 600 /root/.ssh/config; cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; systemctl enable --now sshd >/dev/null 2>&1 || true; systemctl restart sshd >/dev/null 2>&1 || true'
+chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target_home/.ssh/config"; cat "$target_home/.ssh/id_rsa.pub" >> "$target_home/.ssh/authorized_keys"; sort -u "$target_home/.ssh/authorized_keys" -o "$target_home/.ssh/authorized_keys"'
 
-    print_step "Bootstrapping root SSH config/keys on RHIS nodes"
+    print_step "Bootstrapping installer-user SSH config/keys on RHIS nodes (${installer_user})"
     for ip in "${node_ips[@]}"; do
-        sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$bootstrap_cmd" || {
-            print_warning "SSH bootstrap failed for ${ip}; skipping mesh setup."
-            return 1
-        }
+        login_user="${installer_user}"
+        login_pass="${installer_pass}"
+        if ! sshpass -p "$login_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${login_user}@${ip}" "$bootstrap_cmd" >/dev/null 2>&1; then
+            if [ -n "$root_pass" ]; then
+                login_user="root"
+                login_pass="${root_pass}"
+                sshpass -p "$login_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${login_user}@${ip}" "$bootstrap_cmd" >/dev/null 2>&1 || {
+                    print_warning "SSH bootstrap failed for ${ip} as ${installer_user} and root; skipping mesh setup."
+                    return 1
+                }
+            else
+                print_warning "SSH bootstrap failed for ${ip} as ${installer_user}; root fallback unavailable."
+                return 1
+            fi
+        fi
     done
 
-    print_step "Collecting node public keys for full mesh trust"
+    print_step "Collecting ${installer_user} public keys for full mesh trust"
     for ip in "${node_ips[@]}"; do
-        pub="$(sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" 'cat /root/.ssh/id_rsa.pub' 2>/dev/null || true)"
+        pub="$(sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" 'target_home="$(getent passwd "'"${installer_user}"'" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/'"${installer_user}"'"; cat "$target_home/.ssh/id_rsa.pub"' 2>/dev/null || true)"
+        if [ -z "$pub" ] && [ -n "$root_pass" ]; then
+            pub="$(sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" 'target_home="$(getent passwd "'"${installer_user}"'" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/'"${installer_user}"'"; cat "$target_home/.ssh/id_rsa.pub"' 2>/dev/null || true)"
+        fi
         if [ -z "$pub" ]; then
-            print_warning "Could not read root SSH public key from ${ip}."
+            print_warning "Could not read ${installer_user} SSH public key from ${ip}."
             return 1
         fi
         all_pubs+=("$pub")
     done
 
-    print_step "Distributing trusted keys to all nodes (root-to-root mesh)"
+    print_step "Distributing trusted keys to all nodes (${installer_user}-to-${installer_user} mesh)"
     for ip in "${node_ips[@]}"; do
         for pub in "${all_pubs[@]}"; do
-            append_cmd="printf '%s\n' '$pub' >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
-            sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$append_cmd" >/dev/null 2>&1 || {
-                print_warning "Failed to distribute SSH key to ${ip}."
-                return 1
-            }
+            append_cmd="target_home=\"\$(getent passwd '${installer_user}' | cut -d: -f6)\"; [ -n \"\$target_home\" ] || target_home=\"/home/${installer_user}\"; printf '%s\\n' '$pub' >> \"\$target_home/.ssh/authorized_keys\"; sort -u \"\$target_home/.ssh/authorized_keys\" -o \"\$target_home/.ssh/authorized_keys\"; chown '${installer_user}:${installer_user}' \"\$target_home/.ssh/authorized_keys\"; chmod 600 \"\$target_home/.ssh/authorized_keys\""
+            if ! sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" "$append_cmd" >/dev/null 2>&1; then
+                if [ -n "$root_pass" ]; then
+                    sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$append_cmd" >/dev/null 2>&1 || {
+                        print_warning "Failed to distribute SSH key to ${ip} as ${installer_user} and root."
+                        return 1
+                    }
+                else
+                    print_warning "Failed to distribute SSH key to ${ip} as ${installer_user}; root fallback unavailable."
+                    return 1
+                fi
+            fi
         done
     done
 
-    print_success "RHIS SSH mesh configured: root SSH enabled with no strict host key checking across all nodes."
+    print_success "RHIS SSH mesh configured: ${installer_user} SSH trust established across all nodes."
     return 0
 }
 
 validate_rhis_ssh_mesh() {
-    local root_pass
+    local root_pass installer_user installer_pass
     local src_name src_ip dst_name dst_ip
     local validation_cmd
     local failures=0
     local -a node_specs
 
     root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-    if [ -z "$root_pass" ]; then
-        print_warning "Cannot validate SSH mesh: root/admin password is unset."
+    installer_user="${INSTALLER_USER:-${ADMIN_USER}}"
+    installer_pass="${ADMIN_PASS:-}"
+    if [ -z "$installer_pass" ] && [ -z "$root_pass" ]; then
+        print_warning "Cannot validate SSH mesh: installer/admin and root passwords are both unset."
         return 1
     fi
 
@@ -5454,16 +6580,18 @@ validate_rhis_ssh_mesh() {
         "${IDM_HOSTNAME}:${IDM_IP}"
     )
 
-    print_step "Validating RHIS SSH mesh (root-to-root key auth across all nodes)"
+    print_step "Validating RHIS SSH mesh (${installer_user}-to-${installer_user} key auth across all nodes)"
     for src in "${node_specs[@]}"; do
         src_name="${src%%:*}"
         src_ip="${src##*:}"
         for dst in "${node_specs[@]}"; do
             dst_name="${dst%%:*}"
             dst_ip="${dst##*:}"
-            validation_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 root@${dst_ip} 'echo ok:${dst_name}'"
-            if sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
+            validation_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 ${installer_user}@${dst_ip} 'echo ok:${dst_name}'"
+            if sshpass -p "$installer_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ${installer_user}@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
                 print_step "SSH mesh OK: ${src_name} -> ${dst_name}"
+            elif [ -n "$root_pass" ] && sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
+                print_step "SSH mesh OK via root fallback: ${src_name} -> ${dst_name}"
             else
                 print_warning "SSH mesh FAILED: ${src_name} -> ${dst_name}"
                 failures=$((failures + 1))
@@ -5476,7 +6604,7 @@ validate_rhis_ssh_mesh() {
         return 1
     fi
 
-    print_success "SSH mesh validation complete: all RHIS nodes can SSH to themselves and each other as root."
+    print_success "SSH mesh validation complete: all RHIS nodes can SSH to themselves and each other as ${installer_user}."
     return 0
 }
 
@@ -5527,7 +6655,7 @@ setup_virt_manager() {
 ensure_libvirtd() {
 	if ! command -v libvirtd >/dev/null 2>&1; then
 		print_warning "libvirtd not found. Installing..."
-		sudo dnf install -y libvirt libvirt-daemon
+        sudo dnf install -y --nogpgcheck libvirt libvirt-daemon
 	fi
 
 	sudo systemctl enable libvirtd
@@ -5549,7 +6677,7 @@ ensure_iso_tools() {
 	fi
 
 	print_step "Installing ISO image creation tools..."
-	sudo dnf install -y genisoimage xorriso
+    sudo dnf install -y --nogpgcheck genisoimage xorriso
 
 	command -v genisoimage >/dev/null 2>&1 || command -v xorriso >/dev/null 2>&1
 }

@@ -102,6 +102,7 @@ Thumbs.db
 *.key
 *.pem
 *.secret
+*.SAMPLE
 
 # RHIS generated files — contain resolved IPs, passwords from env.yml.
 # Never commit; the *.SAMPLE files in these directories are tracked instead.
