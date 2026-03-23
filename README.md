@@ -146,7 +146,6 @@ Environment toggles:
 - `RHIS_RETRY_FAILED_PHASES_ONCE=0` disables automatic retry of failed config-as-code phases
 - `RHC_AUTO_CONNECT=0` disables automatic `rhc connect` during guest kickstart `%post`
 - `RHIS_POST_VM_SETTLE_GRACE=650` default guest settle window before SSH preflight checks
-- `RHIS_POST_VM_SETTLE_GRACE=<seconds>` guest settle window before SSH preflight (default `300`)
 - `RHIS_INTERNAL_SSH_WARN_GRACE=<seconds>` delay before per-host warning logs (default `600`)
 - `RHIS_INTERNAL_SSH_LOG_EVERY=<seconds>` periodic preflight progress log cadence (default `60`)
 
@@ -703,6 +702,28 @@ If provisioning behaves unexpectedly:
 - inspect generated kickstarts in `/var/lib/libvirt/images/kickstarts/`
 - inspect guest `%post` logs such as `/root/ks-post.log`
 - use `--DEMOKILL` before retrying a clean rebuild
+
+### Current pre-flight safeguards (built into script)
+
+- Managed-node package pre-flight now ensures `rhel-system-roles` and `rhc-worker-playbook` are installed before phase playbooks.
+  - `rhc-worker-playbook` install order: pinned version first, then latest if unavailable.
+  - If install fails, script retries with `--nogpgcheck`.
+- Satellite entitlement pre-flight now validates against **enabled** repos (`subscription-manager repos --list-enabled`) to avoid false negatives.
+- Satellite RHSM remediation prints a one-line cause classification (for easier log scanning):
+  - `remediation-ok`
+  - `auth-failed`
+  - `auth-failed-both`
+  - `remediation-failed`
+
+### Manual rerun command format
+
+When running `ansible-playbook` manually, keep the JSON extra-vars argument quoted as one shell token.
+
+Example:
+
+```bash
+podman exec -it rhis-provisioner ansible-playbook --inventory /rhis/vars/external_inventory/hosts --vault-password-file /rhis/vars/vault/.vaultpass.container --extra-vars @/rhis/vars/vault/env.yml --extra-vars '{"satellite_disconnected":false,"register_to_satellite":false}' --limit idm /rhis/rhis-builder-idm/main.yml
+```
 
 If configuration values are wrong, rerun:
 

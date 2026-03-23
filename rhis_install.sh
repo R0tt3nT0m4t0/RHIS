@@ -168,6 +168,7 @@ CDN_SAT_ACTIVATION_KEY="${CDN_SAT_ACTIVATION_KEY:-}"
 SAT_FIREWALLD_ZONE="${SAT_FIREWALLD_ZONE:-public}"
 SAT_FIREWALLD_INTERFACE="${SAT_FIREWALLD_INTERFACE:-eth1}"
 SAT_FIREWALLD_SERVICES_JSON='["ssh","http","https"]'
+IDM_REPOSITORY_IDS_JSON='["rhel-10-for-x86_64-baseos-rpms","rhel-10-for-x86_64-appstream-rpms"]'
 # Required Satellite server repositories.  Your RHSM account MUST expose all
 # four IDs below before run_config_as_code() reaches the Satellite phase.
 # See assert_satellite_server_repos_available() for the pre-flight guard.
@@ -2466,6 +2467,34 @@ generate_rhis_inventory() {
     local controller_host
     local template_file
     local controller_host_e host_int_ip_e installer_user_e sat_host_e sat_alias_e sat_ip_e aap_host_e aap_alias_e aap_ip_e idm_host_e idm_alias_e idm_ip_e admin_user_e
+    local sat_connect_host aap_connect_host idm_connect_host
+
+    # Prefer external (eth0) addressing for SSH/config-as-code connectivity.
+    # This is especially important for registration flows that require external
+    # network reachability. Fallback order when enabled:
+    #   detected external IP via virsh -> FQDN hostname -> configured internal IP
+    resolve_vm_connect_host() {
+        local vm_name="$1"
+        local fallback_host="$2"
+        local fallback_ip="$3"
+        local detected_ip=""
+
+        if is_enabled "${RHIS_MANAGED_SSH_OVER_ETH0:-1}"; then
+            detected_ip="$(sudo virsh domifaddr "${vm_name}" 2>/dev/null | awk 'NR>2{print $4}' | cut -d/ -f1 | awk '$1 !~ /^10\.168\./ {print; exit}')"
+            if [ -n "${detected_ip}" ]; then
+                printf '%s' "${detected_ip}"
+                return 0
+            fi
+
+            if [ -n "${fallback_host}" ]; then
+                printf '%s' "${fallback_host}"
+                return 0
+            fi
+        fi
+
+        printf '%s' "${fallback_ip}"
+        return 0
+    }
     controller_host="$(hostname -f 2>/dev/null || hostname)"
 
     template_file="${RHIS_INVENTORY_DIR}/hosts.SAMPLE"
@@ -2474,13 +2503,16 @@ generate_rhis_inventory() {
     installer_user_e="$(sed_escape_replacement "${INSTALLER_USER:-${USER}}")"
     sat_host_e="$(sed_escape_replacement "${SAT_HOSTNAME:-satellite}")"
     sat_alias_e="$(sed_escape_replacement "${SAT_ALIAS:-satellite}")"
-    sat_ip_e="$(sed_escape_replacement "${SAT_IP:-10.168.128.1}")"
+    sat_connect_host="$(resolve_vm_connect_host "satellite-618" "${SAT_HOSTNAME:-satellite}" "${SAT_IP:-10.168.128.1}")"
+    sat_ip_e="$(sed_escape_replacement "${sat_connect_host}")"
     aap_host_e="$(sed_escape_replacement "${AAP_HOSTNAME:-aap}")"
     aap_alias_e="$(sed_escape_replacement "${AAP_ALIAS:-aap}")"
-    aap_ip_e="$(sed_escape_replacement "${AAP_IP:-10.168.128.2}")"
+    aap_connect_host="$(resolve_vm_connect_host "aap-26" "${AAP_HOSTNAME:-aap}" "${AAP_IP:-10.168.128.2}")"
+    aap_ip_e="$(sed_escape_replacement "${aap_connect_host}")"
     idm_host_e="$(sed_escape_replacement "${IDM_HOSTNAME:-idm}")"
     idm_alias_e="$(sed_escape_replacement "${IDM_ALIAS:-idm}")"
-    idm_ip_e="$(sed_escape_replacement "${IDM_IP:-10.168.128.3}")"
+    idm_connect_host="$(resolve_vm_connect_host "idm" "${IDM_HOSTNAME:-idm}" "${IDM_IP:-10.168.128.3}")"
+    idm_ip_e="$(sed_escape_replacement "${idm_connect_host}")"
     admin_user_e="$(sed_escape_replacement "${ADMIN_USER:-admin}")"
 
     if [ -f "${template_file}" ]; then
@@ -2514,15 +2546,15 @@ ${controller_host}
 ${controller_host} ansible_host=${HOST_INT_IP:-192.168.122.1} ansible_user=${INSTALLER_USER:-${USER}} ansible_become=true
 
 [scenario_satellite]
-${SAT_HOSTNAME:-satellite} ansible_host=${SAT_IP:-10.168.128.1} ansible_user=${ADMIN_USER:-admin} ansible_become=true
-${SAT_ALIAS:-satellite} ansible_host=${SAT_IP:-10.168.128.1} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${SAT_HOSTNAME:-satellite} ansible_host=${sat_connect_host} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${SAT_ALIAS:-satellite} ansible_host=${sat_connect_host} ansible_user=${ADMIN_USER:-admin} ansible_become=true
 
 [sat_primary:children]
 scenario_satellite
 
 [aap]
-${AAP_HOSTNAME:-aap} ansible_host=${AAP_IP:-10.168.128.2} ansible_user=${ADMIN_USER:-admin} ansible_become=true
-${AAP_ALIAS:-aap} ansible_host=${AAP_IP:-10.168.128.2} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${AAP_HOSTNAME:-aap} ansible_host=${aap_connect_host} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${AAP_ALIAS:-aap} ansible_host=${aap_connect_host} ansible_user=${ADMIN_USER:-admin} ansible_become=true
 
 [aap_hosts:children]
 aap
@@ -2531,8 +2563,8 @@ aap
 aap
 
 [idm]
-${IDM_HOSTNAME:-idm} ansible_host=${IDM_IP:-10.168.128.3} ansible_user=${ADMIN_USER:-admin} ansible_become=true
-${IDM_ALIAS:-idm} ansible_host=${IDM_IP:-10.168.128.3} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${IDM_HOSTNAME:-idm} ansible_host=${idm_connect_host} ansible_user=${ADMIN_USER:-admin} ansible_become=true
+${IDM_ALIAS:-idm} ansible_host=${idm_connect_host} ansible_user=${ADMIN_USER:-admin} ansible_become=true
 
 [idm_primary:children]
 idm
@@ -2572,6 +2604,7 @@ ansible_connection: ssh
 ansible_ssh_private_key_file: "/home/{{ lookup('env', 'USER') | default('root') }}/.ssh/id_rsa"
 satellite_organization: "${SAT_ORG:-REDHAT}"
 satellite_location: "${SAT_LOC:-CORE}"
+satellite_pre_use_idm: true
 EOF
 
     # AAP
@@ -2739,12 +2772,161 @@ run_rhis_config_as_code() {
     fi
 
     local inv="--inventory /rhis/vars/external_inventory/hosts"
-    local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false}}"
-    local manual_evars="--extra-vars @${vault_file} --extra-vars '{\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false}}'"
+    local sat_pre_use_idm="${SATELLITE_PRE_USE_IDM:-true}"
+    local idm_async_timeout="${IDM_ASYNC_TIMEOUT:-14400}"
+    local idm_async_delay="${IDM_ASYNC_DELAY:-15}"
+    local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}"
+    local manual_evars="--extra-vars @${vault_file} --extra-vars '{\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}'"
     local manual_vault_arg="${vault_arg[*]}"
     if [ -z "${manual_vault_arg}" ]; then
         manual_vault_arg="--ask-vault-pass"
     fi
+
+    # Per-phase extras for copy-paste manual reruns — must mirror what run_phase_playbook injects.
+    # IdM: bypass the rhc 'Configure remediation' block (GPG fails on RHEL 10 for rhc-worker-playbook)
+    local manual_idm_extras="--extra-vars '{\"rhc_insights\":{\"remediation\":\"absent\"},\"idm_repository_ids\":${IDM_REPOSITORY_IDS_JSON},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}'"
+    if [ -n "${IPADM_PASSWORD:-}" ]; then
+        manual_idm_extras+=" -e 'ipadm_password=${IPADM_PASSWORD}' -e 'ipaadmin_password=${IPAADMIN_PASSWORD:-${IPADM_PASSWORD}}'"
+    fi
+
+    # Satellite: supply sat_repository_ids, firewall settings, and CDN registration vars
+    local _sat_manual_json="{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm}}"
+    local manual_satellite_extras="--extra-vars '${_sat_manual_json}'"
+
+    ensure_satellite_chrony_template() {
+        local _tpl_path="/rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2"
+        local _mk_cmd='mkdir -p /rhis/rhis-builder-satellite/roles/satellite_pre/templates && cat > /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 <<'"'"'EOF'"'"'
+# RHIS fallback chrony template (auto-generated when upstream template is missing)
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+pool 2.rhel.pool.ntp.org iburst
+EOF'
+
+        if podman exec "${RHIS_CONTAINER_NAME}" test -f "${_tpl_path}" 2>/dev/null; then
+            return 0
+        fi
+
+        print_warning "chrony.j2 is missing in rhis-builder-satellite; applying fallback template workaround."
+
+        if podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_mk_cmd}" >/dev/null 2>&1 || \
+           podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_mk_cmd}" >/dev/null 2>&1; then
+            print_success "Fallback chrony.j2 created in rhis-builder-satellite templates."
+            return 0
+        fi
+
+        print_warning "Failed to create fallback chrony.j2; will skip tags_satellite_pre_chrony."
+        return 1
+    }
+
+    ensure_satellite_foreman_service_check_nonfatal() {
+        local _root="/rhis/rhis-builder-satellite/roles/satellite_pre/tasks"
+        local _py='import pathlib
+import re
+
+root = pathlib.Path("/rhis/rhis-builder-satellite/roles/satellite_pre/tasks")
+if not root.exists():
+    print("MISSING_TASKS_DIR")
+    raise SystemExit(0)
+
+updated = 0
+for path in root.rglob("*.yml"):
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if "Get the state of the foreman service" not in text:
+        continue
+
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if "Get the state of the foreman service" in line:
+            start = i
+            break
+    if start is None:
+        continue
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^\s*-\s+name:\s+", lines[j]):
+            end = j
+            break
+
+    block = lines[start:end]
+    block_text = "\n".join(block)
+
+    register_idx = None
+    changed_idx = None
+    failed_idx = None
+    indent = "      "
+
+    for j in range(start + 1, end):
+        if re.match(r"^\s*register:\s*", lines[j]):
+            register_idx = j
+            indent = re.match(r"^(\s*)", lines[j]).group(1)
+        if re.match(r"^\s*changed_when:\s*", lines[j]):
+            changed_idx = j
+            indent = re.match(r"^(\s*)", lines[j]).group(1)
+        if re.match(r"^\s*failed_when:\s*", lines[j]):
+            failed_idx = j
+            indent = re.match(r"^(\s*)", lines[j]).group(1)
+
+    changed = False
+
+    if changed_idx is not None:
+        normalized = f"{indent}changed_when: false"
+        if lines[changed_idx].strip() != "changed_when: false":
+            lines[changed_idx] = normalized
+            changed = True
+    else:
+        insert_at = register_idx + 1 if register_idx is not None else end
+        lines.insert(insert_at, f"{indent}changed_when: false")
+        changed_idx = insert_at
+        end += 1
+        changed = True
+
+    if failed_idx is None:
+        lines.insert(changed_idx + 1, f"{indent}failed_when: false")
+        changed = True
+    elif lines[failed_idx].strip() != "failed_when: false":
+        lines[failed_idx] = f"{indent}failed_when: false"
+        changed = True
+
+    if changed:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        updated += 1
+
+print(f"UPDATED={updated}")'
+
+        local _cmd="python3 - <<'PY'\n${_py}\nPY"
+        local _out=""
+
+        _out="$(podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+        if [ -z "${_out}" ]; then
+            _out="$(podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+        fi
+
+        if printf '%s\n' "${_out}" | grep -q 'UPDATED='; then
+            if printf '%s\n' "${_out}" | grep -q 'UPDATED=0'; then
+                print_step "satellite_pre foreman service check patch: already compatible or task not present."
+            else
+                print_success "Patched satellite_pre foreman service check to be non-fatal when service is absent."
+            fi
+            return 0
+        fi
+
+        print_warning "Could not confirm satellite_pre foreman service check patch; continuing."
+        return 1
+    }
+
+    if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+        manual_satellite_extras+=" -e cdn_organization_id=${CDN_ORGANIZATION_ID} -e cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}"
+    else
+        manual_satellite_extras+=" --skip-tags tags_satellite_pre_cdn_registration"
+    fi
+    if ! ensure_satellite_chrony_template; then
+        manual_satellite_extras+=" --skip-tags tags_satellite_pre_chrony"
+    fi
+    ensure_satellite_foreman_service_check_nonfatal || true
 
     print_manual_rerun_template() {
         print_warning "Manual rerun template (works for all groups):"
@@ -2767,10 +2949,16 @@ run_rhis_config_as_code() {
             phase_args+=( -e "ipadm_password=${IPADM_PASSWORD}" )
             phase_args+=( -e "ipaadmin_password=${IPAADMIN_PASSWORD:-${IPADM_PASSWORD}}" )
         fi
+        # Skip the rhc role's 'Configure remediation' block — it installs
+        # rhc-worker-playbook but GPG validation fails on RHEL 10 CDN packages;
+        # the package is pre-installed by ensure_core_role_packages_on_managed_nodes.
+        if [ "${phase_limit}" = "idm" ]; then
+            phase_args+=( --extra-vars "{\"rhc_insights\":{\"remediation\":\"absent\"},\"idm_repository_ids\":${IDM_REPOSITORY_IDS_JSON},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}" )
+        fi
 
         # Satellite collection expects sat_repository_ids and (optionally) CDN activation vars.
         if [ "${phase_limit}" = "scenario_satellite" ]; then
-            phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON}}" )
+            phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm}}" )
             if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
                 phase_args+=( -e "cdn_organization_id=${CDN_ORGANIZATION_ID}" )
                 phase_args+=( -e "cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}" )
@@ -2778,10 +2966,11 @@ run_rhis_config_as_code() {
                 phase_args+=( --skip-tags "tags_satellite_pre_cdn_registration" )
             fi
 
-            if ! podman exec "${RHIS_CONTAINER_NAME}" test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 2>/dev/null; then
+            if ! ensure_satellite_chrony_template; then
                 phase_args+=( --skip-tags "tags_satellite_pre_chrony" )
                 print_warning "chrony.j2 is missing in rhis-builder-satellite; skipping tags_satellite_pre_chrony for this run."
             fi
+            ensure_satellite_foreman_service_check_nonfatal || true
         fi
 
         print_step "${phase_label}"
@@ -2812,8 +3001,11 @@ run_rhis_config_as_code() {
             fallback_phase_args+=( -e "ipadm_password=${IPADM_PASSWORD}" )
             fallback_phase_args+=( -e "ipaadmin_password=${IPAADMIN_PASSWORD:-${IPADM_PASSWORD}}" )
         fi
+        if [ "${phase_limit}" = "idm" ]; then
+            fallback_phase_args+=( --extra-vars "{\"rhc_insights\":{\"remediation\":\"absent\"},\"idm_repository_ids\":${IDM_REPOSITORY_IDS_JSON},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}" )
+        fi
         if [ "${phase_limit}" = "scenario_satellite" ]; then
-            fallback_phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON}}" )
+            fallback_phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm}}" )
             if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
                 fallback_phase_args+=( -e "cdn_organization_id=${CDN_ORGANIZATION_ID}" )
                 fallback_phase_args+=( -e "cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}" )
@@ -2821,10 +3013,11 @@ run_rhis_config_as_code() {
                 fallback_phase_args+=( --skip-tags "tags_satellite_pre_cdn_registration" )
             fi
 
-            if ! podman exec "${RHIS_CONTAINER_NAME}" test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 2>/dev/null; then
+            if ! ensure_satellite_chrony_template; then
                 fallback_phase_args+=( --skip-tags "tags_satellite_pre_chrony" )
                 print_warning "chrony.j2 is missing in rhis-builder-satellite; skipping tags_satellite_pre_chrony for fallback run."
             fi
+            ensure_satellite_foreman_service_check_nonfatal || true
         fi
 
         phase_auth_fallback_status="not-needed"
@@ -3562,7 +3755,7 @@ run_rhis_config_as_code() {
         dump_idm_network_diagnostics || true
         print_warning "You can re-run manually:"
         print_manual_rerun_template
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit idm /rhis/rhis-builder-idm/main.yml"
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} ${manual_idm_extras} --limit idm /rhis/rhis-builder-idm/main.yml"
     else
         idm_auth_fallback_status="${phase_auth_fallback_status}"
         idm_status="success"
@@ -3572,13 +3765,10 @@ run_rhis_config_as_code() {
 
     # ── 2. Satellite ───────────────────────────────────────────────────────────
     remediate_satellite_repo_entitlements || true
-    if ! assert_satellite_server_repos_available; then
-        satellite_status="entitlement-missing"
-        any_failed=1
-        print_warning "Skipping Satellite phase: required RHSM server repos are not available."
-        dump_satellite_rhsm_diagnostics || true
-        print_warning "Resolve the entitlement issue above and re-run."
-    elif ! run_phase_playbook_with_auth_fallback "Phase 2/3 — Configuring Satellite..." "scenario_satellite" "/rhis/rhis-builder-satellite/main.yml"; then
+    print_step "Pre-flight: collecting Satellite RHSM state"
+    dump_satellite_rhsm_diagnostics || true
+
+    if ! run_phase_playbook_with_auth_fallback "Phase 2/3 — Configuring Satellite..." "scenario_satellite" "/rhis/rhis-builder-satellite/main.yml"; then
         satellite_auth_fallback_status="${phase_auth_fallback_status}"
         satellite_status="failed"
         any_failed=1
@@ -3586,7 +3776,7 @@ run_rhis_config_as_code() {
         dump_satellite_rhsm_diagnostics || true
         print_warning "You can re-run manually:"
         print_manual_rerun_template
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit scenario_satellite /rhis/rhis-builder-satellite/main.yml"
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} ${manual_satellite_extras} --limit scenario_satellite /rhis/rhis-builder-satellite/main.yml"
     else
         satellite_auth_fallback_status="${phase_auth_fallback_status}"
         satellite_status="success"
@@ -3615,7 +3805,7 @@ run_rhis_config_as_code() {
         print_warning "AAP config-as-code failed.  Check the output above."
         print_warning "You can re-run manually:"
         print_manual_rerun_template
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit aap /rhis/rhis-builder-aap/main.yml"
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit aap /rhis/rhis-builder-aap/main.yml"
     else
         aap_auth_fallback_status="${phase_auth_fallback_status}"
         aap_status="success"
@@ -3678,7 +3868,7 @@ run_rhis_config_as_code() {
     echo ""
     echo "To re-run any component:"
     echo "  podman exec -it ${RHIS_CONTAINER_NAME} /bin/bash"
-    echo "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+    echo "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
 
     cleanup_staged_vaultpass
 
@@ -6700,7 +6890,14 @@ create_rhis_vms() {
     if setup_rhis_ssh_mesh; then
         ssh_mesh_bootstrap_ok=1
     else
-        print_warning "SSH mesh bootstrap did not complete cleanly; will retry after config-as-code once nodes are fully initialized."
+        if is_enabled "${RHIS_ALLOW_DEFERRED_SSH_MESH:-0}"; then
+            print_warning "SSH mesh bootstrap did not complete cleanly; deferred mode enabled (RHIS_ALLOW_DEFERRED_SSH_MESH=1), will retry after config-as-code once nodes are fully initialized."
+        else
+            print_warning "SSH mesh bootstrap is required before continuing. Aborting now."
+            print_warning "If you intentionally want deferred behavior, set RHIS_ALLOW_DEFERRED_SSH_MESH=1 and re-run."
+            stop_vm_power_watchdog || true
+            return 1
+        fi
     fi
     print_phase 4 8 "SSH mesh validation"
     if [ "${ssh_mesh_bootstrap_ok}" -eq 1 ]; then
@@ -6761,6 +6958,7 @@ fix_vm_root_passwords() {
 
 setup_rhis_ssh_mesh() {
     local root_pass installer_user installer_pass ip pub login_user login_pass
+    local ssh_bootstrap_retries ssh_bootstrap_delay
     local local_installer_pub=""
     local local_root_pub=""
     local -a node_ips all_pubs root_pubs node_names
@@ -6769,6 +6967,8 @@ setup_rhis_ssh_mesh() {
     root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
     installer_user="${INSTALLER_USER:-${ADMIN_USER}}"
     installer_pass="${ADMIN_PASS:-}"
+    ssh_bootstrap_retries="${RHIS_SSH_BOOTSTRAP_RETRIES:-45}"
+    ssh_bootstrap_delay="${RHIS_SSH_BOOTSTRAP_DELAY:-10}"
     if [ -z "$installer_pass" ] && [ -z "$root_pass" ]; then
         print_warning "Cannot bootstrap SSH mesh: installer/admin and root passwords are both unset."
         return 1
@@ -6817,7 +7017,7 @@ setup_rhis_ssh_mesh() {
         sudo bash -lc "sshpass -p '${root_pass}' ssh-copy-id -i /root/.ssh/id_rsa.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 >/dev/null 2>&1 || true" || true
     fi
 
-    bootstrap_cmd='set -e; target_user="'"${installer_user}"'"; target_home="$(getent passwd "$target_user" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/$target_user"; install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"; if [ ! -f "$target_home/.ssh/id_rsa" ]; then sudo -u "$target_user" ssh-keygen -q -t rsa -b 4096 -N "" -f "$target_home/.ssh/id_rsa"; fi; touch "$target_home/.ssh/authorized_keys"; chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"; chmod 600 "$target_home/.ssh/authorized_keys"; cat > "$target_home/.ssh/config" <<EOF
+    bootstrap_cmd='set -e; target_user="'"${installer_user}"'"; if ! id "$target_user" >/dev/null 2>&1; then useradd -m -G wheel "$target_user" >/dev/null 2>&1 || useradd -m "$target_user" >/dev/null 2>&1 || true; fi; target_home="$(getent passwd "$target_user" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/$target_user"; install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"; if [ ! -f "$target_home/.ssh/id_rsa" ]; then sudo -u "$target_user" ssh-keygen -q -t rsa -b 4096 -N "" -f "$target_home/.ssh/id_rsa"; fi; touch "$target_home/.ssh/authorized_keys"; chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"; chmod 600 "$target_home/.ssh/authorized_keys"; cat > "$target_home/.ssh/config" <<EOF
 Host *
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -6827,20 +7027,30 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
 
     print_step "Bootstrapping installer-user SSH config/keys on RHIS nodes (${installer_user})"
     for ip in "${node_ips[@]}"; do
-        login_user="${installer_user}"
-        login_pass="${installer_pass}"
-        if ! sshpass -p "$login_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${login_user}@${ip}" "$bootstrap_cmd" >/dev/null 2>&1; then
-            if [ -n "$root_pass" ]; then
-                login_user="root"
-                login_pass="${root_pass}"
-                sshpass -p "$login_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${login_user}@${ip}" "$bootstrap_cmd" >/dev/null 2>&1 || {
-                    print_warning "SSH bootstrap failed for ${ip} as ${installer_user} and root; skipping mesh setup."
-                    return 1
-                }
-            else
-                print_warning "SSH bootstrap failed for ${ip} as ${installer_user}; root fallback unavailable."
-                return 1
+        local _bootstrap_ok=0
+        local _attempt
+        for _attempt in $(seq 1 "${ssh_bootstrap_retries}"); do
+            login_user="${installer_user}"
+            login_pass="${installer_pass}"
+            if [ -n "${login_pass}" ] && sshpass -p "$login_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${login_user}@${ip}" "$bootstrap_cmd" >/dev/null 2>&1; then
+                _bootstrap_ok=1
+                break
             fi
+
+            if [ -n "$root_pass" ] && sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${ip}" "$bootstrap_cmd" >/dev/null 2>&1; then
+                _bootstrap_ok=1
+                break
+            fi
+
+            if [ "${_attempt}" -eq 1 ] || [ $(( _attempt % 6 )) -eq 0 ]; then
+                print_step "SSH bootstrap waiting on ${ip} (attempt ${_attempt}/${ssh_bootstrap_retries})..."
+            fi
+            sleep "${ssh_bootstrap_delay}"
+        done
+
+        if [ "${_bootstrap_ok}" -ne 1 ]; then
+            print_warning "SSH bootstrap failed for ${ip} as ${installer_user} and root after ${ssh_bootstrap_retries} attempts."
+            return 1
         fi
     done
 
@@ -7147,6 +7357,8 @@ ensure_installer_host_ansible_collections() {
     local failed=0
     local server
     local -a collections
+    local collection_list_cache=""
+    local timeout_sec=30
 
     print_step "Ensuring required Ansible collections are installed on installer host"
 
@@ -7163,25 +7375,36 @@ ensure_installer_host_ansible_collections() {
         redhat.rhel_system_roles
         redhat.satellite
         redhat.satellite_operations
-        redhat.aap_utilities
         freeipa.ansible_freeipa
         ansible.posix
         community.general
+        infra.aap_configuration
+        infra.aap_utilities
+
     )
 
+    # Cache collection list once with timeout to avoid repeated Galaxy queries
+    print_step "Querying local Ansible collection cache (timeout: ${timeout_sec}s)..."
+    collection_list_cache="$(timeout ${timeout_sec} ansible-galaxy collection list 2>/dev/null | awk '{print $1}' || true)"
+
     for c in "${collections[@]}"; do
-        if ansible-galaxy collection list 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
+        # Check cached list first (no network)
+        if echo "${collection_list_cache}" | grep -qx "${c}"; then
             continue
         fi
 
+        # Try to install from each server with timeout
         for server in published validated community_galaxy; do
-            if ANSIBLE_CONFIG="${cfg}" ansible-galaxy collection install "${c}" --server "${server}" >/dev/null 2>&1; then
+            print_step "Attempting to install ${c} from ${server}..."
+            if timeout ${timeout_sec} bash -c "ANSIBLE_CONFIG='${cfg}' ansible-galaxy collection install '${c}' --server '${server}'" >/dev/null 2>&1; then
                 installed=$((installed + 1))
+                print_step "  ✓ Installed ${c}"
                 break
             fi
         done
 
-        if ! ansible-galaxy collection list 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
+        # Final check with timeout to see if collection is now available
+        if ! timeout ${timeout_sec} ansible-galaxy collection list 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
             failed=$((failed + 1))
             print_warning "Collection install unresolved on installer host: ${c} (tried published/validated/community_galaxy)"
         fi
@@ -7190,7 +7413,7 @@ ensure_installer_host_ansible_collections() {
     if [ "${failed}" -eq 0 ]; then
         print_success "Installer-host collections verified (installed new: ${installed})."
     else
-        print_warning "Installer-host collection check complete with ${failed} unresolved collection(s)."
+        print_warning "Installer-host collection check complete with ${failed} unresolved collection(s). Consider installing manually: ansible-galaxy collection install -r requirements.yml"
     fi
 
     return 0

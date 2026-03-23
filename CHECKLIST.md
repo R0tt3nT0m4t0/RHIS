@@ -379,3 +379,23 @@ If you want the shortest practical checklist, gather these first:
 - [ ] Your chosen internal IPs do not conflict with an existing network
 - [ ] CDN activation key + org ID are set if Satellite activation-key registration is expected
 - [ ] SSH bootstrap prerequisites are met (passwords + key tools available)
+
+---
+
+## 15. Built-in script safeguards to expect in logs
+
+- [ ] Package pre-flight runs on managed nodes before phase playbooks:
+  - installs `rhel-system-roles`
+  - installs `rhc-worker-playbook` (pinned version first, then latest)
+  - retries package install with `--nogpgcheck` if initial install fails
+- [ ] Satellite RHSM remediation includes auth fallback and emits one-line cause classification:
+  - `remediation-ok`, `auth-failed`, `auth-failed-both`, `remediation-failed`
+- [ ] Satellite entitlement check validates enabled repos (not just full repo catalog output)
+
+### Manual rerun command (copy-safe JSON)
+
+If you run a playbook manually, keep JSON extra-vars quoted as one shell token:
+
+```bash
+podman exec -it rhis-provisioner ansible-playbook --inventory /rhis/vars/external_inventory/hosts --vault-password-file /rhis/vars/vault/.vaultpass.container --extra-vars @/rhis/vars/vault/env.yml --extra-vars '{"satellite_disconnected":false,"register_to_satellite":false}' --limit idm /rhis/rhis-builder-idm/main.yml
+```

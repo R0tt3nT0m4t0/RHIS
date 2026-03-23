@@ -26,3 +26,10 @@ ansible_password: "{{ global_admin_password | default('') }}"
 
 Store the vault at `~/.ansible/conf/env.yml` (encrypted with `ansible-vault`).  
 See `CHECKLIST.md` in the repo root for the full secret checklist.
+
+## Runtime behavior note
+
+`rhis_install.sh` regenerates `host_vars/*.yml` during config-as-code startup.
+Treat these files as generated runtime artifacts; if you need persistent changes,
+set values in the vaulted env source (`~/.ansible/conf/env.yml`) instead of editing
+generated files directly.
