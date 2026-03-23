@@ -1,6 +1,8 @@
 # RHIS Script Run Checklist
 
-Use this checklist before running `run_rhis_install_sequence.sh`.
+Use this checklist before running `rhis_install.sh`.
+
+The node where you run the script is the **installer host**.
 
 You can provide most items in one of three ways:
 
@@ -18,7 +20,9 @@ You can provide most items in one of three ways:
 - [ ] Hardware virtualization available (`KVM`/`libvirt`)
 - [ ] Enough CPU / RAM / disk for Satellite, AAP, and IdM VMs
 - [ ] Internet access from host to Red Hat services
-- [ ] Ability to install host packages as needed (`libvirt`, `virt-install`, `qemu-img`, `genisoimage`/`xorriso`, `tmux`, etc.)
+- [ ] Ability to install host packages as needed via `dnf` / `pip`
+  - Required platform set (current): `libvirt`, `virt-manager` and related tooling
+  - Common runtime tools: `virt-install`, `qemu-img`, `libvirt-client`, `qemu-kvm`, `genisoimage`/`xorriso`, `python3-pip`, `tmux`, `sshpass`
 
 ### Notes
 
@@ -27,11 +31,28 @@ You can provide most items in one of three ways:
 
 ---
 
+## 1.1 Installer-host Ansible collection prerequisites
+
+### Required behavior
+
+- [ ] Required Ansible collections are installed on the installer host.
+- [ ] Collection source order is:
+  1. `console.redhat.com` Automation Hub (published/validated)
+  2. `galaxy.ansible.com` fallback if collection is not available from Red Hat sources
+
+### Notes
+
+- The script now attempts this automatically using host-side `ansible-galaxy`.
+- Ensure your Hub token is valid when Red Hat collections are required.
+
+---
+
 ## 2. Vault / secret storage prerequisites
 
 ### Required
 
 - [ ] An Ansible Vault password for `~/.ansible/conf/.vaultpass.txt`
+- [ ] Encrypted `~/.ansible/conf/env.yml` exists and is decryptable with that password
 
 ### Where it comes from
 
@@ -41,6 +62,11 @@ You can provide most items in one of three ways:
 ### Used for
 
 - Encrypting `~/.ansible/conf/env.yml`
+- Supplying runtime variables to config-as-code phases in the provisioner container
+
+### Non-interactive note
+
+- [ ] If using non-interactive mode, ensure vault password handling is ready (`~/.ansible/conf/.vaultpass.txt` and staged container-readable vault password flow)
 
 ---
 
@@ -88,6 +114,24 @@ You can provide most items in one of three ways:
 - `RH_ISO_URL` should point to the RHEL 10 DVD / Everything ISO you want the VMs to install from.
 - `AAP_BUNDLE_URL` should point to the **Ansible Automation Platform 2.6 containerized setup bundle**.
 - These are usually authenticated CDN links copied from the downloads portal.
+
+---
+
+## 4.1 Satellite CDN activation-key inputs
+
+### Satellite CDN activation-key inputs (strongly recommended)
+
+- [ ] `CDN_ORGANIZATION_ID` — RHSM/connector organization ID
+- [ ] `CDN_SAT_ACTIVATION_KEY` — activation key with Satellite entitlements
+
+### Notes
+
+- Satellite pre-flight remediation and `rhc connect` use these values when present.
+- Without them, registration falls back to username/password and may miss required Satellite entitlements.
+- Verify your key exposes at least:
+  - `satellite-6.18-for-rhel-9-x86_64-rpms`
+  - `satellite-maintenance-6.18-for-rhel-9-x86_64-rpms`
+- **After creating your activation key**, go to https://access.redhat.com/management/subscription_allocations and add Subscription Allocations to it — without allocations attached, the key cannot entitle the Satellite host to the required repos.
 
 ---
 
@@ -168,6 +212,11 @@ You can provide most items in one of three ways:
 - The script expects:
   - `external` network = outside connectivity / updates / remote access
   - `internal` network = provisioning / orchestration / management
+- DNS fallback in automation paths is expected to include:
+  - `nameserver 10.168.0.1`
+  - `nameserver 1.1.1.1`
+  - `nameserver 8.8.8.8`
+  - `options rotate`
 - Make sure your chosen IPs and names match your intended DNS and routing plan.
 
 ---
@@ -235,6 +284,36 @@ You can provide most items in one of three ways:
 
 ---
 
+## 10.2 Workspace layout expectation
+
+For a clean source directory model, the only non-hidden top-level source artifacts you should need to keep are:
+
+- `CHECKLIST.md`
+- `LICENSE`
+- `README.md`
+- `rhis_install.sh`
+
+Other runtime directories/files (for example `inventory/`, `host_vars/`, generated docs/runtime placeholders) are expected to be created by `rhis_install.sh` when missing.
+
+---
+
+## 10.1 SSH bootstrap / mesh prerequisites
+
+### Required for fully automated SSH trust setup
+
+- [ ] `ADMIN_USER` and `ADMIN_PASS` are valid on first boot for Satellite/AAP/IdM
+- [ ] `ROOT_PASS` (or fallback to `ADMIN_PASS`) is available
+- [ ] Host has `ssh`, `ssh-keygen`, `ssh-copy-id`
+- [ ] Host can install/use `sshpass`
+
+### What the script now expects to do
+
+- Generate SSH keypairs in kickstart for both `root` and admin/installer user
+- Establish self-trust intent for loopback (`root@127.0.0.1`, `admin@127.0.0.1`)
+- Push install-host `$USER` public key to both `root` and `admin` on Satellite, IdM, and AAP
+
+---
+
 ## 11. Recommended minimum data set to gather before first run
 
 If you want the shortest practical checklist, gather these first:
@@ -244,6 +323,7 @@ If you want the shortest practical checklist, gather these first:
 - [ ] Red Hat access token
 - [ ] RHEL ISO URL
 - [ ] AAP bundle URL
+- [ ] CDN organization ID + Satellite activation key
 - [ ] Automation Hub token
 - [ ] Shared domain and realm
 - [ ] Shared admin username/password
@@ -258,21 +338,21 @@ If you want the shortest practical checklist, gather these first:
 
 1. Fill in the required values
 2. Run:
-   - `./run_rhis_install_sequence.sh --reconfigure`
+  - `./rhis_install.sh --reconfigure`
    - During `--reconfigure`, an interactive **inventory architecture submenu** will appear
      to select the AAP installer deployment model (enterprise or growth; use `--demo` to skip)
 3. Verify values were written to:
    - `~/.ansible/conf/env.yml`
 4. Clean old lab state if needed:
-   - `./run_rhis_install_sequence.sh --demokill`
+  - `./rhis_install.sh --demokill`
 5. Build the demo stack:
-   - `./run_rhis_install_sequence.sh --demo`
+  - `./rhis_install.sh --demo`
 6. Optional read-only status snapshot (no provisioning changes):
-  - `./run_rhis_install_sequence.sh --status`
+  - `./rhis_install.sh --status`
 7. Optional: run a fast validation sweep after cleanup / before a full rebuild:
-  - `./run_rhis_install_sequence.sh --test=fast --demo`
+  - `./rhis_install.sh --test=fast --demo`
 8. Optional: run the broader integration-style test sweep:
-  - `./run_rhis_install_sequence.sh --test=full --demo`
+  - `./rhis_install.sh --test=full --demo`
 
 ---
 
@@ -281,6 +361,8 @@ If you want the shortest practical checklist, gather these first:
 - Red Hat Customer Portal: https://access.redhat.com/
 - Red Hat Downloads: https://access.redhat.com/downloads/
 - Red Hat Hybrid Cloud Console: https://console.redhat.com/
+- Activation keys: https://console.redhat.com/insights/connector/activation-keys
+- Subscription Allocations: https://access.redhat.com/management/subscription_allocations
 - Token / API access page: https://console.redhat.com/openshift/token
 - Red Hat SSO token endpoint used by script: https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
 
@@ -295,3 +377,5 @@ If you want the shortest practical checklist, gather these first:
 - [ ] If using test mode, review `~/.ansible/conf/ansible-provisioner.log` after the run
 - [ ] KVM/libvirt is working (`virsh list --all` succeeds)
 - [ ] Your chosen internal IPs do not conflict with an existing network
+- [ ] CDN activation key + org ID are set if Satellite activation-key registration is expected
+- [ ] SSH bootstrap prerequisites are met (passwords + key tools available)

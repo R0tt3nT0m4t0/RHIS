@@ -483,7 +483,8 @@ mac-address=${ext_mac}
 [ipv4]
 method=auto
 # DHCP primary with explicit resolver fallback for early bootstrap tasks.
-dns=1.1.1.1;8.8.8.8;
+dns=10.168.0.1;1.1.1.1;8.8.8.8;
+dns-options=rotate;
 ignore-auto-dns=false
 
 [ipv6]
@@ -557,10 +558,20 @@ kickstart_trust_bootstrap_keys_block() {
 # 1.3 Trust installer/orchestration/container SSH keys for root and installer user
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
+
+# Ensure root has a local SSH keypair on first boot.
+if [ ! -f /root/.ssh/id_rsa ]; then
+    ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa || true
+fi
+
 cat >> /root/.ssh/authorized_keys <<'SSH_KEYS'
 ${bootstrap_ssh_keys}
 SSH_KEYS
+[ -f /root/.ssh/id_rsa.pub ] && cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys || true
 sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys || true
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/id_rsa 2>/dev/null || true
+chmod 644 /root/.ssh/id_rsa.pub 2>/dev/null || true
 chmod 600 /root/.ssh/authorized_keys
 EOF
 
@@ -570,10 +581,24 @@ if id "$target_user" >/dev/null 2>&1; then
     target_home="$(getent passwd "$target_user" | cut -d: -f6)"
     [ -n "$target_home" ] || target_home="/home/$target_user"
     install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"
+
+    # Ensure target installer/admin user has a local SSH keypair.
+    if [ ! -f "$target_home/.ssh/id_rsa" ]; then
+        sudo -u "$target_user" ssh-keygen -q -t rsa -b 4096 -N "" -f "$target_home/.ssh/id_rsa" || true
+    fi
+
     cat > "$target_home/.ssh/authorized_keys" <<'SSH_KEYS'
 ${bootstrap_ssh_keys}
 SSH_KEYS
+    [ -f "$target_home/.ssh/id_rsa.pub" ] && cat "$target_home/.ssh/id_rsa.pub" >> "$target_home/.ssh/authorized_keys" || true
+    [ -f /root/.ssh/id_rsa.pub ] && cat /root/.ssh/id_rsa.pub >> "$target_home/.ssh/authorized_keys" || true
+    [ -f "$target_home/.ssh/id_rsa.pub" ] && cat "$target_home/.ssh/id_rsa.pub" >> /root/.ssh/authorized_keys || true
+    sort -u "$target_home/.ssh/authorized_keys" -o "$target_home/.ssh/authorized_keys" || true
+    sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys || true
     chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"
+    chown "$target_user:$target_user" "$target_home/.ssh/id_rsa" "$target_home/.ssh/id_rsa.pub" 2>/dev/null || true
+    chmod 600 "$target_home/.ssh/id_rsa" 2>/dev/null || true
+    chmod 644 "$target_home/.ssh/id_rsa.pub" 2>/dev/null || true
     chmod 600 "$target_home/.ssh/authorized_keys"
 fi
 EOF
@@ -627,6 +652,7 @@ inventory = /rhis/vars/external_inventory/hosts
 host_key_checking = False
 retry_files_enabled = False
 interpreter_python = auto_silent
+remote_tmp = /var/tmp
 forks = ${RHIS_ANSIBLE_FORKS}
 timeout = ${RHIS_ANSIBLE_TIMEOUT}
 gathering = smart
@@ -2042,25 +2068,46 @@ ensure_rootless_podman() {
 #   external_inventory  -> inventory file(s) consumed by rhis-builder playbooks
 #   host_vars           -> per-node variable files (satellite.yml, aap.yml, …)
 #   vault               -> Ansible vault env.yml + optional .vaultpass.txt
+
+# Pin ansible.utils to 4.1.0 when ansible-core inside the container is 2.14.x.
+# ansible.utils >=5.x declares requires_ansible >=2.15 which would flood the
+# output with [WARNING] Collection ansible.utils does not support Ansible
+# version 2.14.x on every playbook run.  4.1.0 declares >=2.14.0 and is
+# functionally equivalent for the tasks we run.
+# NOTE: redhat.rhel_system_roles has the same version-declaration mismatch but
+# Red Hat Automation Hub only serves the current release; no older compatible
+# version is available.  That warning cannot be suppressed via a version pin.
+ensure_container_collection_compat() {
+    local core_ver
+    core_ver=$(podman exec "${RHIS_CONTAINER_NAME}" ansible --version 2>/dev/null \
+        | awk '/^ansible \[core/{gsub(/[\[\]]/,"",$3); print $3}')
+
+    # Only needed for ansible-core 2.14.x; newer images are already fine.
+    [[ "${core_ver}" == 2.14.* ]] || return 0
+
+    local utils_ver
+    utils_ver=$(podman exec "${RHIS_CONTAINER_NAME}" ansible-galaxy collection list 2>/dev/null \
+        | awk '/^ansible\.utils[[:space:]]/{print $2}')
+
+    # Already pinned to 4.x — nothing to do.
+    [[ "${utils_ver}" == 4.* ]] && return 0
+
+    print_step "Pinning ansible.utils to 4.1.0 for ansible-core ${core_ver} compatibility"
+    if podman exec "${RHIS_CONTAINER_NAME}" \
+           ansible-galaxy collection install "ansible.utils:4.1.0" --force >/dev/null 2>&1; then
+        print_success "ansible.utils pinned to 4.1.0 (was ${utils_ver:-unknown})."
+    else
+        print_warning "Could not pin ansible.utils to 4.1.0; version-compatibility warning will appear during playbook runs."
+    fi
+    return 0
+}
+
 ensure_container_running() {
-    # Validate required mount directories exist before attempting to start/use the container.
-    local missing=0
-    if [ ! -d "${RHIS_INVENTORY_DIR}" ]; then
-        print_warning "Inventory directory not found: ${RHIS_INVENTORY_DIR}"
-        print_warning "Create it (or set RHIS_INVENTORY_DIR) and add an 'inventory' file before running."
-        missing=1
-    fi
-    if [ ! -d "${RHIS_HOST_VARS_DIR}" ]; then
-        print_warning "host_vars directory not found: ${RHIS_HOST_VARS_DIR}"
-        print_warning "Create it (or set RHIS_HOST_VARS_DIR) with satellite.yml / aap.yml / idm.yml."
-        missing=1
-    fi
-    if [ ! -d "${ANSIBLE_ENV_DIR}" ]; then
-        print_warning "Vault/env directory not found: ${ANSIBLE_ENV_DIR}"
-        print_warning "Create ~/.ansible/conf/ and add env.yml (see CHECKLIST.md)."
-        missing=1
-    fi
-    [ "$missing" -eq 0 ] || { print_warning "Fix the missing directories above, then retry."; return 1; }
+    # Auto-generate required host mount directories for runtime artifacts.
+    mkdir -p "${RHIS_INVENTORY_DIR}" "${RHIS_HOST_VARS_DIR}" "${ANSIBLE_ENV_DIR}" || {
+        print_warning "Failed to create required runtime directories for container mounts."
+        return 1
+    }
 
     generate_rhis_ansible_cfg || {
         print_warning "Could not generate RHIS Ansible config at ${RHIS_ANSIBLE_CFG_HOST}"
@@ -2070,6 +2117,7 @@ ensure_container_running() {
     if podman ps --filter "name=^${RHIS_CONTAINER_NAME}$" --format '{{.Names}}' 2>/dev/null \
            | grep -q "^${RHIS_CONTAINER_NAME}$"; then
         print_success "RHIS provisioner container '${RHIS_CONTAINER_NAME}' is already running."
+        ensure_container_collection_compat || true
         return 0
     fi
 
@@ -2088,9 +2136,10 @@ ensure_container_running() {
         -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" \
         -v "${RHIS_INVENTORY_DIR}:/rhis/vars/external_inventory:Z" \
         -v "${RHIS_HOST_VARS_DIR}:/rhis/vars/host_vars:Z" \
-        -v "${ANSIBLE_ENV_DIR}:/rhis/vars/vault:Z" \
+        -v "${ANSIBLE_ENV_DIR}:/rhis/vars/vault:z" \
         "${RHIS_CONTAINER_IMAGE}"
 
+    ensure_container_collection_compat || true
     print_success "Container '${RHIS_CONTAINER_NAME}' started."
     echo "Exec into the container : podman exec -it ${RHIS_CONTAINER_NAME} /bin/bash"
     echo "Ansible config file     : ${RHIS_ANSIBLE_CFG_HOST}"
@@ -2388,7 +2437,7 @@ run_deferred_aap_callback() {
 
     AAP_SSH_CALLBACK_ENABLED=1
     print_step "AAP VM is installing. SSH callback will begin as soon as the VM is reachable."
-    print_step "  You can monitor progress: sudo virsh console aap-26   (Ctrl+] to detach)"
+    print_step "Grab a cup of coffee and sit back, or come back after lunch — we will continue to configure this environment while you wait."
 
     if run_aap_setup_on_vm "aap-26"; then
         print_success "AAP setup orchestration complete via SSH callback."
@@ -2691,6 +2740,7 @@ run_rhis_config_as_code() {
 
     local inv="--inventory /rhis/vars/external_inventory/hosts"
     local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false}}"
+    local manual_evars="--extra-vars @${vault_file} --extra-vars '{\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false}}'"
     local manual_vault_arg="${vault_arg[*]}"
     if [ -z "${manual_vault_arg}" ]; then
         manual_vault_arg="--ask-vault-pass"
@@ -2698,7 +2748,7 @@ run_rhis_config_as_code() {
 
     print_manual_rerun_template() {
         print_warning "Manual rerun template (works for all groups):"
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
     }
 
     print_step "Ansible log: ${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
@@ -2839,7 +2889,7 @@ run_rhis_config_as_code() {
     # -------------------------------------------------------------------------
     assert_satellite_server_repos_available() {
         local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-        local check_cmd='source /etc/os-release >/dev/null 2>&1 || true; printf "OS_MAJOR=%s\n" "${VERSION_ID%%.*}"; subscription-manager repos --list 2>/dev/null | awk "/^Repo ID/{print \$NF}" | sort'
+        local check_cmd='source /etc/os-release >/dev/null 2>&1 || true; printf "OS_MAJOR=%s\n" "${VERSION_ID%%.*}"; subscription-manager repos --list-enabled 2>/dev/null | awk "/^Repo ID/{print \$NF}" | sort'
         local repos_out=""
         local -a missing=()
         local -a required_repos=()
@@ -2857,8 +2907,7 @@ run_rhis_config_as_code() {
             "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
             ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
             -m ansible.builtin.shell \
-            -a "${check_cmd}" \
-            --one-line 2>/dev/null) || true
+            -a "${check_cmd}" 2>/dev/null) || true
 
         # Fall back to root password if vault auth yielded nothing.
         if [ -z "${repos_out}" ] && [ -n "${root_auth_pass}" ]; then
@@ -2870,8 +2919,7 @@ run_rhis_config_as_code() {
                 -e "ansible_become=false" \
                 -e "ansible_become_password=${root_auth_pass}" \
                 -m ansible.builtin.shell \
-                -a "${check_cmd}" \
-                --one-line 2>/dev/null) || true
+                -a "${check_cmd}" 2>/dev/null) || true
         fi
 
         if [ -z "${repos_out}" ]; then
@@ -3011,7 +3059,7 @@ run_rhis_config_as_code() {
     }
 
     ensure_idm_internet_resolution() {
-        local net_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true; fi; getent hosts redhat.com >/dev/null 2>&1'
+        local net_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 10.168.0.1\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions rotate\n" > /etc/resolv.conf || true; fi; getent hosts redhat.com >/dev/null 2>&1'
 
         print_step "Pre-flight: ensuring IdM can resolve public internet names (redhat.com)"
 
@@ -3037,13 +3085,15 @@ run_rhis_config_as_code() {
     }
 
     remediate_satellite_repo_entitlements() {
+        local _classify="remediation-ok"
         # Requested remediation flow for Satellite host:
         #   1) dnf upgrade -y --skip-broken --allowerasing --best
         #   2) dnf install -y sos rhc
         #   3) rhc connect --activation-key <key> --organization <org>
         #   4) dnf install -y rhc-worker-playbook
         # Then continue with RHSM repo enablement assertions.
-        local sat_shell='dnf upgrade -y --skip-broken --allowerasing --best || true; dnf install -y sos rhc || true; if [ -n "{{ cdn_organization_id | default(\"\") }}" ] && [ -n "{{ cdn_sat_activation_key | default(\"\") }}" ]; then rhc connect --activation-key "{{ cdn_sat_activation_key }}" --organization "{{ cdn_organization_id }}" || true; fi; dnf install -y rhc-worker-playbook || true; if ! subscription-manager identity >/dev/null 2>&1; then if [ -n "{{ cdn_organization_id | default(\"\") }}" ] && [ -n "{{ cdn_sat_activation_key | default(\"\") }}" ]; then subscription-manager register --org="{{ cdn_organization_id }}" --activationkey="{{ cdn_sat_activation_key }}" --force || true; else subscription-manager register --username="{{ rh_user | default(\"\") }}" --password="{{ rh_pass | default(\"\") }}" --force || true; fi; fi; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; subscription-manager repos --disable="*" >/dev/null 2>&1 || true; subscription-manager repos --enable="rhel-9-for-x86_64-baseos-rpms" --enable="rhel-9-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-9-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-9-x86_64-rpms" >/dev/null 2>&1 || true; subscription-manager repos --list >/dev/null 2>&1 || true'
+        local sat_shell='dnf upgrade -y --skip-broken --allowerasing --best || true; dnf install -y sos rhc || true; if [ -n "{{ cdn_organization_id | default("") }}" ] && [ -n "{{ cdn_sat_activation_key | default("") }}" ]; then rhc connect --activation-key "{{ cdn_sat_activation_key }}" --organization "{{ cdn_organization_id }}" || true; fi; dnf install -y rhc-worker-playbook || true; if ! subscription-manager identity >/dev/null 2>&1; then if [ -n "{{ cdn_organization_id | default("") }}" ] && [ -n "{{ cdn_sat_activation_key | default("") }}" ]; then subscription-manager register --org="{{ cdn_organization_id }}" --activationkey="{{ cdn_sat_activation_key }}" --force || true; else subscription-manager register --username="{{ rh_user | default("") }}" --password="{{ rh_pass | default("") }}" --force || true; fi; fi; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; subscription-manager repos --disable="*" >/dev/null 2>&1 || true; subscription-manager repos --enable="rhel-9-for-x86_64-baseos-rpms" --enable="rhel-9-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-9-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-9-x86_64-rpms" >/dev/null 2>&1 || true; subscription-manager repos --list >/dev/null 2>&1 || true'
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
 
         # Build a local evars string that extends the enclosing scope's evars with
         # cdn_organization_id / cdn_sat_activation_key when they are set as host-side
@@ -3070,6 +3120,45 @@ run_rhis_config_as_code() {
         fi
 
         if [ "${_remediate_rc}" -ne 0 ]; then
+            if printf '%s\n' "${_remediate_out}" | grep -qE 'UNREACHABLE|Permission denied'; then
+                _classify="auth-failed"
+            fi
+            if [ -n "${root_auth_pass}" ]; then
+                print_warning "Satellite RHSM remediation with inventory auth failed (rc=${_remediate_rc}); retrying once with root SSH auth fallback."
+                _remediate_rc=0
+                if [ "$use_interactive_vault_prompt" = "1" ]; then
+                    _remediate_out=$(podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                        ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${_rem_evars} \
+                        -e "ansible_user=root" \
+                        -e "ansible_password=${root_auth_pass}" \
+                        -e "ansible_become=false" \
+                        -e "ansible_become_password=${root_auth_pass}" \
+                        -m shell -a "${sat_shell}" 2>&1) || _remediate_rc=$?
+                else
+                    _remediate_out=$(podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                        ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${_rem_evars} \
+                        -e "ansible_user=root" \
+                        -e "ansible_password=${root_auth_pass}" \
+                        -e "ansible_become=false" \
+                        -e "ansible_become_password=${root_auth_pass}" \
+                        -m shell -a "${sat_shell}" 2>&1) || _remediate_rc=$?
+                fi
+
+                if [ "${_remediate_rc}" -eq 0 ]; then
+                    print_success "Satellite RHSM remediation succeeded with root SSH fallback."
+                    _classify="remediation-ok"
+                else
+                    if printf '%s\n' "${_remediate_out}" | grep -qE 'UNREACHABLE|Permission denied'; then
+                        _classify="auth-failed-both"
+                    else
+                        _classify="remediation-failed"
+                    fi
+                fi
+            fi
+        fi
+
+        if [ "${_remediate_rc}" -ne 0 ]; then
+            [ "${_classify}" != "auth-failed" ] && [ "${_classify}" != "auth-failed-both" ] && _classify="remediation-failed"
             print_warning "Satellite RHSM remediation ansible task returned rc=${_remediate_rc}."
             print_warning "Remediation output:"
             printf '%s\n' "${_remediate_out}" | head -40
@@ -3095,12 +3184,13 @@ run_rhis_config_as_code() {
             fi
         fi
 
+        print_step "Satellite RHSM remediation: ${_classify}"
         return 0
     }
 
     prepare_idm_runtime_network() {
         local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-        local prep_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; nmcli con up eth1 >/dev/null 2>&1 || nmcli dev connect eth1 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true; fi; ip route show >/dev/null 2>&1; getent hosts redhat.com >/dev/null 2>&1'
+        local prep_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; nmcli con up eth1 >/dev/null 2>&1 || nmcli dev connect eth1 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 10.168.0.1\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions rotate\n" > /etc/resolv.conf || true; fi; ip route show >/dev/null 2>&1; getent hosts redhat.com >/dev/null 2>&1'
 
         if [ -z "$root_auth_pass" ]; then
             print_warning "Skipping IdM runtime network prep: ROOT_PASS/ADMIN_PASS is unset."
@@ -3137,6 +3227,46 @@ run_rhis_config_as_code() {
         print_warning "IdM runtime network prep could not be confirmed; continuing to phase playbook."
         return 1
     }
+
+        # Import RPM GPG keys and clear per-repo gpgcheck=1 overrides before the
+        # IdM phase runs.  RHEL 10 packages like rhc-worker-playbook carry a GPG
+        # signature; RHSM-managed repo files frequently set gpgcheck=1 per-repo,
+        # overriding the global dnf.conf setting written during kickstart.
+        ensure_idm_gpg_keys() {
+            local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+            local gpg_shell='if [ -d /etc/pki/rpm-gpg ]; then for k in /etc/pki/rpm-gpg/*; do [ -f "$k" ] && rpm --import "$k" 2>/dev/null || true; done; fi; if ls /etc/yum.repos.d/*.repo >/dev/null 2>&1; then sed -i "s/^gpgcheck=1/gpgcheck=0/" /etc/yum.repos.d/*.repo 2>/dev/null || true; fi; grep -q "^gpgcheck=0" /etc/dnf/dnf.conf 2>/dev/null || printf "gpgcheck=0\nrepo_gpgcheck=0\nlocalpkg_gpgcheck=0\n" >> /etc/dnf/dnf.conf 2>/dev/null || true'
+
+            [ -n "$root_auth_pass" ] || { print_warning "Skipping IdM GPG pre-flight: ROOT_PASS/ADMIN_PASS is unset."; return 0; }
+
+            print_step "Pre-flight: importing RPM GPG keys and normalising repo gpgcheck on IdM host"
+
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${gpg_shell}" >/dev/null 2>&1
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${gpg_shell}" >/dev/null 2>&1
+            fi
+
+            if [ "$?" -eq 0 ]; then
+                print_success "IdM GPG keys imported and repo gpgcheck normalised."
+            else
+                print_warning "IdM GPG key pre-flight could not complete; IdM phase may fail on GPG validation."
+            fi
+            return 0
+        }
 
     # Print IdM network state (routes, resolver, internet check) after a failure
     # so the root cause is immediately visible without manual SSH.
@@ -3214,6 +3344,71 @@ run_rhis_config_as_code() {
         fi
 
         return 0
+    }
+
+    # Ensure rhel-system-roles and rhc-worker-playbook are present on managed
+    # nodes. For rhc-worker-playbook we try the pinned version first, then
+    # latest if unavailable; if install fails, retry with --nogpgcheck.
+    ensure_core_role_packages_on_managed_nodes() {
+        local target="${1:-idm:scenario_satellite:aap}"
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local pkg_shell='if ! rpm -q rhel-system-roles >/dev/null 2>&1; then dnf -y install rhel-system-roles || dnf -y install --nogpgcheck rhel-system-roles || true; fi; if ! rpm -q rhc-worker-playbook >/dev/null 2>&1; then if ! dnf -y install rhc-worker-playbook-0.2.3-3.el10_1; then dnf -y install rhc-worker-playbook || dnf -y install --nogpgcheck rhc-worker-playbook || true; fi; fi'
+        local classify="pkg-preflight-failed"
+
+        print_step "Pre-flight: ensuring rhel-system-roles + rhc-worker-playbook on ${target} (nogpgcheck fallback enabled)"
+
+        if [ -n "$root_auth_pass" ]; then
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${pkg_shell}" >/dev/null 2>&1
+            else
+                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "${target}" ${inv} "${vault_arg[@]}" ${evars} \
+                    -e "ansible_user=root" \
+                    -e "ansible_password=${root_auth_pass}" \
+                    -e "ansible_become=false" \
+                    -e "ansible_become_password=${root_auth_pass}" \
+                    -m shell \
+                    -a "${pkg_shell}" >/dev/null 2>&1
+            fi
+
+            if [ "$?" -eq 0 ]; then
+                classify="pkg-preflight-root-ok"
+                print_success "Package pre-flight complete on ${target}."
+                print_step "Package pre-flight (${target}): ${classify}"
+                return 0
+            fi
+        fi
+
+        print_warning "Package pre-flight with root auth failed/unavailable for ${target}; trying inventory auth."
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${pkg_shell}" >/dev/null 2>&1
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "${target}" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${pkg_shell}" >/dev/null 2>&1
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            classify="pkg-preflight-inventory-ok"
+            print_success "Package pre-flight complete on ${target} (inventory auth)."
+            print_step "Package pre-flight (${target}): ${classify}"
+            return 0
+        fi
+
+        print_step "Package pre-flight (${target}): ${classify}"
+        print_warning "Package pre-flight could not be confirmed on ${target}; continuing."
+        return 1
     }
 
     # Ensure all managed hosts are fully up to date before any config-as-code
@@ -3355,6 +3550,8 @@ run_rhis_config_as_code() {
     fi
 
     prepare_idm_runtime_network || true
+    ensure_idm_gpg_keys || true
+    ensure_core_role_packages_on_managed_nodes "idm:scenario_satellite" || true
 
     # ── 1. IdM — must be ready first (Satellite/AAP enroll against it) ─────────
     if ! run_phase_playbook_with_auth_fallback "Phase 1/3 — Configuring IdM..." "idm" "/rhis/rhis-builder-idm/main.yml"; then
@@ -3396,6 +3593,8 @@ run_rhis_config_as_code() {
         print_success "Satellite configuration complete."
     fi
     print_step "Auth fallback (Satellite): ${satellite_auth_fallback_status}"
+
+    ensure_core_role_packages_on_managed_nodes "aap" || true
 
     # ── 3. AAP ─────────────────────────────────────────────────────────────────
     print_step "Phase gate: starting deferred AAP callback and readiness checks"
@@ -3539,6 +3738,10 @@ enable_virt_manager_resize_guest() {
 
 setup_virt_manager() {
     print_step "Setting up Virt-Manager"
+    ensure_platform_packages_for_virt_manager || {
+        print_warning "Could not install required installer-host packages for virt-manager/libvirt."
+        return 1
+    }
     configure_libvirt_firewall_policy
     enable_virt_manager_xml_editor
     enable_virt_manager_resize_guest
@@ -3851,6 +4054,9 @@ ipadm_password: "${IPADM_PASSWORD:-}"
 ipaadmin_password: "${IPAADMIN_PASSWORD:-}"
 cdn_organization_id: "${CDN_ORGANIZATION_ID:-}"
 cdn_sat_activation_key: "${CDN_SAT_ACTIVATION_KEY:-}"
+# Aliases expected by rhis-builder-idm idm_pre role (redhat.rhel_system_roles.rhc)
+cdn_organization_vault: "${CDN_ORGANIZATION_ID:-}"
+cdn_activation_key_vault: "${CDN_SAT_ACTIVATION_KEY:-}"
 sat_firewalld_zone: "${SAT_FIREWALLD_ZONE:-public}"
 sat_firewalld_interface: "${SAT_FIREWALLD_INTERFACE:-eth1}"
 sat_firewalld_services_json: '${SAT_FIREWALLD_SERVICES_JSON:-["ssh","http","https"]}'
@@ -4472,6 +4678,21 @@ assert_idm_install_iso_is_valid() {
 
 # Ensure SSH key pair exists for AAP VM post-boot callback orchestration.
 ensure_ssh_keys() {
+    # Ensure installer host user keypair exists (used by mesh/bootstrap logic).
+    if [ ! -f "${HOME}/.ssh/id_rsa" ] || [ ! -f "${HOME}/.ssh/id_rsa.pub" ]; then
+        print_step "Generating installer host SSH key pair: ${HOME}/.ssh/id_rsa"
+        mkdir -p "${HOME}/.ssh" || return 1
+        chmod 700 "${HOME}/.ssh" || true
+        ssh-keygen -q -t rsa -b 4096 -N "" -f "${HOME}/.ssh/id_rsa" -C "rhis-installer-host" || return 1
+        chmod 600 "${HOME}/.ssh/id_rsa" || true
+        chmod 644 "${HOME}/.ssh/id_rsa.pub" || true
+    fi
+
+    # Best-effort root keypair on install host as well.
+    if command -v sudo >/dev/null 2>&1; then
+        sudo bash -lc 'mkdir -p /root/.ssh && chmod 700 /root/.ssh && if [ ! -f /root/.ssh/id_rsa ]; then ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa; fi; chmod 600 /root/.ssh/id_rsa 2>/dev/null || true; chmod 644 /root/.ssh/id_rsa.pub 2>/dev/null || true' >/dev/null 2>&1 || true
+    fi
+
     if [ -f "${AAP_SSH_PRIVATE_KEY}" ] && [ -f "${AAP_SSH_PUBLIC_KEY}" ]; then
         print_success "SSH keys already exist: ${AAP_SSH_KEY_DIR}"
         return 0
@@ -6406,6 +6627,7 @@ create_rhis_vms() {
     local sat_disk sat_ram sat_vcpu
     local aap_disk aap_ram aap_vcpu
     local idm_disk idm_ram idm_vcpu
+    local ssh_mesh_bootstrap_ok=0
 
     if is_demo; then
         print_step "DEMO mode: reduced VM specifications (PoC/learning environment)"
@@ -6473,14 +6695,34 @@ create_rhis_vms() {
     ensure_rhis_vms_powered_on
     wait_for_post_vm_settle || true
 
-    # All VMs are running — trigger config-as-code via the provisioner container
-    print_phase 3 8 "Config-as-code orchestration"
+    # As soon as VMs first come up, bootstrap SSH trust mesh before config-as-code.
+    print_phase 3 8 "SSH mesh bootstrap"
+    if setup_rhis_ssh_mesh; then
+        ssh_mesh_bootstrap_ok=1
+    else
+        print_warning "SSH mesh bootstrap did not complete cleanly; will retry after config-as-code once nodes are fully initialized."
+    fi
+    print_phase 4 8 "SSH mesh validation"
+    if [ "${ssh_mesh_bootstrap_ok}" -eq 1 ]; then
+        validate_rhis_ssh_mesh || print_warning "SSH mesh validation reported failures; continuing."
+    else
+        print_step "Skipping early SSH mesh validation because bootstrap was deferred."
+    fi
+
+    # Trigger config-as-code via the provisioner container after SSH baseline is in place.
+    print_phase 5 8 "Config-as-code orchestration"
     run_rhis_config_as_code || print_warning "Config-as-code phase did not complete cleanly. VMs are running; re-run manually if needed."
+
+    if [ "${ssh_mesh_bootstrap_ok}" -eq 0 ]; then
+        print_step "Retrying deferred SSH mesh bootstrap/validation after config-as-code..."
+        if setup_rhis_ssh_mesh; then
+            validate_rhis_ssh_mesh || print_warning "Deferred SSH mesh validation still reported failures; continuing."
+        else
+            print_warning "Deferred SSH mesh bootstrap still did not complete cleanly; continuing."
+        fi
+    fi
+
     stop_vm_power_watchdog || true
-    print_phase 4 8 "SSH mesh bootstrap"
-    setup_rhis_ssh_mesh || print_warning "SSH mesh bootstrap did not complete cleanly; continuing."
-    print_phase 5 8 "SSH mesh validation"
-    validate_rhis_ssh_mesh || print_warning "SSH mesh validation reported failures; continuing."
     print_phase 6 8 "Root password normalization"
     fix_vm_root_passwords || print_warning "Root password fix step did not complete cleanly; continuing."
     print_phase 7 8 "Final health summary"
@@ -6519,9 +6761,10 @@ fix_vm_root_passwords() {
 
 setup_rhis_ssh_mesh() {
     local root_pass installer_user installer_pass ip pub login_user login_pass
-    local remote_home=""
-    local -a node_ips all_pubs
-    local bootstrap_cmd append_cmd
+    local local_installer_pub=""
+    local local_root_pub=""
+    local -a node_ips all_pubs root_pubs node_names
+    local bootstrap_cmd append_cmd bootstrap_root_cmd append_root_cmd
 
     root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
     installer_user="${INSTALLER_USER:-${ADMIN_USER}}"
@@ -6540,6 +6783,39 @@ setup_rhis_ssh_mesh() {
     fi
 
     node_ips=("${SAT_IP}" "${AAP_IP}" "${IDM_IP}")
+    node_names=("satellite" "aap" "idm")
+
+    # Ensure local installer user has key + authorized_keys (install host).
+    mkdir -p "${HOME}/.ssh" >/dev/null 2>&1 || true
+    chmod 700 "${HOME}/.ssh" >/dev/null 2>&1 || true
+    if [ ! -f "${HOME}/.ssh/id_rsa" ]; then
+        ssh-keygen -q -t rsa -b 4096 -N "" -f "${HOME}/.ssh/id_rsa" -C "rhis-installer-host" >/dev/null 2>&1 || true
+    fi
+    touch "${HOME}/.ssh/authorized_keys" >/dev/null 2>&1 || true
+    chmod 600 "${HOME}/.ssh/authorized_keys" >/dev/null 2>&1 || true
+    if [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
+        cat "${HOME}/.ssh/id_rsa.pub" >> "${HOME}/.ssh/authorized_keys"
+        sort -u "${HOME}/.ssh/authorized_keys" -o "${HOME}/.ssh/authorized_keys" || true
+        local_installer_pub="$(cat "${HOME}/.ssh/id_rsa.pub" 2>/dev/null || true)"
+    fi
+
+    # Explicit self trust requested: install-host user -> 127.0.0.1
+    if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ] && [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
+        sshpass -p "${installer_pass}" ssh-copy-id -i "${HOME}/.ssh/id_rsa.pub" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${installer_user}@127.0.0.1" >/dev/null 2>&1 || true
+    fi
+
+    # Ensure local root has key + authorized_keys (best effort).
+    if command -v sudo >/dev/null 2>&1; then
+        sudo bash -lc 'mkdir -p /root/.ssh && chmod 700 /root/.ssh && [ -f /root/.ssh/id_rsa ] || ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; [ -f /root/.ssh/id_rsa.pub ] && cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/id_rsa 2>/dev/null || true; chmod 644 /root/.ssh/id_rsa.pub 2>/dev/null || true' >/dev/null 2>&1 || true
+        local_root_pub="$(sudo cat /root/.ssh/id_rsa.pub 2>/dev/null || true)"
+    fi
+
+    # Explicit self trust requested: local root -> 127.0.0.1
+    if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${root_pass}" ] && command -v sudo >/dev/null 2>&1; then
+        sudo bash -lc "sshpass -p '${root_pass}' ssh-copy-id -i /root/.ssh/id_rsa.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 >/dev/null 2>&1 || true" || true
+    fi
 
     bootstrap_cmd='set -e; target_user="'"${installer_user}"'"; target_home="$(getent passwd "$target_user" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/$target_user"; install -d -m 700 -o "$target_user" -g "$target_user" "$target_home/.ssh"; if [ ! -f "$target_home/.ssh/id_rsa" ]; then sudo -u "$target_user" ssh-keygen -q -t rsa -b 4096 -N "" -f "$target_home/.ssh/id_rsa"; fi; touch "$target_home/.ssh/authorized_keys"; chown "$target_user:$target_user" "$target_home/.ssh/authorized_keys"; chmod 600 "$target_home/.ssh/authorized_keys"; cat > "$target_home/.ssh/config" <<EOF
 Host *
@@ -6568,6 +6844,21 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
         fi
     done
 
+    # Ensure root keypair exists on every node.
+    bootstrap_root_cmd='set -e; install -d -m 700 /root/.ssh; if [ ! -f /root/.ssh/id_rsa ]; then ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa; fi; touch /root/.ssh/authorized_keys; [ -f /root/.ssh/id_rsa.pub ] && cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/id_rsa 2>/dev/null || true; chmod 644 /root/.ssh/id_rsa.pub 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys'
+    print_step "Bootstrapping root SSH keys on RHIS nodes"
+    for ip in "${node_ips[@]}"; do
+        if [ -n "$root_pass" ]; then
+            sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$bootstrap_root_cmd" >/dev/null 2>&1 || {
+                print_warning "Root SSH bootstrap failed for ${ip}."
+                return 1
+            }
+        else
+            print_warning "Root password unavailable; cannot bootstrap root SSH keys on ${ip}."
+            return 1
+        fi
+    done
+
     print_step "Collecting ${installer_user} public keys for full mesh trust"
     for ip in "${node_ips[@]}"; do
         pub="$(sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" 'target_home="$(getent passwd "'"${installer_user}"'" | cut -d: -f6)"; [ -n "$target_home" ] || target_home="/home/'"${installer_user}"'"; cat "$target_home/.ssh/id_rsa.pub"' 2>/dev/null || true)"
@@ -6580,6 +6871,8 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
         fi
         all_pubs+=("$pub")
     done
+
+    [ -n "${local_installer_pub}" ] && all_pubs+=("${local_installer_pub}")
 
     print_step "Distributing trusted keys to all nodes (${installer_user}-to-${installer_user} mesh)"
     for ip in "${node_ips[@]}"; do
@@ -6599,7 +6892,78 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
         done
     done
 
-    print_success "RHIS SSH mesh configured: ${installer_user} SSH trust established across all nodes."
+    # Ensure install host installer user trusts all VM installer keys too.
+    for pub in "${all_pubs[@]}"; do
+        printf '%s\n' "$pub" >> "${HOME}/.ssh/authorized_keys"
+    done
+    sort -u "${HOME}/.ssh/authorized_keys" -o "${HOME}/.ssh/authorized_keys" || true
+    chmod 600 "${HOME}/.ssh/authorized_keys" || true
+
+    # Explicit install-host user trust push to admin@{satellite,idm,aap} and root@{satellite,idm,aap}
+    if [ -n "${local_installer_pub}" ] && [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
+        local i push_ip push_name pub_b64
+        pub_b64="$(printf '%s' "${local_installer_pub}" | base64 -w0 2>/dev/null || true)"
+        for i in 0 1 2; do
+            push_ip="${node_ips[$i]}"
+            push_name="${node_names[$i]}"
+
+            # install-host user -> admin
+            if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ]; then
+                sshpass -p "${installer_pass}" ssh-copy-id -i "${HOME}/.ssh/id_rsa.pub" \
+                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+                    "${installer_user}@${push_ip}" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${pub_b64}" ]; then
+                append_cmd="target_home=\"\$(getent passwd '${installer_user}' | cut -d: -f6)\"; [ -n \"\$target_home\" ] || target_home=\"/home/${installer_user}\"; install -d -m 700 -o '${installer_user}' -g '${installer_user}' \"\$target_home/.ssh\"; touch \"\$target_home/.ssh/authorized_keys\"; printf '%s' '${pub_b64}' | base64 -d >> \"\$target_home/.ssh/authorized_keys\"; sort -u \"\$target_home/.ssh/authorized_keys\" -o \"\$target_home/.ssh/authorized_keys\"; chown '${installer_user}:${installer_user}' \"\$target_home/.ssh/authorized_keys\"; chmod 600 \"\$target_home/.ssh/authorized_keys\""
+                sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${push_ip}" "$append_cmd" >/dev/null 2>&1 || true
+            fi
+
+            # install-host user -> root
+            if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${root_pass}" ]; then
+                sshpass -p "${root_pass}" ssh-copy-id -i "${HOME}/.ssh/id_rsa.pub" \
+                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+                    "root@${push_ip}" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${pub_b64}" ] && [ -n "${root_pass}" ]; then
+                append_root_cmd="install -d -m 700 /root/.ssh; touch /root/.ssh/authorized_keys; printf '%s' '${pub_b64}' | base64 -d >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
+                sshpass -p "${root_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${push_ip}" "$append_root_cmd" >/dev/null 2>&1 || true
+            fi
+
+            print_step "Install-host key synchronized to admin/root on ${push_name} (${push_ip})"
+        done
+    fi
+
+    print_step "Collecting root public keys for full root mesh trust"
+    for ip in "${node_ips[@]}"; do
+        pub="$(sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" 'cat /root/.ssh/id_rsa.pub' 2>/dev/null || true)"
+        if [ -z "$pub" ]; then
+            print_warning "Could not read root SSH public key from ${ip}."
+            return 1
+        fi
+        root_pubs+=("$pub")
+    done
+    [ -n "${local_root_pub}" ] && root_pubs+=("${local_root_pub}")
+
+    print_step "Distributing trusted root keys to all nodes (root-to-root mesh)"
+    for ip in "${node_ips[@]}"; do
+        for pub in "${root_pubs[@]}"; do
+            append_root_cmd="printf '%s\\n' '$pub' >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
+            sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$append_root_cmd" >/dev/null 2>&1 || {
+                print_warning "Failed to distribute root SSH key to ${ip}."
+                return 1
+            }
+        done
+    done
+
+    # Ensure install host root trusts all VM root keys too.
+    if [ -n "${local_root_pub}" ] && command -v sudo >/dev/null 2>&1; then
+        for pub in "${root_pubs[@]}"; do
+            sudo bash -lc "printf '%s\\n' '$pub' >> /root/.ssh/authorized_keys" >/dev/null 2>&1 || true
+        done
+        sudo bash -lc 'sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys' >/dev/null 2>&1 || true
+    fi
+
+    print_success "RHIS SSH mesh configured: ${installer_user} and root SSH trust established across install host + all RHIS nodes."
     return 0
 }
 
@@ -6643,12 +7007,31 @@ validate_rhis_ssh_mesh() {
         done
     done
 
+    if [ -n "$root_pass" ]; then
+        print_step "Validating RHIS root SSH mesh (root-to-root key auth across all nodes)"
+        for src in "${node_specs[@]}"; do
+            src_name="${src%%:*}"
+            src_ip="${src##*:}"
+            for dst in "${node_specs[@]}"; do
+                dst_name="${dst%%:*}"
+                dst_ip="${dst##*:}"
+                validation_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 root@${dst_ip} 'echo ok-root:${dst_name}'"
+                if sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
+                    print_step "Root SSH mesh OK: ${src_name} -> ${dst_name}"
+                else
+                    print_warning "Root SSH mesh FAILED: ${src_name} -> ${dst_name}"
+                    failures=$((failures + 1))
+                fi
+            done
+        done
+    fi
+
     if [ "$failures" -ne 0 ]; then
         print_warning "SSH mesh validation completed with ${failures} failure(s)."
         return 1
     fi
 
-    print_success "SSH mesh validation complete: all RHIS nodes can SSH to themselves and each other as ${installer_user}."
+    print_success "SSH mesh validation complete: installer and root SSH trust is functional across RHIS nodes."
     return 0
 }
 
@@ -6726,6 +7109,93 @@ ensure_iso_tools() {
 	command -v genisoimage >/dev/null 2>&1 || command -v xorriso >/dev/null 2>&1
 }
 
+ensure_workspace_runtime_layout() {
+    print_step "Ensuring generated RHIS runtime layout exists under ${SCRIPT_DIR}"
+
+    mkdir -p "${RHIS_INVENTORY_DIR}" "${RHIS_HOST_VARS_DIR}" "${SCRIPT_DIR}/container/rhis-playbooks-from-container" "${SCRIPT_DIR}/Doc" || return 1
+
+    # Placeholders are intentionally minimal; real content is generated on run.
+    [ -f "${RHIS_INVENTORY_DIR}/README.md" ] || printf '%s\n' "# Generated by rhis_install.sh" > "${RHIS_INVENTORY_DIR}/README.md"
+    [ -f "${RHIS_HOST_VARS_DIR}/README.md" ] || printf '%s\n' "# Generated by rhis_install.sh" > "${RHIS_HOST_VARS_DIR}/README.md"
+    [ -f "${SCRIPT_DIR}/Doc/README.md" ] || printf '%s\n' "# Generated by rhis_install.sh" > "${SCRIPT_DIR}/Doc/README.md"
+
+    return 0
+}
+
+ensure_platform_packages_for_virt_manager() {
+    print_step "Ensuring installer-host platform packages for libvirt/virt-manager are installed"
+    sudo dnf install -y --nogpgcheck \
+        libvirt \
+        libvirt-daemon \
+        libvirt-client \
+        qemu-kvm \
+        virt-install \
+        qemu-img \
+        virt-manager \
+        virt-viewer \
+        python3-pip || return 1
+
+    # Keep pip path available for optional Python helpers used by RHIS flows.
+    python3 -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    return 0
+}
+
+ensure_installer_host_ansible_collections() {
+    local cfg
+    local c
+    local installed=0
+    local failed=0
+    local server
+    local -a collections
+
+    print_step "Ensuring required Ansible collections are installed on installer host"
+
+    if ! command -v ansible-galaxy >/dev/null 2>&1; then
+        print_step "Installing ansible-core for host-side collection management"
+        sudo dnf install -y --nogpgcheck ansible-core || return 1
+    fi
+
+    generate_rhis_ansible_cfg || true
+    cfg="${RHIS_ANSIBLE_CFG_HOST}"
+
+    # Red Hat first (published/validated), then community fallback.
+    collections=(
+        redhat.rhel_system_roles
+        redhat.satellite
+        redhat.satellite_operations
+        redhat.aap_utilities
+        freeipa.ansible_freeipa
+        ansible.posix
+        community.general
+    )
+
+    for c in "${collections[@]}"; do
+        if ansible-galaxy collection list 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
+            continue
+        fi
+
+        for server in published validated community_galaxy; do
+            if ANSIBLE_CONFIG="${cfg}" ansible-galaxy collection install "${c}" --server "${server}" >/dev/null 2>&1; then
+                installed=$((installed + 1))
+                break
+            fi
+        done
+
+        if ! ansible-galaxy collection list 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
+            failed=$((failed + 1))
+            print_warning "Collection install unresolved on installer host: ${c} (tried published/validated/community_galaxy)"
+        fi
+    done
+
+    if [ "${failed}" -eq 0 ]; then
+        print_success "Installer-host collections verified (installed new: ${installed})."
+    else
+        print_warning "Installer-host collection check complete with ${failed} unresolved collection(s)."
+    fi
+
+    return 0
+}
+
 main() {
     parse_args "$@"
     apply_cli_overrides
@@ -6745,6 +7215,11 @@ main() {
     fi
     load_ansible_env_file
     normalize_shared_env_vars
+
+    ensure_workspace_runtime_layout || {
+        print_warning "Could not initialize generated workspace runtime layout."
+        exit 1
+    }
 
     if [ -n "${CLI_STATUS:-}" ]; then
         print_phase 1 1 "Read-only status snapshot"
@@ -6769,6 +7244,12 @@ main() {
 
 	print_step "Startup: Checking ISO image tools"
 	ensure_iso_tools || { print_warning "ISO image tools check failed"; exit 1; }
+
+    print_step "Startup: Ensuring installer-host platform packages"
+    ensure_platform_packages_for_virt_manager || { print_warning "Installer-host package check failed"; exit 1; }
+
+    print_step "Startup: Ensuring installer-host Ansible collections"
+    ensure_installer_host_ansible_collections || print_warning "Installer-host collection install encountered issues; continuing."
 
     if [ -n "${CLI_TEST:-}" ]; then
         if rhis_run_test_suite; then

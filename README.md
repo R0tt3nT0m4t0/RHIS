@@ -4,7 +4,7 @@
 
 RHIS stands for **Red Hat Infrastructure Standard**.
 
-This repository is built around `run_rhis_install_sequence.sh`, an orchestration script for building and bootstrapping a Red Hat management lab on libvirt/KVM.
+This repository is built around `rhis_install.sh`, an orchestration script for building and bootstrapping a Red Hat management lab on libvirt/KVM.
 
 The current workflow focuses on:
 
@@ -62,6 +62,23 @@ This repository is intended for repeatable build-out of a Red Hat infrastructure
 
 This is primarily an **infrastructure provisioning and bootstrap repository**, not just a generic application project.
 
+The machine where you execute `rhis_install.sh` is the **installer host**. Host-side prerequisites and collection management are resolved there.
+
+---
+
+## Installer host responsibilities
+
+[⬆ Back to top](#table-of-contents)
+
+`rhis_install.sh` is expected to ensure installer-host software requirements using `dnf`/`pip` (current platform profile focuses on libvirt + virt-manager workflows).
+
+It also ensures host-side Ansible collections in this order:
+
+1. Red Hat Automation Hub (`console.redhat.com`, published/validated)
+2. Fallback to `galaxy.ansible.com` when not available there
+
+This keeps the installer host self-sufficient for the RHIS workflow.
+
 ---
 
 ## Quick start
@@ -74,7 +91,7 @@ This is primarily an **infrastructure provisioning and bootstrap repository**, n
   - `IdM -> Satellite -> AAP`
 - Menu option `2` (Container Deployment) now auto-runs config-as-code by default.
 - New one-shot workflow:
-  - `./run_rhis_install_sequence.sh --container-config-only`
+  - `./rhis_install.sh --container-config-only`
 - Retry behavior for transient failures:
   - Failed phases are retried once by default.
   - Disable with `RHIS_RETRY_FAILED_PHASES_ONCE=0`.
@@ -84,19 +101,19 @@ This is primarily an **infrastructure provisioning and bootstrap repository**, n
 ### Recommended first run
 
 ```bash
-./run_rhis_install_sequence.sh --reconfigure
+./rhis_install.sh --reconfigure
 ```
 
 ### Clean up a previous demo run
 
 ```bash
-./run_rhis_install_sequence.sh --DEMOKILL
+./rhis_install.sh --DEMOKILL
 ```
 
 ### Build the demo stack
 
 ```bash
-./run_rhis_install_sequence.sh --DEMO
+./rhis_install.sh --DEMO
 ```
 
 ---
@@ -108,7 +125,7 @@ This is primarily an **infrastructure provisioning and bootstrap repository**, n
 The main workflow is:
 
 ```bash
-./run_rhis_install_sequence.sh
+./rhis_install.sh
 ```
 
 ### Interactive menu options
@@ -189,37 +206,37 @@ The provisioner container uses that generated config via `ANSIBLE_CONFIG` and wr
 ### Container one-shot examples
 
 ```bash
-./run_rhis_install_sequence.sh --container-config-only
+./rhis_install.sh --container-config-only
 ```
 
 Run one-shot container workflow without retries:
 
 ```bash
-RHIS_RETRY_FAILED_PHASES_ONCE=0 ./run_rhis_install_sequence.sh --container-config-only
+RHIS_RETRY_FAILED_PHASES_ONCE=0 ./rhis_install.sh --container-config-only
 ```
 
 Re-open VM console monitors after boot:
 
 ```bash
-./run_rhis_install_sequence.sh --attach-consoles
+./rhis_install.sh --attach-consoles
 ```
 
 Read-only health/status snapshot (no provisioning changes):
 
 ```bash
-./run_rhis_install_sequence.sh --status
+./rhis_install.sh --status
 ```
 
 Run a fast noninteractive validation sweep (recommended after `--DEMOKILL`):
 
 ```bash
-./run_rhis_install_sequence.sh --test=fast --DEMO
+./rhis_install.sh --test=fast --DEMO
 ```
 
 Run the broader integration-style validation sweep:
 
 ```bash
-./run_rhis_install_sequence.sh --test=full --DEMO
+./rhis_install.sh --test=full --DEMO
 ```
 
 ### Common examples
@@ -227,31 +244,31 @@ Run the broader integration-style validation sweep:
 Generate only the Satellite kickstart and `OEMDRV.iso`:
 
 ```bash
-./run_rhis_install_sequence.sh --menu-choice 6
+./rhis_install.sh --menu-choice 6
 ```
 
 Run fully unattended:
 
 ```bash
-./run_rhis_install_sequence.sh --non-interactive --menu-choice 6
+./rhis_install.sh --non-interactive --menu-choice 6
 ```
 
 Use a custom bootstrap env file:
 
 ```bash
-./run_rhis_install_sequence.sh --env-file /path/to/custom.env --menu-choice 3
+./rhis_install.sh --env-file /path/to/custom.env --menu-choice 3
 ```
 
 Re-prompt for all saved values:
 
 ```bash
-./run_rhis_install_sequence.sh --reconfigure
+./rhis_install.sh --reconfigure
 ```
 
 Destroy demo resources and clean leftovers:
 
 ```bash
-./run_rhis_install_sequence.sh --DEMOKILL
+./rhis_install.sh --DEMOKILL
 ```
 
 ---
@@ -515,7 +532,7 @@ The script can provide a non-destructive snapshot without provisioning changes:
 Use:
 
 ```bash
-./run_rhis_install_sequence.sh --status
+./rhis_install.sh --status
 ```
 
 ### Ports used by the workflow
@@ -636,9 +653,18 @@ cat /sys/kernel/mm/ksm/pages_shared
 
 [⬆ Back to top](#table-of-contents)
 
-- `run_rhis_install_sequence.sh` — primary orchestration script
+- `rhis_install.sh` — primary orchestration script
 - `CHECKLIST.md` — required user-provided inputs and where to get them
 - `README.md` — this document
+
+For a minimal source tree model, treat these as the canonical non-hidden top-level artifacts:
+
+- `CHECKLIST.md`
+- `LICENSE`
+- `README.md`
+- `rhis_install.sh`
+
+Other runtime directories/files (for example `inventory/`, `host_vars/`, generated placeholders) can be generated by the script if missing.
 
 ---
 
@@ -651,16 +677,16 @@ cat /sys/kernel/mm/ksm/pages_shared
 cat CHECKLIST.md
 
 # 2. Configure or update saved values
-./run_rhis_install_sequence.sh --reconfigure
+./rhis_install.sh --reconfigure
 
 # 3. Clean old lab state if needed
-./run_rhis_install_sequence.sh --DEMOKILL
+./rhis_install.sh --DEMOKILL
 
 # 4. Build the demo stack
-./run_rhis_install_sequence.sh --DEMO
+./rhis_install.sh --DEMO
 
 # 5. Optional: run a fast end-to-end wiring check
-./run_rhis_install_sequence.sh --test=fast --DEMO
+./rhis_install.sh --test=fast --DEMO
 ```
 
 ---
@@ -681,7 +707,7 @@ If provisioning behaves unexpectedly:
 If configuration values are wrong, rerun:
 
 ```bash
-./run_rhis_install_sequence.sh --reconfigure
+./rhis_install.sh --reconfigure
 ```
 
 ---
