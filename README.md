@@ -29,7 +29,27 @@ If you are starting fresh, review:
 
 ---
 
+## Table of contents
+
+- [Quick start](#quick-start)
+- [Configuration and secrets](#configuration-and-secrets)
+- [Default lab layout](#default-lab-layout)
+- [Kickstart generation](#kickstart-generation)
+- [VM provisioning behavior](#vm-provisioning-behavior)
+- [Virt-manager and libvirt setup](#virt-manager-and-libvirt-setup)
+- [DEMOKILL behavior](#demokill-behavior)
+- [RHIS CMDB / HTML dashboard](#rhis-cmdb--html-dashboard)
+- [RHIS Hardware Planning & Resource Management Guide (RHEL 10)](#rhis-hardware-planning--resource-management-guide-rhel-10)
+- [Important files](#important-files)
+- [Recommended run sequence](#recommended-run-sequence)
+- [Troubleshooting](#troubleshooting)
+- [Support](#support)
+
+---
+
 ## Purpose of this repository
+
+[⬆ Back to top](#table-of-contents)
 
 This repository is intended for repeatable build-out of a Red Hat infrastructure management stack with:
 
@@ -45,6 +65,8 @@ This is primarily an **infrastructure provisioning and bootstrap repository**, n
 ---
 
 ## Quick start
+
+[⬆ Back to top](#table-of-contents)
 
 ### What's new
 
@@ -80,6 +102,8 @@ This is primarily an **infrastructure provisioning and bootstrap repository**, n
 ---
 
 ## Main entry point
+
+[⬆ Back to top](#table-of-contents)
 
 The main workflow is:
 
@@ -234,6 +258,8 @@ Destroy demo resources and clean leftovers:
 
 ## Configuration and secrets
 
+[⬆ Back to top](#table-of-contents)
+
 The script stores working configuration in:
 
 - `~/.ansible/conf/env.yml` — encrypted with `ansible-vault`
@@ -268,6 +294,8 @@ For the detailed list, use:
 
 ## Default lab layout
 
+[⬆ Back to top](#table-of-contents)
+
 By default, the script uses these internal addresses:
 
 | Node | Default IP | Default Hostname Pattern |
@@ -297,6 +325,8 @@ Adjust these during `--reconfigure` if your environment needs different values.
 ---
 
 ## Kickstart generation
+
+[⬆ Back to top](#table-of-contents)
 
 The script generates unattended kickstarts for:
 
@@ -363,6 +393,8 @@ The script now enforces registration and repo configuration during kickstart `%p
 
 ## VM provisioning behavior
 
+[⬆ Back to top](#table-of-contents)
+
 When you choose a libvirt build path, the script:
 
 1. validates configuration
@@ -399,6 +431,8 @@ This makes it easier to watch Anaconda and serial console output while the stack
 
 ## Virt-manager and libvirt setup
 
+[⬆ Back to top](#table-of-contents)
+
 The script can configure:
 
 - `libvirtd`
@@ -418,6 +452,8 @@ This matches the intended RHIS lab design.
 ---
 
 ## DEMOKILL behavior
+
+[⬆ Back to top](#table-of-contents)
 
 `--DEMOKILL` is intended for interrupted runs, rebuilds, and stale lab cleanup.
 
@@ -446,6 +482,8 @@ Use this before retrying a build if a prior run failed or was interrupted.
 ---
 
 ## RHIS CMDB / HTML dashboard
+
+[⬆ Back to top](#table-of-contents)
 
 The script includes bootstrap logic for a lightweight RHIS CMDB-style dashboard on the Satellite node using:
 
@@ -488,7 +526,115 @@ Use:
 
 ---
 
+## RHIS Hardware Planning & Resource Management Guide (RHEL 10)
+
+[⬆ Back to top](#table-of-contents)
+
+This document consolidates the resource requirements, platform comparisons, overcommit strategies, and health-check commands for a Red Hat Infrastructure Setup (RHIS) consisting of **Satellite 6.18**, **Ansible Automation Platform (AAP) 2.6**, and **Identity Management (IdM)**.
+
+---
+
+## 1. Product Resource Requirements
+
+[⬆ Back to top](#table-of-contents)
+
+These specifications are tailored for **RHEL 10** environments. Satellite and AAP are resource-intensive due to their database and containerization (Podman) requirements.
+
+| Product | Role | Min vCPU | Min RAM | Rec vCPU | Rec RAM | Storage Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Satellite 6.18** | Lifecycle & Repos | 4 | 20 GB | 8 | 32 GB+ | 500GB+ for `/var/lib/pulp` |
+| **AAP 2.6** | Automation (Bundled)| 4 | 16 GB | 8-16 | 32 GB | 100GB+ for `/var/lib/containers` |
+| **IdM** | Identity & DNS | 2 | 4 GB | 4 | 8-16 GB | 50GB for LDAP & Logs |
+| **TOTAL** | **Full Stack** | **10** | **40 GB** | **20** | **80 GB+** | **~700GB Total SSD/NVMe** |
+
+---
+
+## 2. Platform Overhead Comparison
+
+[⬆ Back to top](#table-of-contents)
+
+The hypervisor choice dictates how much "tax" is taken from your physical hardware before the VMs even boot.
+
+| Platform Type | Examples | CPU Overhead | RAM Overhead | Impact on RHIS |
+| :--- | :--- | :--- | :--- | :--- |
+| **Type 1 (Bare Metal)**| ESXi, Nutanix, KVM | Low (~2-5%) | Fixed (~1-2GB) | Most efficient for heavy stacks. |
+| **Type 2 (Hosted)** | Workstation, VirtualBox| Medium (~15%) | High (Host OS) | Not recommended for production. |
+| **Cloud (Off-Prem)** | AWS, Azure, GCP | Variable | Included in SKU | Avoid "Burstable" CPUs for Satellite. |
+
+---
+
+## 3. Safe Overcommit Ratios
+
+[⬆ Back to top](#table-of-contents)
+
+Overcommitting allows you to run more virtual resources than you have physical hardware, provided you follow these "Golden Ratios."
+
+* **vCPU Overcommit (3:1 to 5:1):** Generally safe. You can assign 3–5 vCPUs per physical core.
+* **RAM Overcommit (1:1):** Highly dangerous for RHIS. Satellite and AAP rely on PostgreSQL; if they are forced into swap, performance collapses.
+
+### Sample Calculation: 64GB RAM / 12-Core (24 Thread) Host
+| VM Name | vCPU | RAM | Note |
+| :--- | :--- | :--- | :--- |
+| **Satellite 6.18** | 8 | 28 GB | Priority for RAM |
+| **AAP 2.6** | 8 | 24 GB | Needs RAM for Execution Envs |
+| **IdM Server** | 4 | 6 GB | Lightweight |
+| **Host Buffer** | - | 6 GB | Essential for Hypervisor stability |
+
+---
+
+## 4. Monitoring Host Health & Memory Pressure
+
+[⬆ Back to top](#table-of-contents)
+
+Use these commands to determine if your hardware can handle an additional VM or if it is currently "thrashing."
+
+### A. Pressure Stall Information (PSI)
+The most accurate health metric in RHEL 10. It measures how much time processes spend waiting for resources.
+```bash
+# Check for Memory Stalls
+cat /proc/pressure/memory
+```
+* **avg10 > 10.00:** Your RAM is over-saturated. Do not add more VMs.
+* **avg10 < 1.00:** Your system is healthy and has room to grow.
+
+### B. Hypervisor Stats (virsh)
+Run these on the KVM/Libvirt host to see actual physical memory footprint (`rss`).
+```bash
+# Get memory stats for all running domains
+virsh domstats --memory
+
+# Check for specific domain memory ballooning
+virsh memstat <domain_name>
+```
+
+### C. Standard Linux Monitoring
+| Tool | Command | Focus |
+| :--- | :--- | :--- |
+| **Free** | `free -h` | Look at the **available** column only. |
+| **Vmstat** | `vmstat 1 5` | If **si** (swap in) or **so** (swap out) are > 0, you are out of RAM. |
+| **Top** | `top` | Press `m` to sort by memory; check `avail Mem`. |
+
+---
+
+## 5. Performance Optimization: KSM
+
+[⬆ Back to top](#table-of-contents)
+
+For RHEL 10 hosts running multiple RHEL 10 guests, enable **Kernel Same-page Merging**. This de-duplicates identical memory pages (like the kernel code) across all VMs, often freeing up several gigabytes of RAM.
+
+```bash
+# Enable KSM and the tuning daemon
+systemctl enable --now ksm ksmtuned
+
+# Check how much memory KSM has saved (in pages)
+cat /sys/kernel/mm/ksm/pages_shared
+```
+
+---
+
 ## Important files
+
+[⬆ Back to top](#table-of-contents)
 
 - `run_rhis_install_sequence.sh` — primary orchestration script
 - `CHECKLIST.md` — required user-provided inputs and where to get them
@@ -497,6 +643,8 @@ Use:
 ---
 
 ## Recommended run sequence
+
+[⬆ Back to top](#table-of-contents)
 
 ```bash
 # 1. Review what you need
@@ -519,6 +667,8 @@ cat CHECKLIST.md
 
 ## Troubleshooting
 
+[⬆ Back to top](#table-of-contents)
+
 If provisioning behaves unexpectedly:
 
 - verify `virsh list --all`
@@ -537,6 +687,8 @@ If configuration values are wrong, rerun:
 ---
 
 ## Support
+
+[⬆ Back to top](#table-of-contents)
 
 For issues, improvements, or repo-specific workflow questions, open a repository issue or contact the maintainers.
 

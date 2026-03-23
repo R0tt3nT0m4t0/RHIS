@@ -31,7 +31,9 @@ KS_DIR="${KS_DIR:-/var/lib/libvirt/images/kickstarts}"
 OEMDRV_ISO="${OEMDRV_ISO:-$ISO_DIR/OEMDRV.iso}"
 ANSIBLE_ENV_DIR="${ANSIBLE_ENV_DIR:-$HOME/.ansible/conf}"
 ANSIBLE_ENV_FILE="${ANSIBLE_ENV_FILE:-$ANSIBLE_ENV_DIR/env.yml}"
-ANSIBLE_VAULT_PASS_FILE="${ANSIBLE_VAULT_PASS_FILE:-$ANSIBLE_ENV_DIR/.vaultpass.txt}"
+# Canonical vault password file location used by RHIS.
+# Keep this fixed so all playbook/manual rerun paths remain consistent.
+ANSIBLE_VAULT_PASS_FILE="${HOME}/.ansible/conf/.vaultpass.txt"
 RHIS_ANSIBLE_CFG_BASENAME="${RHIS_ANSIBLE_CFG_BASENAME:-rhis-ansible.cfg}"
 RHIS_ANSIBLE_CFG_HOST="${RHIS_ANSIBLE_CFG_HOST:-$ANSIBLE_ENV_DIR/${RHIS_ANSIBLE_CFG_BASENAME}}"
 RHIS_ANSIBLE_CFG_CONTAINER="${RHIS_ANSIBLE_CFG_CONTAINER:-/rhis/vars/vault/${RHIS_ANSIBLE_CFG_BASENAME}}"
@@ -99,9 +101,17 @@ RHIS_POST_VM_SETTLE_GRACE="${RHIS_POST_VM_SETTLE_GRACE:-650}"
 RHIS_INTERNAL_SSH_WARN_GRACE="${RHIS_INTERNAL_SSH_WARN_GRACE:-600}"
 RHIS_INTERNAL_SSH_LOG_EVERY="${RHIS_INTERNAL_SSH_LOG_EVERY:-60}"
 RHC_AUTO_CONNECT="${RHC_AUTO_CONNECT:-1}"
+# Optional pre-flight ad-hoc probes/upgrades before phase playbooks.
+# Default OFF to avoid noisy lockout-prone retries on fresh installs.
+RHIS_ENABLE_PRECHECK_ADHOC="${RHIS_ENABLE_PRECHECK_ADHOC:-0}"
+# Guard to ensure the full prompt wizard runs at most once per process.
+RHIS_PROMPTS_COMPLETED="${RHIS_PROMPTS_COMPLETED:-0}"
 
 # Automation Hub + AAP bundle pre-flight HTTP-serve variables
 HUB_TOKEN="${HUB_TOKEN:-}"
+# Automation Hub API token used for [galaxy_server.*] in rhis-ansible.cfg.
+# If unset, HUB_TOKEN is used as fallback.
+VAULT_CONSOLE_REDHAT_TOKEN="${VAULT_CONSOLE_REDHAT_TOKEN:-}"
 HOST_INT_IP="${HOST_INT_IP:-192.168.122.1}"
 AAP_BUNDLE_URL="${AAP_BUNDLE_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/c9/c953da394644892ad66dabdc57fcb4e4022724501466a90904001526fe5660d3/ansible-automation-platform-containerized-setup-bundle-2.6-6-x86_64.tar.gz?user=dfb5278729bd015d083f488da113c04b&_auth_=1773884622_1b332b37fd083ba0f82e94d32ee65a51}"
 AAP_BUNDLE_DIR="${AAP_BUNDLE_DIR:-${VM_DIR}/aap-bundle}"
@@ -150,6 +160,7 @@ SAT_ORG="${SAT_ORG:-REDHAT}"
 SAT_LOC="${SAT_LOC:-CORE}"
 IDM_DS_PASS="${IDM_DS_PASS:-}"  # loaded from vault; fallback set in normalize_shared_env_vars
 SATELLITE_DISCONNECTED="${SATELLITE_DISCONNECTED:-false}"
+REGISTER_TO_SATELLITE="${REGISTER_TO_SATELLITE:-false}"
 IPADM_PASSWORD="${IPADM_PASSWORD:-}"
 IPAADMIN_PASSWORD="${IPAADMIN_PASSWORD:-}"
 CDN_ORGANIZATION_ID="${CDN_ORGANIZATION_ID:-}"
@@ -374,7 +385,9 @@ EOF
 
     if [ "$include_org_id" = "1" ]; then
         cat <<'EOF'
-        if [ -n "${CDN_ORGANIZATION_ID:-}" ]; then
+        if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+            subscription-manager register --org="${CDN_ORGANIZATION_ID}" --activationkey="${CDN_SAT_ACTIVATION_KEY}" --force && return 0
+        elif [ -n "${CDN_ORGANIZATION_ID:-}" ]; then
             subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --org="${CDN_ORGANIZATION_ID}" --auto-attach --force && return 0
         else
             subscription-manager register --username="${RH_USER}" --password="${RH_PASS}" --auto-attach --force && return 0
@@ -469,6 +482,9 @@ mac-address=${ext_mac}
 
 [ipv4]
 method=auto
+# DHCP primary with explicit resolver fallback for early bootstrap tasks.
+dns=1.1.1.1;8.8.8.8;
+ignore-auto-dns=false
 
 [ipv6]
 method=auto
@@ -525,12 +541,12 @@ kickstart_hosts_mapping_block() {
 
     cat <<EOF
 # 1. Local hosts mapping (temporary DNS-independent bootstrap)
-cat > /etc/hosts <<EOF
+cat > /etc/hosts <<EOF_HOSTS
 127.0.0.1 localhost localhost.localdomain
 ${sat_ip} ${sat_host} ${sat_short}
 ${aap_ip} ${aap_host} ${aap_short}
 ${idm_ip} ${idm_host} ${idm_short}
-EOF
+EOF_HOSTS
 EOF
 }
 
@@ -566,6 +582,7 @@ EOF
 
 print_runtime_configuration() {
     print_step "Runtime configuration summary"
+    local galaxy_token_effective="${VAULT_CONSOLE_REDHAT_TOKEN:-${HUB_TOKEN:-}}"
     echo "  PRESEED_ENV_FILE=${PRESEED_ENV_FILE}"
     echo "  NONINTERACTIVE=${NONINTERACTIVE:-0}"
     echo "  MENU_CHOICE=${MENU_CHOICE:-'(unset)'}"
@@ -579,6 +596,8 @@ print_runtime_configuration() {
     echo "  SAT_LOC=${SAT_LOC:-'(unset)'}"
     echo "  DEMO_MODE=${DEMO_MODE:-0}"
     echo "  HUB_TOKEN=$(mask_secret "${HUB_TOKEN:-}")"
+    echo "  VAULT_CONSOLE_REDHAT_TOKEN=$(mask_secret "${VAULT_CONSOLE_REDHAT_TOKEN:-}")"
+    echo "  GALAXY_TOKEN_EFFECTIVE=$(mask_secret "${galaxy_token_effective:-}")"
     echo "  HOST_INT_IP=${HOST_INT_IP:-'(unset)'}"
     echo "  AAP_BUNDLE_URL=$(mask_url_secret "${AAP_BUNDLE_URL:-}")"
     echo "  AAP_INVENTORY_TEMPLATE=${AAP_INVENTORY_TEMPLATE:-'(unset)'}"
@@ -589,6 +608,7 @@ print_runtime_configuration() {
     echo "  RHIS_ANSIBLE_FACT_CACHE_HOST=${RHIS_ANSIBLE_FACT_CACHE_HOST}"
     echo "  AAP_ANSIBLE_LOG=${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
     echo "  RHIS_RETRY_FAILED_PHASES_ONCE=${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
+    echo "  RHIS_ENABLE_PRECHECK_ADHOC=${RHIS_ENABLE_PRECHECK_ADHOC:-0}"
     echo "  RHC_AUTO_CONNECT=${RHC_AUTO_CONNECT:-1}"
     echo "  NETWORKS_ACTIVE=SAT(${SAT_IP:-10.168.128.1}/${SAT_NETMASK:-255.255.0.0} gw:${SAT_GW:-10.168.0.1}) AAP(${AAP_IP:-10.168.128.2}/${AAP_NETMASK:-255.255.0.0} gw:${AAP_GW:-10.168.0.1}) IDM(${IDM_IP:-10.168.128.3}/${IDM_NETMASK:-255.255.0.0} gw:${IDM_GW:-10.168.0.1})"
 }
@@ -596,6 +616,10 @@ print_runtime_configuration() {
 generate_rhis_ansible_cfg() {
     mkdir -p "${ANSIBLE_ENV_DIR}" "${RHIS_ANSIBLE_FACT_CACHE_HOST}" || return 1
     chmod 700 "${ANSIBLE_ENV_DIR}" "${RHIS_ANSIBLE_FACT_CACHE_HOST}" 2>/dev/null || true
+
+    # Prefer explicit vaulted console token; fall back to HUB_TOKEN.
+    # This token is used for Automation Hub galaxy server auth entries.
+    local ah_token="${VAULT_CONSOLE_REDHAT_TOKEN:-${HUB_TOKEN:-}}"
 
     cat > "${RHIS_ANSIBLE_CFG_HOST}" <<EOF
 [defaults]
@@ -619,6 +643,24 @@ pipelining = True
 ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o ServerAliveInterval=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 control_path_dir = /tmp/.ansible-cp
 retries = 3
+
+[galaxy]
+server_list = published, validated, community_galaxy
+
+[galaxy_server.published]
+url = https://console.redhat.com/api/automation-hub/content/published/
+auth_url = https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+# token redacted (use vaulted var vault_console_redhat_token)
+token = ${ah_token}
+
+[galaxy_server.validated]
+url = https://console.redhat.com/api/automation-hub/content/validated/
+auth_url = https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+# token redacted (use vaulted var vault_console_redhat_token)
+token = ${ah_token}
+
+[galaxy_server.community_galaxy]
+url = https://galaxy.ansible.com/
 EOF
 
     chmod 600 "${RHIS_ANSIBLE_CFG_HOST}" 2>/dev/null || true
@@ -626,6 +668,29 @@ EOF
     chmod 600 "${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}" 2>/dev/null || true
     print_success "Generated RHIS Ansible config: ${RHIS_ANSIBLE_CFG_HOST}"
     return 0
+}
+
+# Persist a consolidated view of runtime credentials/config into the encrypted
+# ~/.ansible/conf/env.yml vault so the workflow has a single source of truth.
+# This intentionally runs after stale container teardown in ensure_container_running().
+sync_runtime_values_to_ansible_vault() {
+    [ -f "${ANSIBLE_ENV_FILE}" ] || return 0
+
+    print_step "Consolidating runtime variables into encrypted vault file: ${ANSIBLE_ENV_FILE}"
+
+    # Load existing vaulted values first, then merge any runtime-sourced values.
+    load_ansible_env_file || return 1
+
+    # Bidirectional fallback between dedicated Automation Hub token and legacy HUB_TOKEN.
+    if [ -z "${VAULT_CONSOLE_REDHAT_TOKEN:-}" ] && [ -n "${HUB_TOKEN:-}" ]; then
+        VAULT_CONSOLE_REDHAT_TOKEN="${HUB_TOKEN}"
+    fi
+    if [ -z "${HUB_TOKEN:-}" ] && [ -n "${VAULT_CONSOLE_REDHAT_TOKEN:-}" ]; then
+        HUB_TOKEN="${VAULT_CONSOLE_REDHAT_TOKEN}"
+    fi
+
+    normalize_shared_env_vars
+    write_ansible_env_file
 }
 
 # ─── Test suite helpers ─────────────────────────────────────────────────────
@@ -1183,6 +1248,15 @@ normalize_shared_env_vars() {
             ;;
         *)
             SATELLITE_DISCONNECTED="false"
+            ;;
+    esac
+
+    case "${REGISTER_TO_SATELLITE:-false}" in
+        1|true|TRUE|yes|YES|on|ON)
+            REGISTER_TO_SATELLITE="true"
+            ;;
+        *)
+            REGISTER_TO_SATELLITE="false"
             ;;
     esac
 
@@ -1822,34 +1896,17 @@ configure_libvirt_firewall_policy() {
 }
 
 configure_libvirt_networks() {
-    print_step "Configuring libvirt networks (default->external, create internal)"
+    print_step "Configuring libvirt networks (ensure external + create internal)"
 
     if ! command -v virsh >/dev/null 2>&1; then
         print_warning "virsh not found; skipping libvirt network configuration."
         return 0
     fi
 
-    # Rename default -> external (same settings)
-    if sudo virsh net-info default >/dev/null 2>&1; then
-        print_step "Stopping and renaming network: default -> external"
-        sudo virsh net-destroy default >/dev/null 2>&1 || true
-
-        sudo virsh net-dumpxml default | sudo tee /tmp/default.xml >/dev/null
-        sudo sed -i 's#<name>default</name>#<name>external</name>#' /tmp/default.xml
-        sudo sed -i '/<uuid>/d' /tmp/default.xml
-
-        sudo virsh net-undefine default
-
-        if ! sudo virsh net-info external >/dev/null 2>&1; then
-            sudo virsh net-define /tmp/default.xml
-        fi
-        sudo virsh net-start external >/dev/null 2>&1 || true
-        sudo virsh net-autostart external
-    else
-                print_warning "Network 'default' not found; creating/ensuring network 'external'."
-                if ! sudo virsh net-info external >/dev/null 2>&1; then
-                        print_step "Creating network: external (NAT/DHCP fallback for first guest interface)"
-                        cat <<'EOF' | sudo tee /tmp/external.xml >/dev/null
+    # Keep libvirt's default network untouched; only ensure 'external' exists.
+    if ! sudo virsh net-info external >/dev/null 2>&1; then
+        print_step "Creating network: external (NAT/DHCP fallback for first guest interface)"
+        cat <<'EOF' | sudo tee /tmp/external.xml >/dev/null
 <network>
     <name>external</name>
     <forward mode='nat'/>
@@ -1861,14 +1918,13 @@ configure_libvirt_networks() {
     </ip>
 </network>
 EOF
-                        sudo virsh net-define /tmp/external.xml
-                else
-                        print_step "Network 'external' already exists"
-                fi
-
-                sudo virsh net-start external >/dev/null 2>&1 || true
-                sudo virsh net-autostart external
+        sudo virsh net-define /tmp/external.xml
+    else
+        print_step "Network 'external' already exists"
     fi
+
+    sudo virsh net-start external >/dev/null 2>&1 || true
+    sudo virsh net-autostart external
 
         # Create internal static network with no DHCP
     if ! sudo virsh net-info internal >/dev/null 2>&1; then
@@ -2019,6 +2075,11 @@ ensure_container_running() {
 
     # Remove a stopped/crashed remnant so the name is free
     podman rm -f "${RHIS_CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+    # Right after container teardown, consolidate runtime values from any
+    # active sources (preseed, shell exports, prior vault state) back into
+    # encrypted ~/.ansible/conf/env.yml.
+    sync_runtime_values_to_ansible_vault || print_warning "Could not consolidate runtime values into ${ANSIBLE_ENV_FILE}; continuing."
 
     print_step "Starting RHIS provisioner container '${RHIS_CONTAINER_NAME}'"
     podman run -d -t \
@@ -2629,7 +2690,7 @@ run_rhis_config_as_code() {
     fi
 
     local inv="--inventory /rhis/vars/external_inventory/hosts"
-    local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false}}"
+    local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false}}"
     local manual_vault_arg="${vault_arg[*]}"
     if [ -z "${manual_vault_arg}" ]; then
         manual_vault_arg="--ask-vault-pass"
@@ -2877,7 +2938,6 @@ run_rhis_config_as_code() {
 
     ensure_managed_nodes_registered() {
         local register_target="idm:scenario_satellite:aap"
-        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
         local reg_shell='subscription-manager identity >/dev/null 2>&1 || subscription-manager register --username="{{ rh_user }}" --password="{{ rh_pass }}" --force; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; if [ -d /etc/pki/rpm-gpg ]; then for k in /etc/pki/rpm-gpg/*; do [ -f "$k" ] && rpm --import "$k" >/dev/null 2>&1 || true; done; fi; dnf clean metadata >/dev/null 2>&1 || true'
 
         if [ -z "${RH_USER:-}" ] || [ -z "${RH_PASS:-}" ]; then
@@ -2886,35 +2946,6 @@ run_rhis_config_as_code() {
         fi
 
         print_step "Ensuring RHSM registration on IdM/Satellite/AAP before config-as-code phases"
-
-        if [ -n "$root_auth_pass" ]; then
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${reg_shell}"
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${reg_shell}"
-            fi
-
-            if [ "$?" -eq 0 ]; then
-                print_success "RHSM registration precheck complete for IdM/Satellite/AAP."
-                return 0
-            fi
-
-            print_warning "RHSM registration precheck failed with root auth; retrying once with inventory credentials."
-        fi
 
         if [ "$use_interactive_vault_prompt" = "1" ]; then
             podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
@@ -2933,76 +2964,30 @@ run_rhis_config_as_code() {
             return 0
         fi
 
-        if [ -z "$root_auth_pass" ]; then
-            print_warning "RHSM registration precheck failed and ROOT_PASS/ADMIN_PASS is unset for fallback."
-            return 1
-        fi
-
-        print_warning "RHSM registration precheck failed on first attempt; retrying with root SSH auth fallback."
-
-        if [ "$use_interactive_vault_prompt" = "1" ]; then
-            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
-                -e "ansible_user=root" \
-                -e "ansible_password=${root_auth_pass}" \
-                -e "ansible_become=false" \
-                -e "ansible_become_password=${root_auth_pass}" \
-                -m shell \
-                -a "${reg_shell}"
-        else
-            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                ansible "${register_target}" ${inv} "${vault_arg[@]}" ${evars} \
-                -e "ansible_user=root" \
-                -e "ansible_password=${root_auth_pass}" \
-                -e "ansible_become=false" \
-                -e "ansible_become_password=${root_auth_pass}" \
-                -m shell \
-                -a "${reg_shell}"
-        fi
-
-        if [ "$?" -eq 0 ]; then
-            print_success "RHSM registration precheck succeeded with root auth fallback."
-            return 0
-        fi
-
-        print_warning "RHSM registration precheck failed; package/repository tasks may fail until hosts are registered."
+        print_warning "RHSM registration precheck failed; continuing to phase playbooks (they have their own auth fallback)."
         return 1
     }
 
+    precheck_auth_ready() {
+        # If inventory auth is not ready yet, skip optional ad-hoc prechecks to
+        # avoid noisy UNREACHABLE output and account lockout noise.
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -m ansible.builtin.ping >/dev/null 2>&1
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -m ansible.builtin.ping >/dev/null 2>&1
+        fi
+
+        return $?
+    }
+
     ensure_idm_fqdn_resolution() {
-        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
         local fqdn_shell="f='${IDM_HOSTNAME}'; h='${IDM_ALIAS:-idm}'; ip='${IDM_IP}'; [ -n \"\$ip\" ] || ip=\"\$(hostname -I 2>/dev/null | awk '{print \$1}')\"; if [ -n \"\$f\" ] && [ -n \"\$ip\" ] && ! getent hosts \"\$f\" >/dev/null 2>&1; then echo \"\$ip \$f \$h\" >> /etc/hosts; fi; getent hosts \"\$f\" >/dev/null 2>&1"
 
         print_step "Ensuring IdM host can resolve its own FQDN before idm_pre checks"
-
-        if [ -n "$root_auth_pass" ]; then
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${fqdn_shell}"
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${fqdn_shell}"
-            fi
-
-            if [ "$?" -eq 0 ]; then
-                print_success "IdM FQDN resolution precheck passed."
-                return 0
-            fi
-
-            print_warning "IdM FQDN precheck failed with root auth; retrying once with inventory credentials."
-        fi
 
         if [ "$use_interactive_vault_prompt" = "1" ]; then
             podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
@@ -3021,12 +3006,108 @@ run_rhis_config_as_code() {
             return 0
         fi
 
+        print_warning "IdM FQDN resolution precheck failed; idm_pre DNS assertions may fail."
+        return 1
+    }
+
+    ensure_idm_internet_resolution() {
+        local net_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true; fi; getent hosts redhat.com >/dev/null 2>&1'
+
+        print_step "Pre-flight: ensuring IdM can resolve public internet names (redhat.com)"
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${net_shell}"
+        else
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
+                -m shell \
+                -a "${net_shell}"
+        fi
+
+        if [ "$?" -eq 0 ]; then
+            print_success "IdM internet resolution precheck passed."
+            return 0
+        fi
+
+        print_warning "IdM internet resolution precheck could not be confirmed; idm_pre internet assertions may still fail."
+        return 1
+    }
+
+    remediate_satellite_repo_entitlements() {
+        # Requested remediation flow for Satellite host:
+        #   1) dnf upgrade -y --skip-broken --allowerasing --best
+        #   2) dnf install -y sos rhc
+        #   3) rhc connect --activation-key <key> --organization <org>
+        #   4) dnf install -y rhc-worker-playbook
+        # Then continue with RHSM repo enablement assertions.
+        local sat_shell='dnf upgrade -y --skip-broken --allowerasing --best || true; dnf install -y sos rhc || true; if [ -n "{{ cdn_organization_id | default(\"\") }}" ] && [ -n "{{ cdn_sat_activation_key | default(\"\") }}" ]; then rhc connect --activation-key "{{ cdn_sat_activation_key }}" --organization "{{ cdn_organization_id }}" || true; fi; dnf install -y rhc-worker-playbook || true; if ! subscription-manager identity >/dev/null 2>&1; then if [ -n "{{ cdn_organization_id | default(\"\") }}" ] && [ -n "{{ cdn_sat_activation_key | default(\"\") }}" ]; then subscription-manager register --org="{{ cdn_organization_id }}" --activationkey="{{ cdn_sat_activation_key }}" --force || true; else subscription-manager register --username="{{ rh_user | default(\"\") }}" --password="{{ rh_pass | default(\"\") }}" --force || true; fi; fi; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; subscription-manager repos --disable="*" >/dev/null 2>&1 || true; subscription-manager repos --enable="rhel-9-for-x86_64-baseos-rpms" --enable="rhel-9-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-9-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-9-x86_64-rpms" >/dev/null 2>&1 || true; subscription-manager repos --list >/dev/null 2>&1 || true'
+
+        # Build a local evars string that extends the enclosing scope's evars with
+        # cdn_organization_id / cdn_sat_activation_key when they are set as host-side
+        # environment variables (i.e. not solely inside env.yml).  This mirrors exactly
+        # what run_phase_playbook() does for the Satellite phase.
+        local _rem_evars="${evars}"
+        if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+            _rem_evars="${_rem_evars} --extra-vars cdn_organization_id=${CDN_ORGANIZATION_ID} --extra-vars cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}"
+            print_step "Pre-flight: using CDN_ORGANIZATION_ID/CDN_SAT_ACTIVATION_KEY for Satellite RHSM registration"
+        else
+            print_step "Pre-flight: CDN_ORGANIZATION_ID/CDN_SAT_ACTIVATION_KEY not set as env vars — relying on vault (rh_user/rh_pass) for RHSM registration"
+        fi
+
+        print_step "Pre-flight: attempting Satellite RHSM attach and repo enable remediation"
+
+        local _remediate_rc=0
+        local _remediate_out=""
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            _remediate_out=$(podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${_rem_evars} -m shell -a "${sat_shell}" 2>&1) || _remediate_rc=$?
+        else
+            _remediate_out=$(podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${_rem_evars} -m shell -a "${sat_shell}" 2>&1) || _remediate_rc=$?
+        fi
+
+        if [ "${_remediate_rc}" -ne 0 ]; then
+            print_warning "Satellite RHSM remediation ansible task returned rc=${_remediate_rc}."
+            print_warning "Remediation output:"
+            printf '%s\n' "${_remediate_out}" | head -40
+            print_warning "Collecting verbose remediation diagnostics (-vvv)..."
+            local _remediate_dbg_out=""
+            if [ "$use_interactive_vault_prompt" = "1" ]; then
+                _remediate_dbg_out=$(podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${_rem_evars} -m shell -a "${sat_shell}" -vvv 2>&1 || true)
+            else
+                _remediate_dbg_out=$(podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${_rem_evars} -m shell -a "${sat_shell}" -vvv 2>&1 || true)
+            fi
+            print_warning "Verbose remediation output (first 80 lines):"
+            printf '%s\n' "${_remediate_dbg_out}" | head -80
+            if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+                print_warning "CDN_ORGANIZATION_ID and CDN_SAT_ACTIVATION_KEY were set — verify the"
+                print_warning "activation key includes a 'Smart Management' subscription and that the"
+                print_warning "Satellite host can reach subscription.rhsm.redhat.com."
+            else
+                print_warning "Set CDN_ORGANIZATION_ID and CDN_SAT_ACTIVATION_KEY before re-running"
+                print_warning "to use an activation key instead of username/password registration."
+                print_warning "Alternatively ensure rh_user/rh_pass are present in your vault env.yml."
+            fi
+        fi
+
+        return 0
+    }
+
+    prepare_idm_runtime_network() {
+        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
+        local prep_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; nmcli con up eth1 >/dev/null 2>&1 || nmcli dev connect eth1 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true; fi; ip route show >/dev/null 2>&1; getent hosts redhat.com >/dev/null 2>&1'
+
         if [ -z "$root_auth_pass" ]; then
-            print_warning "IdM FQDN precheck failed and ROOT_PASS/ADMIN_PASS is unset for fallback."
+            print_warning "Skipping IdM runtime network prep: ROOT_PASS/ADMIN_PASS is unset."
             return 1
         fi
 
-        print_warning "IdM FQDN precheck failed on first attempt; retrying with root SSH auth fallback."
+        print_step "Preparing IdM runtime network/DNS state before phase playbook"
 
         if [ "$use_interactive_vault_prompt" = "1" ]; then
             podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
@@ -3036,7 +3117,7 @@ run_rhis_config_as_code() {
                 -e "ansible_become=false" \
                 -e "ansible_become_password=${root_auth_pass}" \
                 -m shell \
-                -a "${fqdn_shell}"
+                -a "${prep_shell}" >/dev/null 2>&1
         else
             podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
                 ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
@@ -3045,92 +3126,16 @@ run_rhis_config_as_code() {
                 -e "ansible_become=false" \
                 -e "ansible_become_password=${root_auth_pass}" \
                 -m shell \
-                -a "${fqdn_shell}"
+                -a "${prep_shell}" >/dev/null 2>&1
         fi
 
         if [ "$?" -eq 0 ]; then
-            print_success "IdM FQDN resolution precheck succeeded with root auth fallback."
+            print_success "IdM runtime network prep completed."
             return 0
         fi
 
-        print_warning "IdM FQDN resolution precheck failed; idm_pre DNS assertions may fail."
+        print_warning "IdM runtime network prep could not be confirmed; continuing to phase playbook."
         return 1
-    }
-
-    ensure_idm_internet_resolution() {
-        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-        local net_shell='set -e; nmcli con up eth0 >/dev/null 2>&1 || nmcli dev connect eth0 >/dev/null 2>&1 || true; if ! getent hosts redhat.com >/dev/null 2>&1; then printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true; fi; getent hosts redhat.com >/dev/null 2>&1'
-
-        print_step "Pre-flight: ensuring IdM can resolve public internet names (redhat.com)"
-
-        if [ -n "$root_auth_pass" ]; then
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${net_shell}"
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${net_shell}"
-            fi
-
-            if [ "$?" -eq 0 ]; then
-                print_success "IdM internet resolution precheck passed."
-                return 0
-            fi
-        fi
-
-        print_warning "IdM internet resolution precheck could not be confirmed; idm_pre internet assertions may still fail."
-        return 1
-    }
-
-    remediate_satellite_repo_entitlements() {
-        local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-        local sat_shell='set -e; subscription-manager identity >/dev/null 2>&1 || subscription-manager register --username="{{ rh_user }}" --password="{{ rh_pass }}" --force || true; subscription-manager attach --auto >/dev/null 2>&1 || true; subscription-manager refresh >/dev/null 2>&1 || true; subscription-manager repos --disable="*" >/dev/null 2>&1 || true; subscription-manager repos --enable="rhel-9-for-x86_64-baseos-rpms" --enable="rhel-9-for-x86_64-appstream-rpms" --enable="satellite-6.18-for-rhel-9-x86_64-rpms" --enable="satellite-maintenance-6.18-for-rhel-9-x86_64-rpms" >/dev/null 2>&1 || true; subscription-manager repos --list >/dev/null 2>&1'
-
-        print_step "Pre-flight: attempting Satellite RHSM attach and repo enable remediation"
-
-        if [ -n "$root_auth_pass" ]; then
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${sat_shell}" >/dev/null 2>&1 || true
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
-                    -e "ansible_user=root" \
-                    -e "ansible_password=${root_auth_pass}" \
-                    -e "ansible_become=false" \
-                    -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${sat_shell}" >/dev/null 2>&1 || true
-            fi
-        else
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${sat_shell}" >/dev/null 2>&1 || true
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${sat_shell}" >/dev/null 2>&1 || true
-            fi
-        fi
-
-        return 0
     }
 
     # Print IdM network state (routes, resolver, internet check) after a failure
@@ -3149,8 +3154,7 @@ run_rhis_config_as_code() {
                     -e "ansible_password=${root_auth_pass}" \
                     -e "ansible_become=false" \
                     -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${diag_shell}" || true
+                    -m shell -a "${diag_shell}" && return 0
             else
                 podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
                     ansible "idm" ${inv} "${vault_arg[@]}" ${evars} \
@@ -3158,17 +3162,16 @@ run_rhis_config_as_code() {
                     -e "ansible_password=${root_auth_pass}" \
                     -e "ansible_become=false" \
                     -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${diag_shell}" || true
+                    -m shell -a "${diag_shell}" && return 0
             fi
+        fi
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
         else
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "idm" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
-            fi
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "idm" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
         fi
 
         return 0
@@ -3190,8 +3193,7 @@ run_rhis_config_as_code() {
                     -e "ansible_password=${root_auth_pass}" \
                     -e "ansible_become=false" \
                     -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${diag_shell}" || true
+                    -m shell -a "${diag_shell}" && return 0
             else
                 podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
                     ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} \
@@ -3199,17 +3201,16 @@ run_rhis_config_as_code() {
                     -e "ansible_password=${root_auth_pass}" \
                     -e "ansible_become=false" \
                     -e "ansible_become_password=${root_auth_pass}" \
-                    -m shell \
-                    -a "${diag_shell}" || true
+                    -m shell -a "${diag_shell}" && return 0
             fi
+        fi
+
+        if [ "$use_interactive_vault_prompt" = "1" ]; then
+            podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
         else
-            if [ "$use_interactive_vault_prompt" = "1" ]; then
-                podman exec -it -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
-            else
-                podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
-                    ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
-            fi
+            podman exec -e "ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}" -e "ANSIBLE_LOG_PATH=${ansible_log_file}" "${podman_user_args[@]}" "${RHIS_CONTAINER_NAME}" \
+                ansible "scenario_satellite" ${inv} "${vault_arg[@]}" ${evars} -m shell -a "${diag_shell}" || true
         fi
 
         return 0
@@ -3338,12 +3339,22 @@ run_rhis_config_as_code() {
         return 0
     }
 
-    ensure_managed_nodes_registered || true
-    ensure_idm_fqdn_resolution || true
-    ensure_idm_internet_resolution || true
-    if ensure_all_hosts_upgraded; then
-        reboot_managed_hosts_after_upgrade || true
+    if is_enabled "${RHIS_ENABLE_PRECHECK_ADHOC:-0}"; then
+        if precheck_auth_ready; then
+            ensure_managed_nodes_registered || true
+            ensure_idm_fqdn_resolution || true
+            ensure_idm_internet_resolution || true
+            if ensure_all_hosts_upgraded; then
+                reboot_managed_hosts_after_upgrade || true
+            fi
+        else
+            print_warning "Skipping optional pre-flight ad-hoc probes/upgrades: authenticated SSH is not ready yet."
+        fi
+    else
+        print_step "Skipping optional pre-flight ad-hoc probes/upgrades (RHIS_ENABLE_PRECHECK_ADHOC=0)."
     fi
+
+    prepare_idm_runtime_network || true
 
     # ── 1. IdM — must be ready first (Satellite/AAP enroll against it) ─────────
     if ! run_phase_playbook_with_auth_fallback "Phase 1/3 — Configuring IdM..." "idm" "/rhis/rhis-builder-idm/main.yml"; then
@@ -3738,9 +3749,11 @@ load_ansible_env_file() {
     _load_env_key RH_OFFLINE_TOKEN rh_offline_token
     _load_env_key RH_ACCESS_TOKEN  rh_access_token
     _load_env_key HUB_TOKEN        hub_token
+    _load_env_key VAULT_CONSOLE_REDHAT_TOKEN vault_console_redhat_token
     _load_env_key SAT_ADMIN_PASS   sat_admin_pass
     _load_env_key AAP_ADMIN_PASS   aap_admin_pass
     _load_env_key SATELLITE_DISCONNECTED satellite_disconnected
+    _load_env_key REGISTER_TO_SATELLITE register_to_satellite
     _load_env_key IPADM_PASSWORD   ipadm_password
     _load_env_key IPAADMIN_PASSWORD ipaadmin_password
     _load_env_key CDN_ORGANIZATION_ID cdn_organization_id
@@ -3792,6 +3805,14 @@ load_ansible_env_file() {
     _load_env_key RH_ISO_URL       rh_iso_url
     _load_env_key RH9_ISO_URL      rh9_iso_url
     normalize_shared_env_vars
+
+    # Keep legacy HUB_TOKEN and dedicated vault_console_redhat_token aligned.
+    if [ -z "${VAULT_CONSOLE_REDHAT_TOKEN:-}" ] && [ -n "${HUB_TOKEN:-}" ]; then
+        VAULT_CONSOLE_REDHAT_TOKEN="${HUB_TOKEN}"
+    fi
+    if [ -z "${HUB_TOKEN:-}" ] && [ -n "${VAULT_CONSOLE_REDHAT_TOKEN:-}" ]; then
+        HUB_TOKEN="${VAULT_CONSOLE_REDHAT_TOKEN}"
+    fi
 }
 
 # Persist all RHIS credentials to ~/.ansible/conf/env.yml (atomic write, chmod 600).
@@ -3819,11 +3840,13 @@ rh_pass: "${RH_PASS:-}"
 rh_offline_token: "${RH_OFFLINE_TOKEN:-}"
 rh_access_token: "${RH_ACCESS_TOKEN:-}"
 hub_token: "${HUB_TOKEN:-}"
+vault_console_redhat_token: "${VAULT_CONSOLE_REDHAT_TOKEN:-${HUB_TOKEN:-}}"
 aap_ip: "${AAP_IP:-}"
 idm_ip: "${IDM_IP:-}"
 aap_admin_pass: "${AAP_ADMIN_PASS:-}"
 sat_admin_pass: "${SAT_ADMIN_PASS:-}"
 satellite_disconnected: ${SATELLITE_DISCONNECTED:-false}
+register_to_satellite: ${REGISTER_TO_SATELLITE:-false}
 ipadm_password: "${IPADM_PASSWORD:-}"
 ipaadmin_password: "${IPAADMIN_PASSWORD:-}"
 cdn_organization_id: "${CDN_ORGANIZATION_ID:-}"
@@ -3972,9 +3995,9 @@ prompt_all_env_options_once() {
             env_changed=1
         fi
 
-        sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC)"
+        sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC CDN_ORGANIZATION_ID CDN_SAT_ACTIVATION_KEY)"
         echo ""
-        echo "=== Satellite (remaining missing: ${sat_missing}/8) ==="
+        echo "=== Satellite (remaining missing: ${sat_missing}/10) ==="
         if [ -z "${SAT_IP:-}" ]; then
             prompt_with_default SAT_IP "Satellite Internal IP (eth1)" "${SAT_IP:-10.168.128.1}" 0 1 || return 1
             env_changed=1
@@ -4005,6 +4028,14 @@ prompt_all_env_options_once() {
         fi
         if [ -z "${SAT_LOC:-}" ]; then
             prompt_with_default SAT_LOC "Satellite Location" "${SAT_LOC:-CORE}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${CDN_ORGANIZATION_ID:-}" ]; then
+            prompt_with_default CDN_ORGANIZATION_ID "Satellite RHSM Organization ID (console.redhat.com/insights/connector/activation-keys#tags=)" "${CDN_ORGANIZATION_ID:-}" 0 1 || return 1
+            env_changed=1
+        fi
+        if [ -z "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
+            prompt_with_default CDN_SAT_ACTIVATION_KEY "Satellite Activation Key name" "${CDN_SAT_ACTIVATION_KEY:-}" 0 1 || return 1
             env_changed=1
         fi
         SAT_ADMIN_PASS="${ADMIN_PASS}"
@@ -4132,9 +4163,9 @@ prompt_all_env_options_once() {
     prompt_with_default RH9_ISO_URL "RHEL 9 ISO URL (Satellite)" "${RH9_ISO_URL:-}" 0 1 || return 1
     prompt_with_default HOST_INT_IP "Host bridge IP for guest HTTP callbacks" "${HOST_INT_IP:-192.168.122.1}" 0 1 || return 1
 
-    sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC)"
+    sat_missing="$(count_missing_vars SAT_IP SAT_NETMASK SAT_GW SAT_HOSTNAME SAT_ALIAS SAT_DOMAIN SAT_ORG SAT_LOC CDN_ORGANIZATION_ID CDN_SAT_ACTIVATION_KEY)"
     echo ""
-    echo "=== Satellite (remaining missing: ${sat_missing}/8) ==="
+    echo "=== Satellite (remaining missing: ${sat_missing}/10) ==="
     prompt_with_default SAT_IP "Satellite Internal IP (eth1)" "${SAT_IP:-10.168.128.1}" 0 1 || return 1
     prompt_with_default SAT_NETMASK "Satellite Internal Netmask" "${SAT_NETMASK:-$NETMASK}" 0 1 || return 1
     prompt_with_default SAT_GW "Satellite Internal Gateway" "${SAT_GW:-$INTERNAL_GW}" 0 1 || return 1
@@ -4143,6 +4174,8 @@ prompt_all_env_options_once() {
     prompt_with_default SAT_DOMAIN "Satellite Domain" "${SAT_DOMAIN:-$DOMAIN}" 0 1 || return 1
     prompt_with_default SAT_ORG "Satellite Organization" "${SAT_ORG:-REDHAT}" 0 1 || return 1
     prompt_with_default SAT_LOC "Satellite Location" "${SAT_LOC:-CORE}" 0 1 || return 1
+    prompt_with_default CDN_ORGANIZATION_ID "Satellite RHSM Organization ID (console.redhat.com/insights/connector/activation-keys#tags=)" "${CDN_ORGANIZATION_ID:-}" 0 1 || return 1
+    prompt_with_default CDN_SAT_ACTIVATION_KEY "Satellite Activation Key name" "${CDN_SAT_ACTIVATION_KEY:-}" 0 1 || return 1
     SAT_ADMIN_PASS="${ADMIN_PASS}"
 
     aap_missing="$(count_missing_vars AAP_IP AAP_NETMASK AAP_GW AAP_HOSTNAME AAP_ALIAS AAP_BUNDLE_URL AAP_INVENTORY_TEMPLATE AAP_INVENTORY_GROWTH_TEMPLATE)"
@@ -4177,7 +4210,16 @@ prompt_all_env_options_once() {
 # Centralized prompt entrypoint used by provisioning flows.
 # Ensures first-run bootstrap and missing-value prompting both execute.
 prompt_use_existing_env() {
+    if [ "${RHIS_PROMPTS_COMPLETED:-0}" = "1" ]; then
+        if [ -f "$ANSIBLE_ENV_FILE" ]; then
+            load_ansible_env_file || return 1
+        fi
+        return 0
+    fi
+
     prompt_all_env_options_once || return 1
+    RHIS_PROMPTS_COMPLETED=1
+    FORCE_PROMPT_ALL=0
 
     if [ -f "$ANSIBLE_ENV_FILE" ]; then
         load_ansible_env_file || return 1
@@ -4928,6 +4970,8 @@ prompt_satellite_618_details() {
     set_or_prompt SAT_DOMAIN "Domain Name: " || return 1
     set_or_prompt SAT_ORG "Organization Name: " || return 1
     set_or_prompt SAT_LOC "Location Name: " || return 1
+    set_or_prompt CDN_ORGANIZATION_ID "Satellite RHSM Organization ID (console.redhat.com/insights/connector/activation-keys#tags=): " || return 1
+    set_or_prompt CDN_SAT_ACTIVATION_KEY "Satellite Activation Key name: " || return 1
     normalize_shared_env_vars
     write_ansible_env_file
 }
@@ -6714,6 +6758,8 @@ main() {
     fi
 
     prompt_all_env_options_once
+    RHIS_PROMPTS_COMPLETED=1
+    FORCE_PROMPT_ALL=0
     normalize_shared_env_vars
     retire_preseed_env_file
     print_runtime_configuration
