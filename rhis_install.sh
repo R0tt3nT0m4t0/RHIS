@@ -7695,6 +7695,7 @@ generate_aap_kickstart() {
     local aap_inventory_growth_content
     local aap_ext_mac aap_int_mac
     local aap_prefix
+    local aap_bundle_url_e
     local bootstrap_ssh_keys
     local ks_nogpg_policy
     local ks_ssh_baseline
@@ -7739,6 +7740,7 @@ generate_aap_kickstart() {
     select_aap_inventory_templates || return 1
     aap_inventory_content="$(render_aap_inventory_template "${AAP_INVENTORY_TEMPLATE}")" || return 1
     aap_inventory_growth_content="$(render_aap_inventory_template "${AAP_INVENTORY_GROWTH_TEMPLATE}")" || return 1
+    aap_bundle_url_e="$(sed_escape_replacement "${AAP_BUNDLE_URL:-}")"
 
     tmp_ks="$(mktemp)"
 
@@ -7838,10 +7840,32 @@ ${ks_repo_enable_verify}
 
 ${ks_creator_baseline}
 
-# 4. Download the AAP bundle from the host HTTP server (started by run_rhis_install_sequence.sh)
+# 4. Download the AAP bundle
+#    Primary: local host HTTP server started by run_rhis_install_sequence.sh
+#    Fallback: configured AAP_BUNDLE_URL (if provided and reachable)
 mkdir -p /root/aap-setup
 echo "Bundle download starting at $(date)" >> /var/log/aap-setup-ready.log
-curl -fL --retry 5 --retry-delay 15 http://{{HOST_INT_IP}}:8080/aap-bundle.tar.gz -o /root/aap-bundle.tar.gz
+
+bundle_download_ok=0
+for src in "http://{{HOST_INT_IP}}:8080/aap-bundle.tar.gz" "{{AAP_BUNDLE_URL}}"; do
+    [ -n "$src" ] || continue
+    case "$src" in
+        http://*|https://*)
+            echo "Attempting AAP bundle download from: $src" >> /var/log/aap-setup-ready.log
+            if curl -fL --retry 5 --retry-delay 15 "$src" -o /root/aap-bundle.tar.gz; then
+                bundle_download_ok=1
+                echo "AAP bundle download succeeded from: $src" >> /var/log/aap-setup-ready.log
+                break
+            fi
+            ;;
+    esac
+done
+
+if [ "$bundle_download_ok" -ne 1 ]; then
+    echo "ERROR: AAP bundle download failed from both local HTTP and configured fallback URL." >> /var/log/aap-setup-ready.log
+    exit 1
+fi
+
 tar -xzf /root/aap-bundle.tar.gz -C /root/aap-setup --strip-components=1
 rm -f /root/aap-bundle.tar.gz
 if [ ! -x /root/aap-setup/setup.sh ]; then
@@ -7940,6 +7964,7 @@ POSTEOF
     sed -i "s|{{SAT_HOSTNAME}}|${SAT_HOSTNAME}|g" "$tmp_ks"
     sed -i "s|{{AAP_IP}}|${AAP_IP}|g" "$tmp_ks"
     sed -i "s|{{AAP_HOSTNAME}}|${AAP_HOSTNAME}|g" "$tmp_ks"
+    sed -i "s|{{AAP_BUNDLE_URL}}|${aap_bundle_url_e}|g" "$tmp_ks"
     sed -i "s|{{IDM_IP}}|${IDM_IP}|g" "$tmp_ks"
     sed -i "s|{{IDM_HOSTNAME}}|${IDM_HOSTNAME}|g" "$tmp_ks"
     sed -i "s|{{SAT_SHORT}}|${SAT_HOSTNAME%%.*}|g" "$tmp_ks"
