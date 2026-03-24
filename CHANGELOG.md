@@ -11,6 +11,20 @@ This file tracks repository changes from this point forward.
 
 ---
 
+## 2026-03-24 11:45:08 MDT
+
+### 2026-03-24 11:45:08 MDT — Kickstart creator baseline integration
+
+- **Area:** `rhis_install.sh`
+- **Summary:**
+  - Added `kickstart_creator_baseline_block()` to centralize creator/automation prerequisites in kickstart `%post`.
+  - Baseline now installs common creator tools (`sudo`, `openssh-clients`, `rsync`, `jq`), enables `chronyd`, and creates `/etc/rhis/creator.env` metadata on provisioned nodes.
+  - Injected creator baseline into all three generated kickstarts: Satellite, AAP, and IdM.
+  - Metadata written per node includes role, hostname, IP, and bootstrap source/version for downstream creator workflows.
+- **Reason:** Ensure every kickstarted node has a consistent creator-ready baseline and machine-readable node metadata for post-provisioning automation.
+
+---
+
 ## 2026-03-24 11:13:51 MDT
 
 ### 2026-03-24 11:13:51 MDT — Agnostic/idempotent script hardening

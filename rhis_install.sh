@@ -848,6 +848,30 @@ EOF
     fi
 }
 
+kickstart_creator_baseline_block() {
+    local role_name="$1"
+    local node_hostname="$2"
+    local node_ip="$3"
+
+    cat <<EOF
+# RHIS creator baseline (shared across all kickstarted nodes)
+# Ensures common tooling/services expected by creator/bootstrap automation.
+dnf install -y --nogpgcheck sudo openssh-clients rsync jq || true
+systemctl enable --now chronyd || true
+
+install -d -m 0755 /etc/rhis /var/lib/rhis /var/lib/rhis/creator
+cat > /etc/rhis/creator.env <<'RHIS_CREATOR_ENV'
+RHIS_CREATOR_MANAGED=1
+RHIS_ROLE=${role_name}
+RHIS_HOSTNAME=${node_hostname}
+RHIS_IP=${node_ip}
+RHIS_BOOTSTRAP_SOURCE=kickstart
+RHIS_BOOTSTRAP_VERSION=1
+RHIS_CREATOR_ENV
+chmod 0644 /etc/rhis/creator.env || true
+EOF
+}
+
 print_runtime_configuration() {
     print_step "Runtime configuration summary"
     local galaxy_token_effective="${VAULT_CONSOLE_REDHAT_TOKEN:-${HUB_TOKEN:-}}"
@@ -6988,6 +7012,7 @@ generate_satellite_618_kickstart() {
     local ks_nm_dual_nic
     local ks_hosts_mapping
     local ks_trust_bootstrap_keys
+    local ks_creator_baseline
 
     prompt_satellite_618_details || return 1
     ensure_iso_vars || return 1
@@ -7011,6 +7036,7 @@ generate_satellite_618_kickstart() {
     ks_nm_dual_nic="$(kickstart_networkmanager_dual_nic_block "${sat_ext_mac}" "${sat_int_mac}" "${SAT_IP}" "${sat_prefix}" "${SAT_GW}")"
     ks_hosts_mapping="$(kickstart_hosts_mapping_block "${SAT_IP}" "${SAT_HOSTNAME}" "${SAT_HOSTNAME%%.*}" "${AAP_IP}" "${AAP_HOSTNAME}" "${AAP_HOSTNAME%%.*}" "${IDM_IP}" "${IDM_HOSTNAME}" "${IDM_HOSTNAME%%.*}")"
     ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 1)"
+    ks_creator_baseline="$(kickstart_creator_baseline_block "satellite" "${SAT_HOSTNAME}" "${SAT_IP}")"
 
     tmpdir="$(mktemp -d)"
     tmp_ks="${tmpdir}/satellite-618.ks"
@@ -7125,6 +7151,8 @@ ${ks_rhsm_register}
 ${ks_rhc_connect}
 
 ${ks_repo_enable_verify}
+
+${ks_creator_baseline}
 
 # 4. Satellite package installation
 dnf install -y --nogpgcheck satellite
@@ -7677,6 +7705,7 @@ generate_aap_kickstart() {
     local ks_nm_dual_nic
     local ks_hosts_mapping
     local ks_trust_bootstrap_keys
+    local ks_creator_baseline
 
     prompt_aap_details || return 1
     ensure_iso_vars || return 1
@@ -7697,6 +7726,7 @@ generate_aap_kickstart() {
     ks_nm_dual_nic="$(kickstart_networkmanager_dual_nic_block "${aap_ext_mac}" "${aap_int_mac}" "${AAP_IP}" "${aap_prefix}" "${AAP_GW}")"
     ks_hosts_mapping="$(kickstart_hosts_mapping_block "{{SAT_IP}}" "{{SAT_HOSTNAME}}" "{{SAT_SHORT}}" "{{AAP_IP}}" "{{AAP_HOSTNAME}}" "{{AAP_SHORT}}" "{{IDM_IP}}" "{{IDM_HOSTNAME}}" "{{IDM_SHORT}}")"
     ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 0)"
+    ks_creator_baseline="$(kickstart_creator_baseline_block "aap" "${AAP_HOSTNAME}" "${AAP_IP}")"
 
     # Read the host's public key for SSH callback orchestration
     if [ ! -f "${AAP_SSH_PUBLIC_KEY}" ]; then
@@ -7805,6 +7835,8 @@ ${ks_rhsm_register}
 ${ks_rhc_connect}
 
 ${ks_repo_enable_verify}
+
+${ks_creator_baseline}
 
 # 4. Download the AAP bundle from the host HTTP server (started by run_rhis_install_sequence.sh)
 mkdir -p /root/aap-setup
@@ -7954,6 +7986,7 @@ generate_idm_kickstart() {
     local ks_nm_dual_nic
     local ks_hosts_mapping
     local ks_trust_bootstrap_keys
+    local ks_creator_baseline
 
     prompt_idm_details || return 1
     ensure_iso_vars || return 1
@@ -7974,6 +8007,7 @@ generate_idm_kickstart() {
     ks_nm_dual_nic="$(kickstart_networkmanager_dual_nic_block "${idm_ext_mac}" "${idm_int_mac}" "${IDM_IP}" "${idm_prefix}" "${IDM_GW}")"
     ks_hosts_mapping="$(kickstart_hosts_mapping_block "${SAT_IP}" "${SAT_HOSTNAME}" "${SAT_HOSTNAME%%.*}" "${AAP_IP}" "${AAP_HOSTNAME}" "${AAP_HOSTNAME%%.*}" "${IDM_IP}" "${IDM_HOSTNAME}" "${IDM_HOSTNAME%%.*}")"
     ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 1)"
+    ks_creator_baseline="$(kickstart_creator_baseline_block "idm" "${IDM_HOSTNAME}" "${IDM_IP}")"
 
     tmp_ks="$(mktemp)"
 
@@ -8070,6 +8104,8 @@ ${ks_trust_bootstrap_keys}
 ${ks_rhsm_register}
 
 ${ks_rhc_connect}
+
+${ks_creator_baseline}
 
 # 3. Hostname
 hostnamectl set-hostname "${IDM_HOSTNAME}"
