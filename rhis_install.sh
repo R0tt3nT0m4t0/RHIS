@@ -6668,7 +6668,7 @@ wait_for_vm_ssh() {
 }
 
 # Run the AAP 2.6 containerized installer on the VM via SSH callback from the host.
-# Captures setup.sh output, validates exit code, and stops the HTTP server upon completion.
+# Supports both legacy setup.sh bundles and playbook-driven bundles.
 run_aap_setup_on_vm() {
     local vm_name="${1:-aap-26}"
     local vm_ip
@@ -6686,12 +6686,53 @@ run_aap_setup_on_vm() {
     print_step "Running AAP containerized installer via SSH on ${vm_name} (${vm_ip})..."
     print_step "  Output will be logged to: ${AAP_SETUP_LOG_LOCAL}"
 
-    # SSH in and run setup.sh, capturing output with timestamp
+    # SSH in and run installer entrypoint, capturing output with timestamp.
+    # Entry-point selection:
+    #   1) setup.sh (legacy)
+    #   2) ansible-playbook with auto-detected install playbook + rendered inventory
     {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting AAP setup on ${vm_ip}"
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -i "${AAP_SSH_PRIVATE_KEY}" "root@${vm_ip}" \
-            'cd /root/aap-setup && bash setup.sh 2>&1' || {
+            'set -euo pipefail
+             cd /root/aap-setup
+
+             if [ -x ./setup.sh ]; then
+                 echo "[aap-install] using legacy setup.sh"
+                 exec bash ./setup.sh 2>&1
+             fi
+
+             echo "[aap-install] setup.sh not present; using ansible-playbook entrypoint"
+             command -v ansible-playbook >/dev/null 2>&1 || dnf install -y --nogpgcheck ansible-core
+
+             inv_file="inventory"
+             if [ "${DEMO_MODE:-0}" = "1" ] && [ -f "DEMO-inventory" ]; then
+                 inv_file="DEMO-inventory"
+             elif [ ! -f "${inv_file}" ] && [ -f "inventory-growth" ]; then
+                 inv_file="inventory-growth"
+             fi
+
+             playbook=""
+             for candidate in install.yml setup.yml site.yml playbook.yml playbooks/install.yml; do
+                 if [ -f "${candidate}" ]; then
+                     playbook="${candidate}"
+                     break
+                 fi
+             done
+
+             if [ -z "${playbook}" ]; then
+                 playbook="$(find . -maxdepth 3 -type f \( -name "*install*.yml" -o -name "site.yml" -o -name "setup.yml" \) | head -1)"
+             fi
+
+             if [ -z "${playbook}" ]; then
+                 echo "[aap-install] ERROR: no installer playbook found under /root/aap-setup"
+                 ls -la
+                 find . -maxdepth 3 -type f | sed -n "1,120p"
+                 exit 1
+             fi
+
+             echo "[aap-install] running ansible-playbook -i ${inv_file} ${playbook}"
+             exec ansible-playbook -i "${inv_file}" "${playbook}" 2>&1' || {
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] AAP setup FAILED on ${vm_ip}"
                 return 1
             }
@@ -6718,7 +6759,7 @@ wait_for_aap_api() {
     print_success "AAP API is ready on ${host}."
 }
 
-# After setup.sh completes, pre-create credentials in AAP via REST API
+# After installer completes, pre-create credentials in AAP via REST API
 # using values already stored in ~/.ansible/conf/env.yml.
 create_aap_credentials() {
     [ -n "${AAP_HOSTNAME:-}" ] || {
@@ -7868,9 +7909,14 @@ fi
 
 tar -xzf /root/aap-bundle.tar.gz -C /root/aap-setup --strip-components=1
 rm -f /root/aap-bundle.tar.gz
-if [ ! -x /root/aap-setup/setup.sh ]; then
-    echo "ERROR: AAP bundle extraction failed (missing /root/aap-setup/setup.sh)."
+if [ ! -x /root/aap-setup/setup.sh ] && ! find /root/aap-setup -maxdepth 3 -type f \( -name "*install*.yml" -o -name "site.yml" -o -name "setup.yml" \) | grep -q .; then
+    echo "ERROR: AAP bundle extraction failed (missing setup.sh and no install playbook found)."
     exit 1
+fi
+if [ -x /root/aap-setup/setup.sh ]; then
+    echo "AAP installer entrypoint detected: /root/aap-setup/setup.sh" >> /var/log/aap-setup-ready.log
+else
+    echo "AAP installer entrypoint detected: playbook-driven bundle" >> /var/log/aap-setup-ready.log
 fi
 echo "Bundle extracted. Ready for SSH callback." >> /var/log/aap-setup-ready.log
 
