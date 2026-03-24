@@ -33,3 +33,14 @@ See `CHECKLIST.md` in the repo root for the full secret checklist.
 Treat these files as generated runtime artifacts; if you need persistent changes,
 set values in the vaulted env source (`~/.ansible/conf/env.yml`) instead of editing
 generated files directly.
+
+Current generated Satellite host_vars defaults include:
+
+- `satellite_pre_use_idm` (default-safe behavior is `false` unless explicitly enabled)
+- `ipa_client_dns_servers`
+- `ipa_server_fqdn`
+
+RHIS dependency order remains:
+
+- Build/create: `IdM -> Satellite -> AAP`
+- Config-as-code: `IdM -> Satellite -> AAP`

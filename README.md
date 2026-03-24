@@ -417,9 +417,9 @@ When you choose a libvirt build path, the script:
 2. generates kickstarts
 3. stages the AAP bundle on the host
 4. creates these VMs:
-   - `satellite-618`
-   - `aap-26`
-   - `idm`
+  - `idm`
+  - `satellite-618`
+  - `aap-26`
 5. enables `virsh autostart` for each VM
 6. checks that the three VMs are left in an ON/running state so automation can continue
 
@@ -431,6 +431,25 @@ After provisioning, config-as-code is executed in dependency order:
 
 The AAP callback/install step is deferred until the AAP phase so foundational
 IdM/Satellite phases can proceed first.
+
+### AAP callback progress + fail-fast behavior
+
+While waiting for AAP SSH callback readiness, RHIS now reports live progress with:
+
+- VM state transitions (including power-state changes)
+- detected IP changes
+- SSH reachability transitions
+- periodic progress heartbeat with percent + ETA-style remaining time
+
+If callback state does not progress for a configured timeout window, RHIS now
+fails fast so troubleshooting can begin immediately instead of waiting silently.
+
+Relevant environment controls:
+
+- `AAP_SSH_WAIT_TIMEOUT` (default `5400`)
+- `AAP_SSH_WAIT_INTERVAL` (default `10`)
+- `AAP_SSH_PROGRESS_EVERY` (default `30`)
+- `AAP_SSH_NO_PROGRESS_TIMEOUT` (default `900`)
 
 If a phase fails, the script retries only failed phases once by default.
 
@@ -719,10 +738,23 @@ If provisioning behaves unexpectedly:
 
 When running `ansible-playbook` manually, keep the JSON extra-vars argument quoted as one shell token.
 
+Before any manual re-run, ensure the provisioner container exists and is running:
+
+```bash
+podman ps -a --format '{{.Names}} {{.Status}}' | grep -E '^rhis-provisioner\b' || echo 'Container missing: run menu option 2 first'
+podman start rhis-provisioner >/dev/null 2>&1 || true
+```
+
 Example:
 
 ```bash
 podman exec -it rhis-provisioner ansible-playbook --inventory /rhis/vars/external_inventory/hosts --vault-password-file /rhis/vars/vault/.vaultpass.container --extra-vars @/rhis/vars/vault/env.yml --extra-vars '{"satellite_disconnected":false,"register_to_satellite":false}' --limit idm /rhis/rhis-builder-idm/main.yml
+```
+
+If inventory/admin auth fails, use root-auth fallback explicitly:
+
+```bash
+podman exec -it -e ANSIBLE_CONFIG=/rhis/vars/vault/rhis-ansible.cfg rhis-provisioner ansible-playbook --inventory /rhis/vars/external_inventory/hosts --vault-password-file /rhis/vars/vault/.vaultpass.container --extra-vars @/rhis/vars/vault/env.yml --extra-vars '{"satellite_disconnected":false,"register_to_satellite":false}' -e ansible_user=root -e ansible_password='<ROOT_PASS>' -e ansible_become=false --limit idm /rhis/rhis-builder-idm/main.yml
 ```
 
 If configuration values are wrong, rerun:

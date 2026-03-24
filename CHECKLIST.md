@@ -273,9 +273,13 @@ You can provide most items in one of three ways:
 
 ### Runtime UX tuning (optional)
 
-- [ ] `RHIS_POST_VM_SETTLE_GRACE` (default `300`)
+- [ ] `RHIS_POST_VM_SETTLE_GRACE` (default `650`)
 - [ ] `RHIS_INTERNAL_SSH_WARN_GRACE` (default `600`)
 - [ ] `RHIS_INTERNAL_SSH_LOG_EVERY` (default `60`)
+- [ ] `AAP_SSH_WAIT_TIMEOUT` (default `5400`)
+- [ ] `AAP_SSH_WAIT_INTERVAL` (default `10`)
+- [ ] `AAP_SSH_PROGRESS_EVERY` (default `30`)
+- [ ] `AAP_SSH_NO_PROGRESS_TIMEOUT` (default `900`)
 
 ### Notes
 
@@ -396,6 +400,15 @@ If you want the shortest practical checklist, gather these first:
 
 If you run a playbook manually, keep JSON extra-vars quoted as one shell token:
 
+Before running `podman exec ... rhis-provisioner ...`, make sure the container exists/runs:
+
+```bash
+podman ps -a --format '{{.Names}} {{.Status}}' | grep -E '^rhis-provisioner\b' || echo 'Container missing: run menu option 2 first'
+podman start rhis-provisioner >/dev/null 2>&1 || true
+```
+
 ```bash
 podman exec -it rhis-provisioner ansible-playbook --inventory /rhis/vars/external_inventory/hosts --vault-password-file /rhis/vars/vault/.vaultpass.container --extra-vars @/rhis/vars/vault/env.yml --extra-vars '{"satellite_disconnected":false,"register_to_satellite":false}' --limit idm /rhis/rhis-builder-idm/main.yml
 ```
+
+If inventory/admin auth fails, use root-auth fallback with explicit auth vars.

@@ -43,6 +43,10 @@ RHIS_ANSIBLE_FACT_CACHE_CONTAINER="${RHIS_ANSIBLE_FACT_CACHE_CONTAINER:-/rhis/va
 RHIS_ANSIBLE_FORKS="${RHIS_ANSIBLE_FORKS:-15}"
 RHIS_ANSIBLE_TIMEOUT="${RHIS_ANSIBLE_TIMEOUT:-30}"
 RHIS_ANSIBLE_FACT_CACHE_TIMEOUT="${RHIS_ANSIBLE_FACT_CACHE_TIMEOUT:-86400}"
+RHIS_RUN_LOG_DIR="${RHIS_RUN_LOG_DIR:-/var/log/rhis}"
+RHIS_RUN_LOG_FILE="${RHIS_RUN_LOG_FILE:-}"
+RHIS_LOG_STDIO_REDIRECTED="${RHIS_LOG_STDIO_REDIRECTED:-0}"
+RHIS_RUN_LOG_KEEP_COUNT="${RHIS_RUN_LOG_KEEP_COUNT:-30}"
 
 # Resolve the script's own directory first so it can be used as the default
 # base for all relative paths below.  Users can override any of these by
@@ -94,6 +98,10 @@ RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY="${RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY:-1}"
 # Retry only failed config-as-code phases once (IdM/Satellite/AAP).
 # Set to 0/false/no/off to disable.
 RHIS_RETRY_FAILED_PHASES_ONCE="${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
+# Apply/verify runtime playbook hotfixes inside provisioner container before phase runs.
+RHIS_ENABLE_CONTAINER_HOTFIXES="${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"
+# Fail fast if hotfix verification cannot be confirmed.
+RHIS_ENFORCE_CONTAINER_HOTFIXES="${RHIS_ENFORCE_CONTAINER_HOTFIXES:-1}"
 # Internal SSH readiness wait for config-as-code preflight
 RHIS_INTERNAL_SSH_WAIT_TIMEOUT="${RHIS_INTERNAL_SSH_WAIT_TIMEOUT:-1800}"
 RHIS_INTERNAL_SSH_WAIT_INTERVAL="${RHIS_INTERNAL_SSH_WAIT_INTERVAL:-10}"
@@ -101,6 +109,9 @@ RHIS_POST_VM_SETTLE_GRACE="${RHIS_POST_VM_SETTLE_GRACE:-650}"
 RHIS_INTERNAL_SSH_WARN_GRACE="${RHIS_INTERNAL_SSH_WARN_GRACE:-600}"
 RHIS_INTERNAL_SSH_LOG_EVERY="${RHIS_INTERNAL_SSH_LOG_EVERY:-60}"
 RHC_AUTO_CONNECT="${RHC_AUTO_CONNECT:-1}"
+# If enabled, fail the run when root-to-root SSH mesh cannot be fully established.
+# Default keeps root mesh best-effort while installer-user mesh remains mandatory.
+RHIS_REQUIRE_ROOT_SSH_MESH="${RHIS_REQUIRE_ROOT_SSH_MESH:-0}"
 # Optional pre-flight ad-hoc probes/upgrades before phase playbooks.
 # Default OFF to avoid noisy lockout-prone retries on fresh installs.
 RHIS_ENABLE_PRECHECK_ADHOC="${RHIS_ENABLE_PRECHECK_ADHOC:-0}"
@@ -161,6 +172,7 @@ SAT_LOC="${SAT_LOC:-CORE}"
 IDM_DS_PASS="${IDM_DS_PASS:-}"  # loaded from vault; fallback set in normalize_shared_env_vars
 SATELLITE_DISCONNECTED="${SATELLITE_DISCONNECTED:-false}"
 REGISTER_TO_SATELLITE="${REGISTER_TO_SATELLITE:-false}"
+SATELLITE_PRE_USE_IDM="${SATELLITE_PRE_USE_IDM:-false}"
 IPADM_PASSWORD="${IPADM_PASSWORD:-}"
 IPAADMIN_PASSWORD="${IPAADMIN_PASSWORD:-}"
 CDN_ORGANIZATION_ID="${CDN_ORGANIZATION_ID:-}"
@@ -192,9 +204,22 @@ RHIS_VM_WATCHDOG_PID=""
 # Guardrail: disable AAP SSH callback probing unless explicitly enabled by the
 # VM provisioning/callback workflow path.
 AAP_SSH_CALLBACK_ENABLED="${AAP_SSH_CALLBACK_ENABLED:-0}"
+# Dedicated persistent installer-host key used by RHIS mesh operations.
+# Keeps RHIS traffic isolated from the operator's default ~/.ssh/id_rsa identity.
+RHIS_INSTALLER_SSH_KEY_DIR="${RHIS_INSTALLER_SSH_KEY_DIR:-${HOME}/.ssh/rhis-installer}"
+RHIS_INSTALLER_SSH_PRIVATE_KEY="${RHIS_INSTALLER_SSH_KEY_DIR}/id_rsa"
+RHIS_INSTALLER_SSH_PUBLIC_KEY="${RHIS_INSTALLER_SSH_KEY_DIR}/id_rsa.pub"
+# If enabled, prune/reseed known_hosts entries for RHIS node IPs/hostnames each run.
+RHIS_REFRESH_KNOWN_HOSTS="${RHIS_REFRESH_KNOWN_HOSTS:-1}"
 # Fail fast when SSH port is reachable but key auth repeatedly fails.
 # 18 attempts * 10s = ~3 minutes (after SSH becomes reachable).
 AAP_SSH_KEY_FAIL_FAST_ATTEMPTS="${AAP_SSH_KEY_FAIL_FAST_ATTEMPTS:-18}"
+# AAP callback wait-loop controls
+AAP_SSH_WAIT_TIMEOUT="${AAP_SSH_WAIT_TIMEOUT:-5400}"
+AAP_SSH_WAIT_INTERVAL="${AAP_SSH_WAIT_INTERVAL:-10}"
+AAP_SSH_PROGRESS_EVERY="${AAP_SSH_PROGRESS_EVERY:-30}"
+# If there is no observed callback-stage progress for this long, fail fast.
+AAP_SSH_NO_PROGRESS_TIMEOUT="${AAP_SSH_NO_PROGRESS_TIMEOUT:-900}"
 
 # Function to print colored output
 sanitize_log_message() {
@@ -236,6 +261,126 @@ print_phase() {
     echo -e "${CYAN}[PHASE ${index}/${total}]${NC} ${BOLD}${label}${NC}"
 }
 
+ensure_rhis_installer_ssh_key() {
+    mkdir -p "${RHIS_INSTALLER_SSH_KEY_DIR}" >/dev/null 2>&1 || true
+    chmod 700 "${RHIS_INSTALLER_SSH_KEY_DIR}" >/dev/null 2>&1 || true
+
+    if [ ! -f "${RHIS_INSTALLER_SSH_PRIVATE_KEY}" ]; then
+        ssh-keygen -q -t rsa -b 4096 -N "" -f "${RHIS_INSTALLER_SSH_PRIVATE_KEY}" -C "rhis-installer-host" >/dev/null 2>&1 || return 1
+    fi
+
+    chmod 600 "${RHIS_INSTALLER_SSH_PRIVATE_KEY}" >/dev/null 2>&1 || true
+    chmod 644 "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" >/dev/null 2>&1 || true
+    return 0
+}
+
+refresh_rhis_known_hosts() {
+    local host
+    local -a rhis_hosts
+
+    if ! is_enabled "${RHIS_REFRESH_KNOWN_HOSTS:-1}"; then
+        return 0
+    fi
+
+    [ -d "${HOME}/.ssh" ] || mkdir -p "${HOME}/.ssh" >/dev/null 2>&1 || true
+    touch "${HOME}/.ssh/known_hosts" >/dev/null 2>&1 || true
+    chmod 600 "${HOME}/.ssh/known_hosts" >/dev/null 2>&1 || true
+
+    rhis_hosts=(
+        "${SAT_IP:-}" "${AAP_IP:-}" "${IDM_IP:-}"
+        "${SAT_HOSTNAME:-}" "${AAP_HOSTNAME:-}" "${IDM_HOSTNAME:-}"
+    )
+
+    for host in "${rhis_hosts[@]}"; do
+        [ -n "${host}" ] || continue
+        ssh-keygen -R "${host}" -f "${HOME}/.ssh/known_hosts" >/dev/null 2>&1 || true
+        ssh-keyscan -H -T 3 "${host}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null || true
+    done
+}
+
+init_rhis_run_logging() {
+    local run_ts target_dir log_file
+
+    # Idempotent guard for re-entry.
+    if [ "${RHIS_LOG_STDIO_REDIRECTED:-0}" = "1" ]; then
+        return 0
+    fi
+
+    target_dir="${RHIS_RUN_LOG_DIR:-/var/log/rhis}"
+    run_ts="$(date +%Y%m%d-%H%M%S)"
+    log_file="${target_dir}/rhis_install_${run_ts}_pid$$.log"
+
+    # Ensure /var/log/rhis exists; requires elevated permissions on most systems.
+    if [ ! -d "${target_dir}" ]; then
+        if ! sudo mkdir -p "${target_dir}" 2>/dev/null; then
+            print_warning "Could not create ${target_dir}; run logging disabled for this invocation."
+            return 0
+        fi
+    fi
+
+    sudo chown "${USER}:${USER}" "${target_dir}" >/dev/null 2>&1 || true
+    sudo chmod 0755 "${target_dir}" >/dev/null 2>&1 || true
+
+    if ! touch "${log_file}" 2>/dev/null; then
+        if ! sudo touch "${log_file}" 2>/dev/null; then
+            print_warning "Could not create run log file at ${log_file}; run logging disabled for this invocation."
+            return 0
+        fi
+    fi
+
+    sudo chown "${USER}:${USER}" "${log_file}" >/dev/null 2>&1 || true
+    sudo chmod 0644 "${log_file}" >/dev/null 2>&1 || true
+
+    RHIS_RUN_LOG_FILE="${log_file}"
+    export RHIS_RUN_LOG_FILE
+    export RHIS_LOG_STDIO_REDIRECTED=1
+
+    # Mirror all script output to console and a per-run logfile.
+    exec > >(tee -a "${RHIS_RUN_LOG_FILE}") 2>&1
+
+    ln -sfn "${RHIS_RUN_LOG_FILE}" "${target_dir}/latest.log" >/dev/null 2>&1 || true
+    print_step "RHIS run logging enabled: ${RHIS_RUN_LOG_FILE}"
+
+    prune_rhis_run_logs || true
+}
+
+prune_rhis_run_logs() {
+    local target_dir keep_count
+    local -a run_logs
+    local i
+
+    target_dir="${RHIS_RUN_LOG_DIR:-/var/log/rhis}"
+    keep_count="${RHIS_RUN_LOG_KEEP_COUNT:-30}"
+
+    case "${keep_count}" in
+        ''|*[!0-9]*)
+            print_warning "Invalid RHIS_RUN_LOG_KEEP_COUNT='${keep_count}'; skipping log pruning."
+            return 0
+            ;;
+    esac
+
+    [ "${keep_count}" -ge 1 ] || {
+        print_warning "RHIS_RUN_LOG_KEEP_COUNT must be >= 1; skipping log pruning."
+        return 0
+    }
+
+    [ -d "${target_dir}" ] || return 0
+
+    # Newest first by mtime, only per-run RHIS installer logs.
+    mapfile -t run_logs < <(ls -1t "${target_dir}"/rhis_install_*.log 2>/dev/null || true)
+
+    if [ "${#run_logs[@]}" -le "${keep_count}" ]; then
+        return 0
+    fi
+
+    for (( i=keep_count; i<${#run_logs[@]}; i++ )); do
+        rm -f "${run_logs[$i]}" >/dev/null 2>&1 || sudo rm -f "${run_logs[$i]}" >/dev/null 2>&1 || true
+    done
+
+    print_step "Pruned RHIS run logs; kept newest ${keep_count} file(s) in ${target_dir}."
+    return 0
+}
+
 print_usage() {
     cat <<EOF
 Usage: $(basename "$0") [options]
@@ -258,6 +403,10 @@ Options:
   --demokill               Destroy demo VMs/files/temp locks and exit (CLI-only)
   (env) RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY=0  Disable auto config after menu option 2
   (env) RHIS_RETRY_FAILED_PHASES_ONCE=0       Disable automatic retry of failed phases
+    (env) RHIS_ENABLE_CONTAINER_HOTFIXES=0      Disable runtime role hotfix patching in container
+    (env) RHIS_ENFORCE_CONTAINER_HOTFIXES=0     Do not fail when hotfix verification cannot be confirmed
+        (env) RHIS_REFRESH_KNOWN_HOSTS=0            Do not refresh RHIS node host keys in ~/.ssh/known_hosts
+        (env) RHIS_INSTALLER_SSH_KEY_DIR=<path>     Override dedicated persistent RHIS installer SSH key directory
     (env) RHC_AUTO_CONNECT=0                    Disable automatic rhc connect in guest kickstarts
   --help                   Show this help message
 EOF
@@ -634,6 +783,11 @@ print_runtime_configuration() {
     echo "  RHIS_ANSIBLE_FACT_CACHE_HOST=${RHIS_ANSIBLE_FACT_CACHE_HOST}"
     echo "  AAP_ANSIBLE_LOG=${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
     echo "  RHIS_RETRY_FAILED_PHASES_ONCE=${RHIS_RETRY_FAILED_PHASES_ONCE:-1}"
+    echo "  RHIS_ENABLE_CONTAINER_HOTFIXES=${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"
+    echo "  RHIS_ENFORCE_CONTAINER_HOTFIXES=${RHIS_ENFORCE_CONTAINER_HOTFIXES:-1}"
+    echo "  RHIS_REQUIRE_ROOT_SSH_MESH=${RHIS_REQUIRE_ROOT_SSH_MESH:-0}"
+    echo "  RHIS_REFRESH_KNOWN_HOSTS=${RHIS_REFRESH_KNOWN_HOSTS:-1}"
+    echo "  RHIS_INSTALLER_SSH_KEY_DIR=${RHIS_INSTALLER_SSH_KEY_DIR:-'(unset)'}"
     echo "  RHIS_ENABLE_PRECHECK_ADHOC=${RHIS_ENABLE_PRECHECK_ADHOC:-0}"
     echo "  RHC_AUTO_CONNECT=${RHC_AUTO_CONNECT:-1}"
     echo "  NETWORKS_ACTIVE=SAT(${SAT_IP:-10.168.128.1}/${SAT_NETMASK:-255.255.0.0} gw:${SAT_GW:-10.168.0.1}) AAP(${AAP_IP:-10.168.128.2}/${AAP_NETMASK:-255.255.0.0} gw:${AAP_GW:-10.168.0.1}) IDM(${IDM_IP:-10.168.128.3}/${IDM_NETMASK:-255.255.0.0} gw:${IDM_GW:-10.168.0.1})"
@@ -1284,6 +1438,15 @@ normalize_shared_env_vars() {
             ;;
         *)
             REGISTER_TO_SATELLITE="false"
+            ;;
+    esac
+
+    case "${SATELLITE_PRE_USE_IDM:-false}" in
+        1|true|TRUE|yes|YES|on|ON)
+            SATELLITE_PRE_USE_IDM="true"
+            ;;
+        *)
+            SATELLITE_PRE_USE_IDM="false"
             ;;
     esac
 
@@ -2103,6 +2266,260 @@ ensure_container_collection_compat() {
     return 0
 }
 
+# Maintain RHIS-managed hotfixes inside the provisioner container so each newly
+# deployed container gets the same compatibility/workaround patches before any
+# playbooks are executed.
+ensure_container_managed_chrony_template() {
+    local _tpl_path="/rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2"
+    local _mk_cmd='mkdir -p /rhis/rhis-builder-satellite/roles/satellite_pre/templates && cat > /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 <<'"'"'EOF'"'"'
+# RHIS fallback chrony template (auto-generated when upstream template is missing)
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+pool 2.rhel.pool.ntp.org iburst
+EOF'
+
+    if podman exec "${RHIS_CONTAINER_NAME}" test -f "${_tpl_path}" 2>/dev/null; then
+        return 0
+    fi
+
+    print_warning "Managed container patch: chrony.j2 missing; applying fallback template."
+
+    if podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_mk_cmd}" >/dev/null 2>&1 || \
+       podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_mk_cmd}" >/dev/null 2>&1; then
+        print_success "Managed container patch applied: fallback chrony.j2 created."
+        return 0
+    fi
+
+    print_warning "Managed container patch failed: could not create fallback chrony.j2."
+    return 1
+}
+
+ensure_container_managed_satellite_foreman_patch() {
+    local _root="/rhis/rhis-builder-satellite/roles/satellite_pre/tasks"
+    local _py='import pathlib
+import re
+
+root = pathlib.Path("/rhis/rhis-builder-satellite/roles/satellite_pre/tasks")
+if not root.exists():
+    print("MISSING_TASKS_DIR")
+    raise SystemExit(0)
+
+updated = 0
+for path in root.rglob("*.yml"):
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if "Get the state of the foreman service" not in text:
+        continue
+
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if "Get the state of the foreman service" in line:
+            start = i
+            break
+    if start is None:
+        continue
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^\s*-\s+name:\s+", lines[j]):
+            end = j
+            break
+
+    register_idx = None
+    changed_idx = None
+    failed_idx = None
+    indent = "      "
+
+    for j in range(start + 1, end):
+        if re.match(r"^\s*register:\s*", lines[j]):
+            register_idx = j
+            indent = re.match(r"^(\s*)", lines[j]).group(1)
+        if re.match(r"^\s*changed_when:\s*", lines[j]):
+            changed_idx = j
+            indent = re.match(r"^(\s*)", lines[j]).group(1)
+        if re.match(r"^\s*failed_when:\s*", lines[j]):
+            failed_idx = j
+            indent = re.match(r"^(\s*)", lines[j]).group(1)
+
+    changed = False
+
+    if changed_idx is not None:
+        normalized = f"{indent}changed_when: false"
+        if lines[changed_idx].strip() != "changed_when: false":
+            lines[changed_idx] = normalized
+            changed = True
+    else:
+        insert_at = register_idx + 1 if register_idx is not None else end
+        lines.insert(insert_at, f"{indent}changed_when: false")
+        changed_idx = insert_at
+        end += 1
+        changed = True
+
+    if failed_idx is None:
+        lines.insert(changed_idx + 1, f"{indent}failed_when: false")
+        changed = True
+    elif lines[failed_idx].strip() != "failed_when: false":
+        lines[failed_idx] = f"{indent}failed_when: false"
+        changed = True
+
+    if changed:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        updated += 1
+
+print(f"UPDATED={updated}")'
+
+    local _cmd=$'python3 - <<\'PY\'\n'"${_py}"$'\nPY'
+    local _out=""
+
+    _out="$(podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+    if [ -z "${_out}" ]; then
+        _out="$(podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+    fi
+
+    if printf '%s\n' "${_out}" | grep -q 'UPDATED='; then
+        if printf '%s\n' "${_out}" | grep -q 'UPDATED=0'; then
+            print_step "Managed container patch: Satellite foreman service check already compatible or absent."
+        else
+            print_success "Managed container patch applied: Satellite foreman service check made non-fatal."
+        fi
+        return 0
+    fi
+
+    print_warning "Managed container patch failed: could not confirm Satellite foreman service compatibility patch."
+    return 1
+}
+
+ensure_container_managed_idm_update_patch() {
+    local _py='import pathlib
+import re
+
+path = pathlib.Path("/rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml")
+if not path.exists():
+    print("MISSING_IDM_UPDATE_TASK")
+    raise SystemExit(0)
+
+lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+updated = False
+
+start = None
+for i, line in enumerate(lines):
+    if "name: \"Update the system\"" in line:
+        start = i
+        break
+
+if start is None:
+    print("UPDATED=0")
+    raise SystemExit(0)
+
+end = len(lines)
+for j in range(start + 1, len(lines)):
+    if re.match(r"^\s*-\s+name:\s+", lines[j]):
+        end = j
+        break
+
+module_idx = None
+module_indent = ""
+async_idx = None
+disable_idx = None
+exclude_idx = None
+
+for j in range(start + 1, end):
+    if re.match(r"^\s*ansible\.builtin\.dnf:\s*$", lines[j]):
+        module_idx = j
+        module_indent = re.match(r"^(\s*)", lines[j]).group(1)
+    if re.match(r"^\s*async:\s*", lines[j]) and async_idx is None:
+        async_idx = j
+    if re.match(r"^\s*disable_gpg_check:\s*", lines[j]):
+        disable_idx = j
+    if re.match(r"^\s*exclude:\s*", lines[j]):
+        exclude_idx = j
+
+if module_idx is None:
+    print("UPDATED=0")
+    raise SystemExit(0)
+
+arg_indent = module_indent + "  "
+
+if disable_idx is not None:
+    desired = f"{arg_indent}disable_gpg_check: true"
+    if lines[disable_idx].strip() != "disable_gpg_check: true":
+        lines[disable_idx] = desired
+        updated = True
+
+if exclude_idx is not None:
+    desired = f"{arg_indent}exclude: \"intel-audio-firmware*\""
+    if lines[exclude_idx].strip() != "exclude: \"intel-audio-firmware*\"":
+        lines[exclude_idx] = desired
+        updated = True
+
+insert_at = async_idx if async_idx is not None else end
+
+if disable_idx is None:
+    lines.insert(insert_at, f"{arg_indent}disable_gpg_check: true")
+    updated = True
+    insert_at += 1
+
+if exclude_idx is None:
+    lines.insert(insert_at, f"{arg_indent}exclude: \"intel-audio-firmware*\"")
+    updated = True
+
+if updated:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("UPDATED=1")
+else:
+    print("UPDATED=0")'
+
+    local _cmd=$'python3 - <<\'PY\'\n'"${_py}"$'\nPY'
+    local _out=""
+    _out="$(podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+    if [ -z "${_out}" ]; then
+        _out="$(podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+    fi
+
+    if printf '%s\n' "${_out}" | grep -q 'UPDATED=1'; then
+        print_success "Managed container patch applied: IdM update task GPG guard enabled."
+        return 0
+    fi
+    if printf '%s\n' "${_out}" | grep -q 'UPDATED=0'; then
+        print_step "Managed container patch: IdM update task already compatible or absent."
+        return 0
+    fi
+
+    print_warning "Managed container patch failed: could not confirm IdM update task patch."
+    return 1
+}
+
+apply_managed_container_patches() {
+    local _verify_cmd='test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 && grep -q "failed_when: false" /rhis/rhis-builder-satellite/roles/satellite_pre/tasks/is_satellite_installed.yml && grep -q "disable_gpg_check: true" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml && grep -q "exclude: \"intel-audio-firmware\\*\"" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml'
+
+    if ! is_enabled "${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"; then
+        print_step "Managed container patches disabled (RHIS_ENABLE_CONTAINER_HOTFIXES=${RHIS_ENABLE_CONTAINER_HOTFIXES})."
+        return 0
+    fi
+
+    print_step "Applying RHIS-managed patches to provisioner container components"
+
+    ensure_container_managed_chrony_template || true
+    ensure_container_managed_satellite_foreman_patch || true
+    ensure_container_managed_idm_update_patch || true
+
+    if podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_verify_cmd}" >/dev/null 2>&1 || \
+       podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_verify_cmd}" >/dev/null 2>&1; then
+        print_success "Managed container patch verification passed."
+        return 0
+    fi
+
+    if is_enabled "${RHIS_ENFORCE_CONTAINER_HOTFIXES:-1}"; then
+        print_warning "Managed container patch verification failed and enforcement is ON."
+        return 1
+    fi
+
+    print_warning "Managed container patch verification failed, but enforcement is OFF; continuing."
+    return 0
+}
+
 ensure_container_running() {
     # Auto-generate required host mount directories for runtime artifacts.
     mkdir -p "${RHIS_INVENTORY_DIR}" "${RHIS_HOST_VARS_DIR}" "${ANSIBLE_ENV_DIR}" || {
@@ -2119,6 +2536,7 @@ ensure_container_running() {
            | grep -q "^${RHIS_CONTAINER_NAME}$"; then
         print_success "RHIS provisioner container '${RHIS_CONTAINER_NAME}' is already running."
         ensure_container_collection_compat || true
+        apply_managed_container_patches || return 1
         return 0
     fi
 
@@ -2141,6 +2559,7 @@ ensure_container_running() {
         "${RHIS_CONTAINER_IMAGE}"
 
     ensure_container_collection_compat || true
+    apply_managed_container_patches || return 1
     print_success "Container '${RHIS_CONTAINER_NAME}' started."
     echo "Exec into the container : podman exec -it ${RHIS_CONTAINER_NAME} /bin/bash"
     echo "Ansible config file     : ${RHIS_ANSIBLE_CFG_HOST}"
@@ -2439,6 +2858,7 @@ run_deferred_aap_callback() {
     AAP_SSH_CALLBACK_ENABLED=1
     print_step "AAP VM is installing. SSH callback will begin as soon as the VM is reachable."
     print_step "Grab a cup of coffee and sit back, or come back after lunch — we will continue to configure this environment while you wait."
+    print_step "Live monitor is active: you will see AAP callback progress (percent + ETA). If no state progress is detected, this step will fail fast for troubleshooting."
 
     if run_aap_setup_on_vm "aap-26"; then
         print_success "AAP setup orchestration complete via SSH callback."
@@ -2584,6 +3004,7 @@ INVENTORY_EOF
 # /rhis/vars/vault/env.yml (decrypted by --vault-password-file automatically).
 generate_rhis_host_vars() {
     mkdir -p "${RHIS_HOST_VARS_DIR}" || return 1
+    local sat_pre_use_idm_value="${SATELLITE_PRE_USE_IDM:-false}"
 
     # Installer / controller host
     cat > "${RHIS_HOST_VARS_DIR}/installer.yml" <<EOF
@@ -2604,7 +3025,9 @@ ansible_connection: ssh
 ansible_ssh_private_key_file: "/home/{{ lookup('env', 'USER') | default('root') }}/.ssh/id_rsa"
 satellite_organization: "${SAT_ORG:-REDHAT}"
 satellite_location: "${SAT_LOC:-CORE}"
-satellite_pre_use_idm: true
+satellite_pre_use_idm: ${sat_pre_use_idm_value}
+ipa_client_dns_servers: "${IDM_IP:-10.168.128.3}"
+ipa_server_fqdn: "${IDM_HOSTNAME:-idm.${DOMAIN:-localdomain}}"
 EOF
 
     # AAP
@@ -2694,6 +3117,20 @@ run_rhis_config_as_code() {
 
     load_ansible_env_file || true
     normalize_shared_env_vars
+
+    # Re-sync installer/user/root trust before entering phase playbooks.
+    # This is intentionally best-effort here because some nodes may still be
+    # converging; phase auth fallback remains the final safety net.
+    print_step "Pre-flight: refreshing RHIS SSH trust baseline before config-as-code"
+    if ! setup_rhis_ssh_mesh; then
+        print_warning "SSH trust baseline refresh did not fully converge; continuing with phase auth fallback logic."
+    fi
+
+    # Ensure root auth fallback path is reliable even on reruns where guest-side
+    # passwords drifted from current vault values.
+    print_step "Pre-flight: normalizing VM root passwords for auth fallback reliability"
+    fix_vm_root_passwords || print_warning "Root password pre-flight normalization did not complete cleanly; continuing."
+
     generate_rhis_inventory     || { print_warning "Inventory generation failed; skipping config-as-code."; return 1; }
     generate_rhis_host_vars     || { print_warning "host_vars generation failed; skipping config-as-code."; return 1; }
     print_step "Phase gate: waiting only for IdM and Satellite so foundational services can proceed first"
@@ -2772,9 +3209,11 @@ run_rhis_config_as_code() {
     fi
 
     local inv="--inventory /rhis/vars/external_inventory/hosts"
-    local sat_pre_use_idm="${SATELLITE_PRE_USE_IDM:-true}"
+    local sat_pre_use_idm="${SATELLITE_PRE_USE_IDM:-false}"
     local idm_async_timeout="${IDM_ASYNC_TIMEOUT:-14400}"
     local idm_async_delay="${IDM_ASYNC_DELAY:-15}"
+    local sat_ipa_dns="${IDM_IP:-10.168.128.3}"
+    local sat_ipa_fqdn="${IDM_HOSTNAME:-idm.${DOMAIN:-localdomain}}"
     local evars="--extra-vars @${vault_file} --extra-vars {\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}"
     local manual_evars="--extra-vars @${vault_file} --extra-vars '{\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}'"
     local manual_vault_arg="${vault_arg[*]}"
@@ -2790,8 +3229,9 @@ run_rhis_config_as_code() {
     fi
 
     # Satellite: supply sat_repository_ids, firewall settings, and CDN registration vars
-    local _sat_manual_json="{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm}}"
+    local _sat_manual_json="{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"ipa_client_dns_servers\":\"${sat_ipa_dns}\",\"ipa_server_fqdn\":\"${sat_ipa_fqdn}\"}"
     local manual_satellite_extras="--extra-vars '${_sat_manual_json}'"
+    local manual_podman_env="-e ANSIBLE_CONFIG=${RHIS_ANSIBLE_CFG_CONTAINER}"
 
     ensure_satellite_chrony_template() {
         local _tpl_path="/rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2"
@@ -2897,7 +3337,7 @@ for path in root.rglob("*.yml"):
 
 print(f"UPDATED={updated}")'
 
-        local _cmd="python3 - <<'PY'\n${_py}\nPY"
+        local _cmd=$'python3 - <<\'PY\'\n'"${_py}"$'\nPY'
         local _out=""
 
         _out="$(podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
@@ -2918,6 +3358,134 @@ print(f"UPDATED={updated}")'
         return 1
     }
 
+    ensure_idm_update_task_nogpgcheck() {
+        local _py='import pathlib
+import re
+
+path = pathlib.Path("/rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml")
+if not path.exists():
+    print("MISSING_IDM_UPDATE_TASK")
+    raise SystemExit(0)
+
+lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+updated = False
+
+start = None
+for i, line in enumerate(lines):
+    if "name: \"Update the system\"" in line:
+        start = i
+        break
+
+if start is None:
+    print("UPDATED=0")
+    raise SystemExit(0)
+
+end = len(lines)
+for j in range(start + 1, len(lines)):
+    if re.match(r"^\s*-\s+name:\s+", lines[j]):
+        end = j
+        break
+
+module_idx = None
+module_indent = ""
+async_idx = None
+disable_idx = None
+exclude_idx = None
+
+for j in range(start + 1, end):
+    if re.match(r"^\s*ansible\.builtin\.dnf:\s*$", lines[j]):
+        module_idx = j
+        module_indent = re.match(r"^(\s*)", lines[j]).group(1)
+    if re.match(r"^\s*async:\s*", lines[j]) and async_idx is None:
+        async_idx = j
+    if re.match(r"^\s*disable_gpg_check:\s*", lines[j]):
+        disable_idx = j
+    if re.match(r"^\s*exclude:\s*", lines[j]):
+        exclude_idx = j
+
+if module_idx is None:
+    print("UPDATED=0")
+    raise SystemExit(0)
+
+arg_indent = module_indent + "  "
+
+if disable_idx is not None:
+    desired = f"{arg_indent}disable_gpg_check: true"
+    if lines[disable_idx].strip() != "disable_gpg_check: true":
+        lines[disable_idx] = desired
+        updated = True
+
+if exclude_idx is not None:
+    desired = f"{arg_indent}exclude: \"intel-audio-firmware*\""
+    if lines[exclude_idx].strip() != "exclude: \"intel-audio-firmware*\"":
+        lines[exclude_idx] = desired
+        updated = True
+
+insert_at = async_idx if async_idx is not None else end
+
+if disable_idx is None:
+    lines.insert(insert_at, f"{arg_indent}disable_gpg_check: true")
+    updated = True
+    insert_at += 1
+
+if exclude_idx is None:
+    lines.insert(insert_at, f"{arg_indent}exclude: \"intel-audio-firmware*\"")
+    updated = True
+
+if updated:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("UPDATED=1")
+else:
+    print("UPDATED=0")'
+
+        local _cmd=$'python3 - <<\'PY\'\n'"${_py}"$'\nPY'
+        local _out=""
+        _out="$(podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+        if [ -z "${_out}" ]; then
+            _out="$(podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_cmd}" 2>/dev/null || true)"
+        fi
+
+        if printf '%s\n' "${_out}" | grep -q 'UPDATED=1'; then
+            print_success "Patched idm_pre update task to bypass problematic GPG signature checks."
+            return 0
+        fi
+        if printf '%s\n' "${_out}" | grep -q 'UPDATED=0'; then
+            print_step "idm_pre update task patch: already compatible or task not present."
+            return 0
+        fi
+
+        print_warning "Could not confirm idm_pre update task patch; continuing."
+        return 1
+    }
+
+    ensure_container_playbook_hotfixes() {
+        local _verify_cmd='grep -q "failed_when: false" /rhis/rhis-builder-satellite/roles/satellite_pre/tasks/is_satellite_installed.yml && grep -q "disable_gpg_check: true" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml && grep -q "exclude: \"intel-audio-firmware\\*\"" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml'
+        local _verified=1
+
+        print_step "Pre-flight: applying container role hotfixes"
+
+        ensure_satellite_foreman_service_check_nonfatal || true
+        ensure_idm_update_task_nogpgcheck || true
+
+        if podman exec "${RHIS_CONTAINER_NAME}" bash -lc "${_verify_cmd}" >/dev/null 2>&1 || \
+           podman exec --user 0 "${RHIS_CONTAINER_NAME}" bash -lc "${_verify_cmd}" >/dev/null 2>&1; then
+            _verified=0
+        fi
+
+        if [ "${_verified}" -eq 0 ]; then
+            print_success "Container hotfix verification passed (Satellite foreman + IdM GPG update guards)."
+            return 0
+        fi
+
+        if is_enabled "${RHIS_ENFORCE_CONTAINER_HOTFIXES:-1}"; then
+            print_warning "Container hotfix verification failed and enforcement is ON; stopping before phase playbooks."
+            return 1
+        fi
+
+        print_warning "Container hotfix verification failed, but enforcement is OFF; continuing."
+        return 0
+    }
+
     if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
         manual_satellite_extras+=" -e cdn_organization_id=${CDN_ORGANIZATION_ID} -e cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}"
     else
@@ -2926,11 +3494,18 @@ print(f"UPDATED={updated}")'
     if ! ensure_satellite_chrony_template; then
         manual_satellite_extras+=" --skip-tags tags_satellite_pre_chrony"
     fi
-    ensure_satellite_foreman_service_check_nonfatal || true
+    if is_enabled "${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"; then
+        ensure_container_playbook_hotfixes || return 1
+    fi
 
     print_manual_rerun_template() {
         print_warning "Manual rerun template (works for all groups):"
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+        print_warning "  # Ensure the provisioner container exists/runs before re-run"
+        print_warning "  podman ps -a --format '{{.Names}} {{.Status}}' | grep -E '^${RHIS_CONTAINER_NAME}\\b' || echo 'Container missing: run menu option 2 first'"
+        print_warning "  podman start ${RHIS_CONTAINER_NAME} >/dev/null 2>&1 || true"
+        print_warning "  podman exec -it ${manual_podman_env} ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+        print_warning "  # Root-auth fallback template (when admin/inventory auth fails)"
+        print_warning "  podman exec -it ${manual_podman_env} ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} -e ansible_user=root -e ansible_password='<ROOT_PASS>' -e ansible_become=false --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
     }
 
     print_step "Ansible log: ${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}"
@@ -2953,12 +3528,15 @@ print(f"UPDATED={updated}")'
         # rhc-worker-playbook but GPG validation fails on RHEL 10 CDN packages;
         # the package is pre-installed by ensure_core_role_packages_on_managed_nodes.
         if [ "${phase_limit}" = "idm" ]; then
+            if is_enabled "${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"; then
+                ensure_idm_update_task_nogpgcheck || true
+            fi
             phase_args+=( --extra-vars "{\"rhc_insights\":{\"remediation\":\"absent\"},\"idm_repository_ids\":${IDM_REPOSITORY_IDS_JSON},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}" )
         fi
 
         # Satellite collection expects sat_repository_ids and (optionally) CDN activation vars.
         if [ "${phase_limit}" = "scenario_satellite" ]; then
-            phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm}}" )
+            phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"ipa_client_dns_servers\":\"${sat_ipa_dns}\",\"ipa_server_fqdn\":\"${sat_ipa_fqdn}\"}" )
             if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
                 phase_args+=( -e "cdn_organization_id=${CDN_ORGANIZATION_ID}" )
                 phase_args+=( -e "cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}" )
@@ -2970,7 +3548,9 @@ print(f"UPDATED={updated}")'
                 phase_args+=( --skip-tags "tags_satellite_pre_chrony" )
                 print_warning "chrony.j2 is missing in rhis-builder-satellite; skipping tags_satellite_pre_chrony for this run."
             fi
-            ensure_satellite_foreman_service_check_nonfatal || true
+            if is_enabled "${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"; then
+                ensure_satellite_foreman_service_check_nonfatal || true
+            fi
         fi
 
         print_step "${phase_label}"
@@ -3002,10 +3582,13 @@ print(f"UPDATED={updated}")'
             fallback_phase_args+=( -e "ipaadmin_password=${IPAADMIN_PASSWORD:-${IPADM_PASSWORD}}" )
         fi
         if [ "${phase_limit}" = "idm" ]; then
+            if is_enabled "${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"; then
+                ensure_idm_update_task_nogpgcheck || true
+            fi
             fallback_phase_args+=( --extra-vars "{\"rhc_insights\":{\"remediation\":\"absent\"},\"idm_repository_ids\":${IDM_REPOSITORY_IDS_JSON},\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}" )
         fi
         if [ "${phase_limit}" = "scenario_satellite" ]; then
-            fallback_phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm}}" )
+            fallback_phase_args+=( --extra-vars "{\"sat_repository_ids\":${SAT_REPOSITORY_IDS_JSON},\"sat_firewalld_zone\":\"${SAT_FIREWALLD_ZONE}\",\"sat_firewalld_interface\":\"${SAT_FIREWALLD_INTERFACE}\",\"sat_firewalld_services\":${SAT_FIREWALLD_SERVICES_JSON},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"ipa_client_dns_servers\":\"${sat_ipa_dns}\",\"ipa_server_fqdn\":\"${sat_ipa_fqdn}\"}" )
             if [ -n "${CDN_ORGANIZATION_ID:-}" ] && [ -n "${CDN_SAT_ACTIVATION_KEY:-}" ]; then
                 fallback_phase_args+=( -e "cdn_organization_id=${CDN_ORGANIZATION_ID}" )
                 fallback_phase_args+=( -e "cdn_sat_activation_key=${CDN_SAT_ACTIVATION_KEY}" )
@@ -3017,7 +3600,9 @@ print(f"UPDATED={updated}")'
                 fallback_phase_args+=( --skip-tags "tags_satellite_pre_chrony" )
                 print_warning "chrony.j2 is missing in rhis-builder-satellite; skipping tags_satellite_pre_chrony for fallback run."
             fi
-            ensure_satellite_foreman_service_check_nonfatal || true
+            if is_enabled "${RHIS_ENABLE_CONTAINER_HOTFIXES:-1}"; then
+                ensure_satellite_foreman_service_check_nonfatal || true
+            fi
         fi
 
         phase_auth_fallback_status="not-needed"
@@ -3427,7 +4012,10 @@ print(f"UPDATED={updated}")'
         # overriding the global dnf.conf setting written during kickstart.
         ensure_idm_gpg_keys() {
             local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
-            local gpg_shell='if [ -d /etc/pki/rpm-gpg ]; then for k in /etc/pki/rpm-gpg/*; do [ -f "$k" ] && rpm --import "$k" 2>/dev/null || true; done; fi; if ls /etc/yum.repos.d/*.repo >/dev/null 2>&1; then sed -i "s/^gpgcheck=1/gpgcheck=0/" /etc/yum.repos.d/*.repo 2>/dev/null || true; fi; grep -q "^gpgcheck=0" /etc/dnf/dnf.conf 2>/dev/null || printf "gpgcheck=0\nrepo_gpgcheck=0\nlocalpkg_gpgcheck=0\n" >> /etc/dnf/dnf.conf 2>/dev/null || true'
+            # Fix: use s/^gpgcheck=.*/gpgcheck=0/ to catch any existing value (not just =1),
+            # sed-replace in dnf.conf instead of appending (dnf uses first occurrence wins),
+            # and create a drop-in override for both dnf and dnf5 (RHEL 10).
+            local gpg_shell='if [ -d /etc/pki/rpm-gpg ]; then for k in /etc/pki/rpm-gpg/*; do [ -f "$k" ] && rpm --import "$k" 2>/dev/null || true; done; fi; if ls /etc/yum.repos.d/*.repo >/dev/null 2>&1; then sed -i "s/^gpgcheck=.*/gpgcheck=0/" /etc/yum.repos.d/*.repo 2>/dev/null || true; sed -i "s/^repo_gpgcheck=.*/repo_gpgcheck=0/" /etc/yum.repos.d/*.repo 2>/dev/null || true; fi; for _conf in /etc/dnf/dnf.conf /etc/dnf5/dnf.conf; do [ -f "$_conf" ] || continue; sed -i "s/^gpgcheck=.*/gpgcheck=0/" "$_conf" 2>/dev/null || true; grep -q "^gpgcheck=" "$_conf" || printf "\ngpgcheck=0\n" >> "$_conf" 2>/dev/null || true; done; for _d in /etc/dnf/dnf.conf.d /etc/dnf5/dnf.conf.d; do [ -d "$_d" ] || mkdir -p "$_d" 2>/dev/null || true; printf "[main]\ngpgcheck=0\nrepo_gpgcheck=0\nlocalpkg_gpgcheck=0\nexclude=intel-audio-firmware*\n" > "$_d/rhis-disable-gpgcheck.conf" 2>/dev/null || true; done'
 
             [ -n "$root_auth_pass" ] || { print_warning "Skipping IdM GPG pre-flight: ROOT_PASS/ADMIN_PASS is unset."; return 0; }
 
@@ -3755,7 +4343,7 @@ print(f"UPDATED={updated}")'
         dump_idm_network_diagnostics || true
         print_warning "You can re-run manually:"
         print_manual_rerun_template
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} ${manual_idm_extras} --limit idm /rhis/rhis-builder-idm/main.yml"
+        print_warning "  podman exec -it ${manual_podman_env} ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} ${manual_idm_extras} --limit idm /rhis/rhis-builder-idm/main.yml"
     else
         idm_auth_fallback_status="${phase_auth_fallback_status}"
         idm_status="success"
@@ -3776,7 +4364,7 @@ print(f"UPDATED={updated}")'
         dump_satellite_rhsm_diagnostics || true
         print_warning "You can re-run manually:"
         print_manual_rerun_template
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} ${manual_satellite_extras} --limit scenario_satellite /rhis/rhis-builder-satellite/main.yml"
+        print_warning "  podman exec -it ${manual_podman_env} ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} ${manual_satellite_extras} --limit scenario_satellite /rhis/rhis-builder-satellite/main.yml"
     else
         satellite_auth_fallback_status="${phase_auth_fallback_status}"
         satellite_status="success"
@@ -3805,7 +4393,7 @@ print(f"UPDATED={updated}")'
         print_warning "AAP config-as-code failed.  Check the output above."
         print_warning "You can re-run manually:"
         print_manual_rerun_template
-        print_warning "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit aap /rhis/rhis-builder-aap/main.yml"
+        print_warning "  podman exec -it ${manual_podman_env} ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit aap /rhis/rhis-builder-aap/main.yml"
     else
         aap_auth_fallback_status="${phase_auth_fallback_status}"
         aap_status="success"
@@ -3868,7 +4456,7 @@ print(f"UPDATED={updated}")'
     echo ""
     echo "To re-run any component:"
     echo "  podman exec -it ${RHIS_CONTAINER_NAME} /bin/bash"
-    echo "  podman exec -it ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
+    echo "  podman exec -it ${manual_podman_env} ${RHIS_CONTAINER_NAME} ansible-playbook ${inv} ${manual_vault_arg} ${manual_evars} --limit <GROUP> /rhis/rhis-builder-<COMPONENT>/main.yml"
 
     cleanup_staged_vaultpass
 
@@ -4147,6 +4735,7 @@ load_ansible_env_file() {
     _load_env_key AAP_ADMIN_PASS   aap_admin_pass
     _load_env_key SATELLITE_DISCONNECTED satellite_disconnected
     _load_env_key REGISTER_TO_SATELLITE register_to_satellite
+    _load_env_key SATELLITE_PRE_USE_IDM satellite_pre_use_idm
     _load_env_key IPADM_PASSWORD   ipadm_password
     _load_env_key IPAADMIN_PASSWORD ipaadmin_password
     _load_env_key CDN_ORGANIZATION_ID cdn_organization_id
@@ -4240,6 +4829,7 @@ aap_admin_pass: "${AAP_ADMIN_PASS:-}"
 sat_admin_pass: "${SAT_ADMIN_PASS:-}"
 satellite_disconnected: ${SATELLITE_DISCONNECTED:-false}
 register_to_satellite: ${REGISTER_TO_SATELLITE:-false}
+satellite_pre_use_idm: ${SATELLITE_PRE_USE_IDM:-false}
 ipadm_password: "${IPADM_PASSWORD:-}"
 ipaadmin_password: "${IPAADMIN_PASSWORD:-}"
 cdn_organization_id: "${CDN_ORGANIZATION_ID:-}"
@@ -4907,8 +5497,11 @@ collect_bootstrap_public_keys() {
     local key_file
     local container_pub=""
 
+    ensure_rhis_installer_ssh_key >/dev/null 2>&1 || true
+
     {
         for key_file in \
+            "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
             "${HOME}/.ssh/id_ed25519.pub" \
             "${HOME}/.ssh/id_rsa.pub" \
             "${AAP_SSH_PUBLIC_KEY}"; do
@@ -4979,26 +5572,76 @@ wait_for_vm_ssh() {
     local vm_name="${1:-aap-26}"
     local vm_ip
     local vm_state
-    local ssh_attempts=0
-    local ssh_max_attempts=540  # 540 × 10s = 90 minutes
-    local elapsed_minutes=0
+    local ssh_wait_timeout="${AAP_SSH_WAIT_TIMEOUT:-5400}"
+    local ssh_wait_interval="${AAP_SSH_WAIT_INTERVAL:-10}"
+    local ssh_progress_every="${AAP_SSH_PROGRESS_EVERY:-30}"
+    local ssh_no_progress_timeout="${AAP_SSH_NO_PROGRESS_TIMEOUT:-900}"
     local ssh_key_auth_failures=0
     local ssh_probe_out=""
+    local wait_start=0
+    local wait_deadline=0
+    local now=0
+    local elapsed=0
+    local remaining=0
+    local percent=0
+    local filled=0
+    local bar=""
+    local last_progress_log=0
+    local last_stage_change=0
+    local stage=0
+    local last_stage=0
+    local stage_label="booting"
+    local last_vm_state=""
+    local last_vm_ip=""
+    local ssh_port_reachable=0
 
     if ! is_enabled "${AAP_SSH_CALLBACK_ENABLED:-0}"; then
         print_step "AAP SSH callback probing is disabled for this workflow; skipping wait_for_vm_ssh."
         return 1
     fi
 
+    case "${ssh_wait_timeout}" in ''|*[!0-9]*) ssh_wait_timeout=5400 ;; esac
+    case "${ssh_wait_interval}" in ''|*[!0-9]*) ssh_wait_interval=10 ;; esac
+    case "${ssh_progress_every}" in ''|*[!0-9]*) ssh_progress_every=30 ;; esac
+    case "${ssh_no_progress_timeout}" in ''|*[!0-9]*) ssh_no_progress_timeout=900 ;; esac
+    [ "${ssh_wait_interval}" -le 0 ] && ssh_wait_interval=10
+    [ "${ssh_progress_every}" -le 0 ] && ssh_progress_every=30
+    [ "${ssh_no_progress_timeout}" -le 0 ] && ssh_no_progress_timeout=900
+
+    wait_start="$(date +%s)"
+    wait_deadline=$(( wait_start + ssh_wait_timeout ))
+    last_progress_log="${wait_start}"
+    last_stage_change="${wait_start}"
+
     print_step "Waiting for ${vm_name} to boot and SSH to become available..."
     print_step "  (Anaconda install + 3.5 GB bundle download typically takes 30-60 min)"
+    print_step "AAP callback monitor enabled: progress every ${ssh_progress_every}s, timeout ${ssh_wait_timeout}s, no-progress fail-fast ${ssh_no_progress_timeout}s."
 
-    while [ "${ssh_attempts}" -lt "${ssh_max_attempts}" ]; do
+    while true; do
+        now="$(date +%s)"
+        elapsed=$(( now - wait_start ))
+        remaining=$(( wait_deadline - now ))
+        if [ "${remaining}" -le 0 ]; then
+            print_warning "${vm_name} SSH did not become available within $((ssh_wait_timeout / 60)) minute(s)."
+            return 1
+        fi
+
+        stage=0
         vm_state="$(sudo virsh domstate "${vm_name}" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [ "${vm_state}" != "${last_vm_state}" ]; then
+            print_step "${vm_name} state transition: ${last_vm_state:-unknown} -> ${vm_state:-unknown}"
+            last_vm_state="${vm_state}"
+            last_stage_change="${now}"
+        fi
+
         if [ "$vm_state" = "shutoff" ] || [ "$vm_state" = "crashed" ] || [ "$vm_state" = "pmsuspended" ]; then
             print_warning "${vm_name} state is ${vm_state}; starting it to continue automated setup"
             sudo virsh start "${vm_name}" >/dev/null 2>&1 || true
             sleep 5
+        fi
+
+        if [ "$vm_state" = "running" ]; then
+            stage=1
         fi
 
         # Get the VM's IP from virsh
@@ -5012,11 +5655,24 @@ wait_for_vm_ssh() {
             esac
         fi
 
+        if [ -n "${vm_ip}" ] && [ "${vm_ip}" != "${last_vm_ip}" ]; then
+            print_step "${vm_name} network update: detected IP ${vm_ip}"
+            last_vm_ip="${vm_ip}"
+            last_stage_change="${now}"
+        fi
+
         if [ -n "${vm_ip}" ]; then
-            print_step "${vm_name} has IP ${vm_ip} — checking SSH..."
+            stage=2
 
             # If TCP/22 is open, force public-key auth probe to detect bad key setup quickly.
             if timeout 2 bash -lc "cat < /dev/tcp/${vm_ip}/22" >/dev/null 2>&1; then
+                stage=3
+                if [ "${ssh_port_reachable}" -eq 0 ]; then
+                    print_success "${vm_name} is reachable on TCP/22 at ${vm_ip}; starting key-auth validation."
+                    ssh_port_reachable=1
+                    last_stage_change="${now}"
+                fi
+
                 ssh_probe_out="$(timeout 5 ssh \
                     -o BatchMode=yes \
                     -o PreferredAuthentications=publickey \
@@ -5040,22 +5696,47 @@ wait_for_vm_ssh() {
                         return 1
                     fi
                 fi
+            else
+                if [ "${ssh_port_reachable}" -eq 1 ]; then
+                    print_warning "${vm_name} TCP/22 is no longer reachable at ${vm_ip}; waiting for recovery."
+                    ssh_port_reachable=0
+                    last_stage_change="${now}"
+                fi
             fi
         fi
 
-        ssh_attempts="$((ssh_attempts + 1))"
-        printf "."
-        if [ $((ssh_attempts % 6)) -eq 0 ]; then
-            elapsed_minutes=$((ssh_attempts / 6))
-            echo ""
-            print_step "Still waiting for ${vm_name} SSH... elapsed ${elapsed_minutes} minute(s)"
-            print_step "Tip: check VM state with: sudo virsh list --all"
-        fi
-        sleep 10
-    done
+        case "${stage}" in
+            0) stage_label="booting" ;;
+            1) stage_label="running-no-ip" ;;
+            2) stage_label="ip-known-no-ssh" ;;
+            3) stage_label="ssh-port-open-auth-pending" ;;
+            *) stage_label="unknown" ;;
+        esac
 
-        print_warning "${vm_name} SSH did not become available within 90 minutes."
-    return 1
+        if [ "${stage}" -gt "${last_stage}" ]; then
+            last_stage="${stage}"
+            last_stage_change="${now}"
+        fi
+
+        if [ $((now - last_progress_log)) -ge "${ssh_progress_every}" ]; then
+            percent=$(( elapsed * 100 / ssh_wait_timeout ))
+            [ "${percent}" -gt 100 ] && percent=100
+            filled=$(( percent / 5 ))
+            printf -v bar '%*s' "${filled}" ''
+            bar="${bar// /#}"
+            printf -v bar '%-20s' "${bar}"
+            print_step "AAP callback wait: [${bar}] ${percent}%% elapsed=${elapsed}s/${ssh_wait_timeout}s remaining~${remaining}s stage=${stage_label}"
+            last_progress_log="${now}"
+        fi
+
+        if [ $((now - last_stage_change)) -ge "${ssh_no_progress_timeout}" ]; then
+            print_warning "${vm_name} callback wait stalled for ${ssh_no_progress_timeout}s (stage=${stage_label})."
+            print_warning "Fail-fast triggered for troubleshooting. Check VM console, network, and /var/log/anaconda/ on guest."
+            return 1
+        fi
+
+        sleep "${ssh_wait_interval}"
+    done
 }
 
 # Run the AAP 2.6 containerized installer on the VM via SSH callback from the host.
@@ -6856,6 +7537,9 @@ create_rhis_vms() {
     # The VM will curl it from there during %post via the HTTP server below.
     preflight_download_aap_bundle || print_warning "AAP bundle preflight skipped. Ensure aap-bundle.tar.gz is in ${AAP_BUNDLE_DIR} before the VM runs %post."
 
+    # Build-order requirement: IdM must come first, then Satellite, then AAP.
+    create_vm_if_missing "idm"           "${VM_DIR}/idm.qcow2"           "$idm_disk" "$idm_ram" "$idm_vcpu" "${KS_DIR}/idm.ks" || return 1
+
     create_vm_if_missing "satellite-618" "${VM_DIR}/satellite-618.qcow2" "$sat_disk" "$sat_ram" "$sat_vcpu" "${KS_DIR}/satellite-618.ks" "hd:LABEL=OEMDRV:/ks.cfg" "${SAT_ISO_PATH}" || return 1
 
     # Start the HTTP server before the AAP VM boots so the bundle is available
@@ -6865,9 +7549,6 @@ create_rhis_vms() {
     fi
 
     create_vm_if_missing "aap-26"        "${VM_DIR}/aap-26.qcow2"        "$aap_disk" "$aap_ram" "$aap_vcpu" "${KS_DIR}/aap-26.ks" || return 1
-
-    # Create IdM immediately after AAP VM request, before any long AAP callback wait.
-    create_vm_if_missing "idm"           "${VM_DIR}/idm.qcow2"           "$idm_disk" "$idm_ram" "$idm_vcpu" "${KS_DIR}/idm.ks" || return 1
 
     print_phase 2 8 "Guest settle and initial readiness"
 
@@ -6961,14 +7642,20 @@ setup_rhis_ssh_mesh() {
     local ssh_bootstrap_retries ssh_bootstrap_delay
     local local_installer_pub=""
     local local_root_pub=""
+    local root_mesh_failures=0
+    local root_mesh_required=0
     local -a node_ips all_pubs root_pubs node_names
     local bootstrap_cmd append_cmd bootstrap_root_cmd append_root_cmd
+    local bootstrap_root_via_admin_cmd read_root_pub_via_admin_cmd
 
     root_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
     installer_user="${INSTALLER_USER:-${ADMIN_USER}}"
     installer_pass="${ADMIN_PASS:-}"
     ssh_bootstrap_retries="${RHIS_SSH_BOOTSTRAP_RETRIES:-45}"
     ssh_bootstrap_delay="${RHIS_SSH_BOOTSTRAP_DELAY:-10}"
+    if is_enabled "${RHIS_REQUIRE_ROOT_SSH_MESH:-0}"; then
+        root_mesh_required=1
+    fi
     if [ -z "$installer_pass" ] && [ -z "$root_pass" ]; then
         print_warning "Cannot bootstrap SSH mesh: installer/admin and root passwords are both unset."
         return 1
@@ -6985,23 +7672,29 @@ setup_rhis_ssh_mesh() {
     node_ips=("${SAT_IP}" "${AAP_IP}" "${IDM_IP}")
     node_names=("satellite" "aap" "idm")
 
+    # Rebuilds rotate SSH host keys on RHIS nodes; keep installer known_hosts clean.
+    refresh_rhis_known_hosts || true
+
+    # Ensure dedicated, persistent installer-host RHIS key exists.
+    if ! ensure_rhis_installer_ssh_key; then
+        print_warning "Could not prepare dedicated RHIS installer SSH key at ${RHIS_INSTALLER_SSH_PRIVATE_KEY}."
+        return 1
+    fi
+
     # Ensure local installer user has key + authorized_keys (install host).
     mkdir -p "${HOME}/.ssh" >/dev/null 2>&1 || true
     chmod 700 "${HOME}/.ssh" >/dev/null 2>&1 || true
-    if [ ! -f "${HOME}/.ssh/id_rsa" ]; then
-        ssh-keygen -q -t rsa -b 4096 -N "" -f "${HOME}/.ssh/id_rsa" -C "rhis-installer-host" >/dev/null 2>&1 || true
-    fi
     touch "${HOME}/.ssh/authorized_keys" >/dev/null 2>&1 || true
     chmod 600 "${HOME}/.ssh/authorized_keys" >/dev/null 2>&1 || true
-    if [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
-        cat "${HOME}/.ssh/id_rsa.pub" >> "${HOME}/.ssh/authorized_keys"
+    if [ -f "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" ]; then
+        cat "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" >> "${HOME}/.ssh/authorized_keys"
         sort -u "${HOME}/.ssh/authorized_keys" -o "${HOME}/.ssh/authorized_keys" || true
-        local_installer_pub="$(cat "${HOME}/.ssh/id_rsa.pub" 2>/dev/null || true)"
+        local_installer_pub="$(cat "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" 2>/dev/null || true)"
     fi
 
     # Explicit self trust requested: install-host user -> 127.0.0.1
-    if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ] && [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
-        sshpass -p "${installer_pass}" ssh-copy-id -i "${HOME}/.ssh/id_rsa.pub" \
+    if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ] && [ -f "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" ]; then
+        sshpass -p "${installer_pass}" ssh-copy-id -i "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             "${installer_user}@127.0.0.1" >/dev/null 2>&1 || true
     fi
@@ -7056,16 +7749,34 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
 
     # Ensure root keypair exists on every node.
     bootstrap_root_cmd='set -e; install -d -m 700 /root/.ssh; if [ ! -f /root/.ssh/id_rsa ]; then ssh-keygen -q -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa; fi; touch /root/.ssh/authorized_keys; [ -f /root/.ssh/id_rsa.pub ] && cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/id_rsa 2>/dev/null || true; chmod 644 /root/.ssh/id_rsa.pub 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys'
+    bootstrap_root_via_admin_cmd="sudo -n bash -lc '$(printf '%s' "${bootstrap_root_cmd}" | sed "s/'/'\\''/g")'"
+    read_root_pub_via_admin_cmd="sudo -n cat /root/.ssh/id_rsa.pub"
     print_step "Bootstrapping root SSH keys on RHIS nodes"
     for ip in "${node_ips[@]}"; do
         if [ -n "$root_pass" ]; then
-            sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$bootstrap_root_cmd" >/dev/null 2>&1 || {
-                print_warning "Root SSH bootstrap failed for ${ip}."
-                return 1
-            }
+            if sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$bootstrap_root_cmd" >/dev/null 2>&1; then
+                :
+            elif [ -n "${installer_pass}" ] && sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" "${bootstrap_root_via_admin_cmd}" >/dev/null 2>&1; then
+                print_step "Root SSH bootstrap on ${ip} completed via ${installer_user} + sudo fallback."
+            else
+                print_warning "Root SSH bootstrap failed for ${ip} via direct root and ${installer_user} + sudo fallback."
+                if [ "${root_mesh_required}" -eq 1 ]; then
+                    return 1
+                fi
+                root_mesh_failures=$((root_mesh_failures + 1))
+                continue
+            fi
         else
-            print_warning "Root password unavailable; cannot bootstrap root SSH keys on ${ip}."
-            return 1
+            if [ -n "${installer_pass}" ] && sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" "${bootstrap_root_via_admin_cmd}" >/dev/null 2>&1; then
+                print_step "Root SSH bootstrap on ${ip} completed via ${installer_user} + sudo fallback."
+            else
+                print_warning "Root password unavailable and ${installer_user} + sudo fallback failed; cannot bootstrap root SSH keys on ${ip}."
+                if [ "${root_mesh_required}" -eq 1 ]; then
+                    return 1
+                fi
+                root_mesh_failures=$((root_mesh_failures + 1))
+                continue
+            fi
         fi
     done
 
@@ -7110,7 +7821,7 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
     chmod 600 "${HOME}/.ssh/authorized_keys" || true
 
     # Explicit install-host user trust push to admin@{satellite,idm,aap} and root@{satellite,idm,aap}
-    if [ -n "${local_installer_pub}" ] && [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
+    if [ -n "${local_installer_pub}" ] && [ -f "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" ]; then
         local i push_ip push_name pub_b64
         pub_b64="$(printf '%s' "${local_installer_pub}" | base64 -w0 2>/dev/null || true)"
         for i in 0 1 2; do
@@ -7119,7 +7830,7 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
 
             # install-host user -> admin
             if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ]; then
-                sshpass -p "${installer_pass}" ssh-copy-id -i "${HOME}/.ssh/id_rsa.pub" \
+                sshpass -p "${installer_pass}" ssh-copy-id -i "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
                     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
                     "${installer_user}@${push_ip}" >/dev/null 2>&1 || true
             fi
@@ -7130,7 +7841,7 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
 
             # install-host user -> root
             if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${root_pass}" ]; then
-                sshpass -p "${root_pass}" ssh-copy-id -i "${HOME}/.ssh/id_rsa.pub" \
+                sshpass -p "${root_pass}" ssh-copy-id -i "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
                     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
                     "root@${push_ip}" >/dev/null 2>&1 || true
             fi
@@ -7145,25 +7856,48 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
 
     print_step "Collecting root public keys for full root mesh trust"
     for ip in "${node_ips[@]}"; do
-        pub="$(sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" 'cat /root/.ssh/id_rsa.pub' 2>/dev/null || true)"
+        pub=""
+        if [ -n "$root_pass" ]; then
+            pub="$(sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" 'cat /root/.ssh/id_rsa.pub' 2>/dev/null || true)"
+        fi
+        if [ -z "$pub" ] && [ -n "${installer_pass}" ]; then
+            pub="$(sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" "${read_root_pub_via_admin_cmd}" 2>/dev/null || true)"
+            [ -n "$pub" ] && print_step "Collected root SSH public key from ${ip} via ${installer_user} + sudo fallback."
+        fi
         if [ -z "$pub" ]; then
             print_warning "Could not read root SSH public key from ${ip}."
-            return 1
+            if [ "${root_mesh_required}" -eq 1 ]; then
+                return 1
+            fi
+            root_mesh_failures=$((root_mesh_failures + 1))
+            continue
         fi
         root_pubs+=("$pub")
     done
     [ -n "${local_root_pub}" ] && root_pubs+=("${local_root_pub}")
 
-    print_step "Distributing trusted root keys to all nodes (root-to-root mesh)"
-    for ip in "${node_ips[@]}"; do
-        for pub in "${root_pubs[@]}"; do
-            append_root_cmd="printf '%s\\n' '$pub' >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
-            sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$append_root_cmd" >/dev/null 2>&1 || {
-                print_warning "Failed to distribute root SSH key to ${ip}."
-                return 1
-            }
+    if [ "${#root_pubs[@]}" -gt 0 ]; then
+        print_step "Distributing trusted root keys to all nodes (root-to-root mesh)"
+        for ip in "${node_ips[@]}"; do
+            for pub in "${root_pubs[@]}"; do
+                append_root_cmd="printf '%s\\n' '$pub' >> /root/.ssh/authorized_keys; sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
+                if [ -n "$root_pass" ] && sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$ip" "$append_root_cmd" >/dev/null 2>&1; then
+                    :
+                elif [ -n "${installer_pass}" ] && sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${ip}" "sudo -n bash -lc '$(printf '%s' "${append_root_cmd}" | sed "s/'/'\\''/g")'" >/dev/null 2>&1; then
+                    :
+                else
+                    print_warning "Failed to distribute root SSH key to ${ip} via direct root and ${installer_user} + sudo fallback."
+                    if [ "${root_mesh_required}" -eq 1 ]; then
+                        return 1
+                    fi
+                    root_mesh_failures=$((root_mesh_failures + 1))
+                fi
+            done
         done
-    done
+    else
+        print_warning "No root SSH public keys were collected; skipping root-to-root mesh distribution."
+        root_mesh_failures=$((root_mesh_failures + 1))
+    fi
 
     # Ensure install host root trusts all VM root keys too.
     if [ -n "${local_root_pub}" ] && command -v sudo >/dev/null 2>&1; then
@@ -7173,7 +7907,11 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
         sudo bash -lc 'sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys' >/dev/null 2>&1 || true
     fi
 
-    print_success "RHIS SSH mesh configured: ${installer_user} and root SSH trust established across install host + all RHIS nodes."
+    if [ "${root_mesh_failures}" -gt 0 ]; then
+        print_warning "RHIS SSH mesh configured with ${root_mesh_failures} root-mesh issue(s). Installer-user mesh is active; root mesh is best-effort."
+    else
+        print_success "RHIS SSH mesh configured: ${installer_user} and root SSH trust established across install host + all RHIS nodes."
+    fi
     return 0
 }
 
@@ -7350,6 +8088,62 @@ ensure_platform_packages_for_virt_manager() {
     return 0
 }
 
+rhis_required_ansible_collections() {
+    cat <<'EOF'
+ansible.posix
+community.general
+freeipa.ansible_freeipa
+infra.aap_configuration
+infra.aap_utilities
+infra.ah_configuration
+infra.controller_configuration
+infra.eda_configuration
+infra.ee_utilities
+redhat.rhel_system_roles
+redhat.satellite
+redhat.satellite_operations
+EOF
+}
+
+check_missing_installer_host_ansible_collections() {
+    local c
+    local -a collections
+    local -a missing=()
+    local timeout_sec=20
+    local collection_list_cache=""
+
+    mapfile -t collections < <(rhis_required_ansible_collections)
+
+    if ! command -v ansible-galaxy >/dev/null 2>&1; then
+        print_warning "ansible-galaxy is not installed yet; collection visibility check skipped."
+        print_warning "Expected required collections (${#collections[@]}):"
+        for c in "${collections[@]}"; do
+            echo "  - ${c}"
+        done
+        return 0
+    fi
+
+    print_step "Pre-flight: checking installer-host required collections (timeout: ${timeout_sec}s)"
+    collection_list_cache="$(timeout ${timeout_sec} ansible-galaxy collection list 2>/dev/null | awk '{print $1}' || true)"
+
+    for c in "${collections[@]}"; do
+        if ! echo "${collection_list_cache}" | grep -qx "${c}"; then
+            missing+=("${c}")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        print_success "Pre-flight collection visibility: all required collections are already installed."
+    else
+        print_warning "Pre-flight collection visibility: ${#missing[@]} missing collection(s):"
+        for c in "${missing[@]}"; do
+            echo "  - ${c}"
+        done
+    fi
+
+    return 0
+}
+
 ensure_installer_host_ansible_collections() {
     local cfg
     local c
@@ -7370,18 +8164,9 @@ ensure_installer_host_ansible_collections() {
     generate_rhis_ansible_cfg || true
     cfg="${RHIS_ANSIBLE_CFG_HOST}"
 
-    # Red Hat first (published/validated), then community fallback.
-    collections=(
-        redhat.rhel_system_roles
-        redhat.satellite
-        redhat.satellite_operations
-        freeipa.ansible_freeipa
-        ansible.posix
-        community.general
-        infra.aap_configuration
-        infra.aap_utilities
-
-    )
+    # Required collections (normalized, unique, and alphabetically sorted).
+    # NOTE: `eda_configuration` has been normalized to `infra.eda_configuration`.
+    mapfile -t collections < <(rhis_required_ansible_collections)
 
     # Cache collection list once with timeout to avoid repeated Galaxy queries
     print_step "Querying local Ansible collection cache (timeout: ${timeout_sec}s)..."
@@ -7420,6 +8205,8 @@ ensure_installer_host_ansible_collections() {
 }
 
 main() {
+    init_rhis_run_logging
+
     parse_args "$@"
     apply_cli_overrides
 
@@ -7470,6 +8257,9 @@ main() {
 
     print_step "Startup: Ensuring installer-host platform packages"
     ensure_platform_packages_for_virt_manager || { print_warning "Installer-host package check failed"; exit 1; }
+
+    print_step "Startup: Pre-flight collection visibility"
+    check_missing_installer_host_ansible_collections || true
 
     print_step "Startup: Ensuring installer-host Ansible collections"
     ensure_installer_host_ansible_collections || print_warning "Installer-host collection install encountered issues; continuing."
