@@ -14,6 +14,7 @@ This file tracks repository changes from this point forward.
 ## 2026-03-24 09:51:57 MDT
 
 ### 2026-03-24 09:51:57 MDT — Emergency recovery: Missing provisioner templates
+
 - **Area:** `RECOVERY_PROCEDURES.md`, `QUICK_RECOVERY.md`, (provisioner container patches applied)
 - **Summary:**
   - Diagnosed config-as-code phase failures: IdM/Satellite playbooks failed due to missing `chrony.j2` template in provisioner container.
@@ -29,6 +30,7 @@ This file tracks repository changes from this point forward.
 ## 2026-03-23 17:39:04 MDT
 
 ### 2026-03-23 17:39:04 MDT — Script hardening and orchestration updates
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added container playbook hotfix preflight with verify/fail-fast controls.
@@ -41,6 +43,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Improve reliability, visibility, and deterministic dependency order while reducing repeated operator troubleshooting.
 
 ### 2026-03-23 17:39:04 MDT — Documentation alignment
+
 - **Area:** `README.md`, `CHECKLIST.md`, `Doc/README.md`, `host_vars/README.md`, `inventory/README.md`
 - **Summary:**
   - Updated docs to match current runtime behavior and dependency order.
@@ -51,6 +54,7 @@ This file tracks repository changes from this point forward.
 ## 2026-03-24 07:28:21 MDT
 
 ### 2026-03-24 07:28:21 MDT — SSH mesh fallback hardening
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added installer-user + passwordless `sudo` fallback for root SSH key bootstrap on RHIS nodes.
@@ -59,6 +63,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Prevent RHIS from aborting when direct `root@<node>` SSH is not ready yet but the installer/admin account is already available.
 
 ### 2026-03-24 07:35:18 MDT — Managed container patch persistence
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added top-level RHIS-managed container patch functions for Satellite and IdM playbook component fixes.
@@ -67,6 +72,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Ensure all container component fixes are maintained by the script itself and are consistently re-applied whenever a new provisioner container is deployed through RHIS.
 
 ### 2026-03-24 07:51:02 MDT — Per-run installer logging under /var/log/rhis
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added run-log configuration and startup log initialization for each script invocation.
@@ -76,6 +82,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Provide durable, per-run operational logs for troubleshooting and auditability of each `rhis_install.sh` execution.
 
 ### 2026-03-24 07:54:03 MDT — Automatic run-log retention/pruning
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added `RHIS_RUN_LOG_KEEP_COUNT` (default `30`) to control retained per-run installer logs.
@@ -84,6 +91,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Prevent unbounded growth of `/var/log/rhis` while preserving recent execution history.
 
 ### 2026-03-24 08:09:44 MDT — Root SSH mesh defaults to best-effort
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added `RHIS_REQUIRE_ROOT_SSH_MESH` (default `0`) to control whether root mesh failures are fatal.
@@ -92,6 +100,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Avoid aborting full workflow when root key auth is not fully ready on one node (for example IdM), while still allowing strict enforcement when explicitly required.
 
 ### 2026-03-24 08:15:26 MDT — SSH key/known_hosts stability hardening for rebuilt RHIS nodes
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added dedicated persistent installer-host RHIS SSH key path (`RHIS_INSTALLER_SSH_KEY_DIR`) so RHIS mesh operations no longer depend on/churn default `~/.ssh/id_rsa`.
@@ -101,6 +110,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Prevent recurring host-key-change breakage and avoid impacting the static installer host’s primary SSH identity during repeated RHIS rebuild/install cycles.
 
 ### 2026-03-24 08:45:25 MDT — Config-only auth resilience preflight
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added config-as-code preflight call to refresh SSH trust baseline (`setup_rhis_ssh_mesh`) before phase playbooks (best-effort in this path).
@@ -108,6 +118,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Reduce repeated phase failures in container config-only/rerun workflows caused by SSH trust drift and root password mismatch between current vault values and guest state.
 
 ### 2026-03-24 09:17:24 MDT — /etc/hosts sync for RHIS external interfaces
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added `sync_rhis_external_hosts_entries()` to discover RHIS VM external/NAT interface IPs via `virsh domifaddr` and write them to a managed `/etc/hosts` block.
@@ -116,6 +127,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Ensure installer-host name resolution has up-to-date external interface mappings after VM reprovision/re-IP events.
 
 ### 2026-03-24 09:21:37 MDT — Fix missing IdM chrony.j2 template during idm_pre
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added managed container hotfix creation for `/rhis/rhis-builder-idm/roles/idm_pre/templates/chrony.j2` (fallback template) alongside existing Satellite chrony fallback.
@@ -124,6 +136,7 @@ This file tracks repository changes from this point forward.
 - **Reason:** Prevent `TASK [idm_pre : Configure time servers]` failures caused by missing `chrony.j2` in the IdM role templates.
 
 ### 2026-03-24 09:28:18 MDT — IdM Web UI readiness gate + diagnostics
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added IdM Web UI readiness controls (`RHIS_IDM_WEB_UI_TIMEOUT`, `RHIS_IDM_WEB_UI_INTERVAL`) and runtime config visibility.
@@ -132,7 +145,19 @@ This file tracks repository changes from this point forward.
   - IdM phase now marks status as failed when web UI readiness does not converge, instead of reporting a false-success state.
 - **Reason:** Ensure the workflow only reports IdM success when the actual IdM web UI is reachable and healthy.
 
+### 2026-03-24 16:35:00 MDT — Fix container SSH auth for Ansible (admin user key distribution)
+
+- **Area:** `rhis_install.sh`
+- **Summary:**
+  - Root cause: `setup_rhis_ssh_mesh()` was distributing the RHIS installer key only to `installer_user` (sgallego) and root on each VM — not to `ADMIN_USER` (admin), which is the `ansible_user` in the inventory and the account Ansible actually connects as.
+  - Added explicit installer-key push to `ADMIN_USER@node` in the key distribution loop when `ADMIN_USER != installer_user`.
+  - Added `RHIS_INSTALLER_SSH_KEY_CONTAINER_DIR`/`RHIS_INSTALLER_SSH_KEY_CONTAINER_PATH` constants for the container-side SSH key mount path.
+  - Mounted `RHIS_INSTALLER_SSH_KEY_DIR` into the provisioner container as `/rhis/vars/ssh` (read-only) so Ansible inside the container has access to the RHIS installer private key.
+  - Added `-i ${RHIS_INSTALLER_SSH_KEY_CONTAINER_PATH}` to `ssh_args` in the generated `ansible.cfg` so all Ansible SSH connections use the RHIS installer key by default.
+- **Reason:** Ansible connections from the provisioner container were failing with `Permission denied (publickey,...)` on all nodes because the container had no SSH private key available and the Ansible inventory user (`admin`) did not have a trusted key path configured.
+
 ### 2026-03-24 09:43:07 MDT — Cross-component post-install healthcheck/remediation framework
+
 - **Area:** `rhis_install.sh`
 - **Summary:**
   - Added post-install healthcheck controls: `RHIS_ENABLE_POST_HEALTHCHECK`, `RHIS_HEALTHCHECK_AUTOFIX`, `RHIS_HEALTHCHECK_RERUN_COMPONENT`.

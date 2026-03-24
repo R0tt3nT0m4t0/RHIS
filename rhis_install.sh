@@ -220,6 +220,9 @@ AAP_SSH_CALLBACK_ENABLED="${AAP_SSH_CALLBACK_ENABLED:-0}"
 RHIS_INSTALLER_SSH_KEY_DIR="${RHIS_INSTALLER_SSH_KEY_DIR:-${HOME}/.ssh/rhis-installer}"
 RHIS_INSTALLER_SSH_PRIVATE_KEY="${RHIS_INSTALLER_SSH_KEY_DIR}/id_rsa"
 RHIS_INSTALLER_SSH_PUBLIC_KEY="${RHIS_INSTALLER_SSH_KEY_DIR}/id_rsa.pub"
+# Container-side mount path for the RHIS installer SSH key (read-only).
+RHIS_INSTALLER_SSH_KEY_CONTAINER_DIR="/rhis/vars/ssh"
+RHIS_INSTALLER_SSH_KEY_CONTAINER_PATH="${RHIS_INSTALLER_SSH_KEY_CONTAINER_DIR}/id_rsa"
 # If enabled, prune/reseed known_hosts entries for RHIS node IPs/hostnames each run.
 RHIS_REFRESH_KNOWN_HOSTS="${RHIS_REFRESH_KNOWN_HOSTS:-1}"
 # Fail fast when SSH port is reachable but key auth repeatedly fails.
@@ -842,7 +845,7 @@ nocows = 1
 
 [ssh_connection]
 pipelining = True
-ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o ServerAliveInterval=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o ServerAliveInterval=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${RHIS_INSTALLER_SSH_KEY_CONTAINER_PATH}
 control_path_dir = /tmp/.ansible-cp
 retries = 3
 
@@ -2605,6 +2608,7 @@ ensure_container_running() {
         -v "${RHIS_INVENTORY_DIR}:/rhis/vars/external_inventory:Z" \
         -v "${RHIS_HOST_VARS_DIR}:/rhis/vars/host_vars:Z" \
         -v "${ANSIBLE_ENV_DIR}:/rhis/vars/vault:z" \
+        -v "${RHIS_INSTALLER_SSH_KEY_DIR}:${RHIS_INSTALLER_SSH_KEY_CONTAINER_DIR}:z,ro" \
         "${RHIS_CONTAINER_IMAGE}"
 
     ensure_container_collection_compat || true
@@ -8265,7 +8269,10 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
     sort -u "${HOME}/.ssh/authorized_keys" -o "${HOME}/.ssh/authorized_keys" || true
     chmod 600 "${HOME}/.ssh/authorized_keys" || true
 
-    # Explicit install-host user trust push to admin@{satellite,idm,aap} and root@{satellite,idm,aap}
+    # Explicit install-host key push to installer_user, ADMIN_USER (Ansible inventory user), and root
+    # on each RHIS node.  ADMIN_USER is the account the Ansible inventory connects as; it must also
+    # trust the RHIS installer key so the provisioner container can reach all nodes via Ansible.
+    local admin_user="${ADMIN_USER:-${installer_user}}"
     if [ -n "${local_installer_pub}" ] && [ -f "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" ]; then
         local i push_ip push_name pub_b64
         pub_b64="$(printf '%s' "${local_installer_pub}" | base64 -w0 2>/dev/null || true)"
@@ -8273,7 +8280,7 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
             push_ip="${node_ips[$i]}"
             push_name="${node_names[$i]}"
 
-            # install-host user -> admin
+            # install-host key -> installer_user (sgallego / INSTALLER_USER)
             if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ]; then
                 sshpass -p "${installer_pass}" ssh-copy-id -i "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
                     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
@@ -8284,7 +8291,26 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
                 sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${installer_user}@${push_ip}" "$append_cmd" >/dev/null 2>&1 || true
             fi
 
-            # install-host user -> root
+            # install-host key -> admin_user (ADMIN_USER — the Ansible inventory connection user)
+            # This is separate from installer_user when ADMIN_USER != INSTALLER_USER.
+            if [ "${admin_user}" != "${installer_user}" ]; then
+                if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${installer_pass}" ]; then
+                    sshpass -p "${installer_pass}" ssh-copy-id -i "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
+                        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+                        "${admin_user}@${push_ip}" >/dev/null 2>&1 || true
+                fi
+                if [ -n "${pub_b64}" ]; then
+                    append_admin_cmd="target_home=\"\$(getent passwd '${admin_user}' | cut -d: -f6)\"; [ -n \"\$target_home\" ] || target_home=\"/home/${admin_user}\"; install -d -m 700 -o '${admin_user}' -g '${admin_user}' \"\$target_home/.ssh\"; touch \"\$target_home/.ssh/authorized_keys\"; printf '%s' '${pub_b64}' | base64 -d >> \"\$target_home/.ssh/authorized_keys\"; sort -u \"\$target_home/.ssh/authorized_keys\" -o \"\$target_home/.ssh/authorized_keys\"; chown '${admin_user}:${admin_user}' \"\$target_home/.ssh/authorized_keys\"; chmod 600 \"\$target_home/.ssh/authorized_keys\""
+                    if [ -n "${installer_pass}" ]; then
+                        sshpass -p "${installer_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${admin_user}@${push_ip}" "$append_admin_cmd" >/dev/null 2>&1 || true
+                    fi
+                    if [ -n "${root_pass}" ]; then
+                        sshpass -p "${root_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${push_ip}" "$append_admin_cmd" >/dev/null 2>&1 || true
+                    fi
+                fi
+            fi
+
+            # install-host key -> root
             if command -v ssh-copy-id >/dev/null 2>&1 && [ -n "${root_pass}" ]; then
                 sshpass -p "${root_pass}" ssh-copy-id -i "${RHIS_INSTALLER_SSH_PUBLIC_KEY}" \
                     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
@@ -8295,7 +8321,7 @@ chown "$target_user:$target_user" "$target_home/.ssh/config"; chmod 600 "$target
                 sshpass -p "${root_pass}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@${push_ip}" "$append_root_cmd" >/dev/null 2>&1 || true
             fi
 
-            print_step "Install-host key synchronized to admin/root on ${push_name} (${push_ip})"
+            print_step "Install-host key synchronized to ${installer_user}/${admin_user}/root on ${push_name} (${push_ip})"
         done
     fi
 
@@ -8389,7 +8415,12 @@ validate_rhis_ssh_mesh() {
             dst_name="${dst%%:*}"
             dst_ip="${dst##*:}"
             validation_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 ${installer_user}@${dst_ip} 'echo ok:${dst_name}'"
-            if sshpass -p "$installer_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ${installer_user}@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
+            # Try with RHIS installer key first (installer host key is pushed to each node's authorized_keys
+            # during mesh setup, so key auth works even when installer_user has no password on the VMs).
+            if [ -f "${RHIS_INSTALLER_SSH_PRIVATE_KEY:-}" ] && \
+               ssh -i "${RHIS_INSTALLER_SSH_PRIVATE_KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ${installer_user}@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
+                print_step "SSH mesh OK: ${src_name} -> ${dst_name}"
+            elif [ -n "$installer_pass" ] && sshpass -p "$installer_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 ${installer_user}@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
                 print_step "SSH mesh OK: ${src_name} -> ${dst_name}"
             elif [ -n "$root_pass" ] && sshpass -p "$root_pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 root@"$src_ip" "$validation_cmd" >/dev/null 2>&1; then
                 print_step "SSH mesh OK via root fallback: ${src_name} -> ${dst_name}"
