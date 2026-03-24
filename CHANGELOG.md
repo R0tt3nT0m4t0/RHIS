@@ -11,6 +11,24 @@ This file tracks repository changes from this point forward.
 
 ---
 
+## 2026-03-24 10:50:00 MDT
+
+### 2026-03-24 10:50:00 MDT — Merge headless helper files into rhis_install.sh
+
+- **Area:** `rhis_install.sh` (new functions), `rhis-headless-validate.sh` (removed), `rhis-headless.env.template` (removed)
+- **Summary:**
+  - Merged standalone `rhis-headless-validate.sh` into `rhis_install.sh` as `validate_headless_config()` function.
+  - Merged `rhis-headless.env.template` into `rhis_install.sh` as `generate_env_template()` function (heredoc).
+  - Added `--validate` / `--preflight` CLI flag: runs pre-flight checks (required vars per menu-choice, Linux/root/sudo, required commands, SSH keys, IP format, FQDN format, storage ≥300 GB, memory ≥64 GB, Red Hat CDN and DNS reachability) then exits.
+  - Added `--generate-env [path]` CLI flag: writes a commented headless env-file template to the specified path (default `./rhis-headless.env.template`) then exits.
+  - Added `CLI_VALIDATE` and `CLI_GENERATE_ENV` global flag variables.
+  - Updated `apply_cli_overrides()` to set `NONINTERACTIVE=1 RUN_ONCE=1` for both new flags.
+  - Updated `print_usage()` with documentation for both new flags.
+  - Removed `rhis-headless-validate.sh` and `rhis-headless.env.template` from repository (functionality now in `rhis_install.sh`).
+- **Reason:** Consolidate headless deployment tooling into a single script so users do not need external helper files; headless validation and env-file generation are available as first-class CLI operations.
+
+---
+
 ## 2026-03-24 09:51:57 MDT
 
 ### 2026-03-24 09:51:57 MDT — Emergency recovery: Missing provisioner templates

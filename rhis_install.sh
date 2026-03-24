@@ -83,6 +83,8 @@ CLI_ATTACH_CONSOLES=""
 CLI_STATUS=""
 CLI_TEST=""
 CLI_TEST_PROFILE="full"
+CLI_VALIDATE=""
+CLI_GENERATE_ENV=""
 MENU_CHOICE_CONSUMED=0
 RHIS_TEST_MODE="${RHIS_TEST_MODE:-0}"
 RHIS_DASHBOARD_SINGLE_SHOT="${RHIS_DASHBOARD_SINGLE_SHOT:-0}"
@@ -415,7 +417,13 @@ Options:
   --test[=fast|full]       Run a curated non-interactive test sweep and print a summary
   --demo                   Use minimal PoC/demo VM specs and kickstarts
   --demokill               Destroy demo VMs/files/temp locks and exit (CLI-only)
-  (env) RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY=0  Disable auto config after menu option 2
+    --validate [--menu-choice N]  Pre-flight check: required vars, tools, storage, memory,
+                                                     SSH keys, network/FQDN format, CDN and DNS reachability.
+                                                     Use together with --env-file to validate a headless env file.
+    --generate-env [path]    Write a headless env-file template to <path> (default:
+                                                     ./rhis-headless.env.template). Copy and fill in values,
+                                                     then run with: --non-interactive --env-file <path> --menu-choice N
+    (env) RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY=0  Disable auto config after menu option 2
   (env) RHIS_RETRY_FAILED_PHASES_ONCE=0       Disable automatic retry of failed phases
     (env) RHIS_ENABLE_CONTAINER_HOTFIXES=0      Disable runtime role hotfix patching in container
     (env) RHIS_ENFORCE_CONTAINER_HOTFIXES=0     Do not fail when hotfix verification cannot be confirmed
@@ -1238,6 +1246,20 @@ parse_args() {
                 print_usage
                 exit 0
                 ;;
+            --validate|--preflight)
+                CLI_VALIDATE="1"
+                RUN_ONCE=1
+                ;;
+            --generate-env)
+                # Optional next arg: output path for the generated template
+                if [ "$#" -gt 1 ] && [[ "${2:-}" != --* ]]; then
+                    shift
+                    CLI_GENERATE_ENV="$1"
+                else
+                    CLI_GENERATE_ENV="${SCRIPT_DIR}/rhis-headless.env.template"
+                fi
+                RUN_ONCE=1
+                ;;
             *)
                 print_warning "Unknown option: $1"
                 print_usage
@@ -1292,6 +1314,16 @@ apply_cli_overrides() {
     fi
 
     if [ -n "$CLI_STATUS" ]; then
+        NONINTERACTIVE=1
+        RUN_ONCE=1
+    fi
+
+    if [ -n "$CLI_VALIDATE" ]; then
+        NONINTERACTIVE=1
+        RUN_ONCE=1
+    fi
+
+    if [ -n "$CLI_GENERATE_ENV" ]; then
         NONINTERACTIVE=1
         RUN_ONCE=1
     fi
@@ -2927,6 +2959,356 @@ preflight_config_as_code_targets() {
 
     print_success "Preflight passed: RHIS VMs are running and reachable on the internal network."
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# validate_headless_config
+#
+# Standalone pre-flight checker for headless / non-interactive deployments.
+# Checks required variables per menu choice, system requirements, commands,
+# SSH keys, IP/FQDN format, storage (≥300 GB), memory (≥64 GB), and CDN/DNS
+# reachability.
+#
+# Called by --validate / --preflight, or automatically before a non-interactive
+# run when PRESEED_ENV_FILE is loaded.
+# ---------------------------------------------------------------------------
+validate_headless_config() {
+    local choice="${MENU_CHOICE:-${CLI_MENU_CHOICE:-5}}"
+
+    # Self-contained ANSI helpers (callable before main print_* are defined)
+    local _vRED='\033[0;31m'
+    local _vGREEN='\033[0;32m'
+    local _vYELLOW='\033[1;33m'
+    local _vBLUE='\033[0;34m'
+    local _vNC='\033[0m'
+    local VPASS=0 VWARN=0 VFAIL=0
+
+    _vok()   { printf "${_vGREEN}✓${_vNC} %s\n" "$1"; (( VPASS++ )) || true; }
+    _vwarn() { printf "${_vYELLOW}⚠${_vNC} %s\n" "$1"; (( VWARN++ )) || true; }
+    _vfail() { printf "${_vRED}✗${_vNC} %s\n"   "$1"; (( VFAIL++ )) || true; }
+    _vhead() { printf "\n${_vBLUE}━━ %s${_vNC}\n" "$1"; }
+
+    printf "${_vBLUE}╔══════════════════════════════════════════════════════════════╗${_vNC}\n"
+    printf "${_vBLUE}║  RHIS Headless Environment Validation                       ║${_vNC}\n"
+    printf "${_vBLUE}╚══════════════════════════════════════════════════════════════╝${_vNC}\n\n"
+
+    # ── Env file check ──────────────────────────────────────────────────────────
+    _vhead "Environment File"
+    if [ -n "${PRESEED_ENV_FILE:-}" ]; then
+        if [ -f "${PRESEED_ENV_FILE}" ]; then
+            _vok "Env file found: ${PRESEED_ENV_FILE}"
+        else
+            _vwarn "Env file not found: ${PRESEED_ENV_FILE} (relying on already-exported vars)"
+        fi
+    else
+        _vwarn "--env-file not specified; relying on already-exported environment"
+    fi
+
+    # ── Required variables per menu choice ─────────────────────────────────────
+    _vhead "Required Variables (menu choice ${choice})"
+    local -a required_vars=()
+    local mode_label=""
+    case "${choice}" in
+        1|2)
+            required_vars=(RH_USER RH_PASS ADMIN_PASS)
+            mode_label="Local App / Container"
+            ;;
+        3)
+            required_vars=(IDM_IP IDM_HOSTNAME SAT_IP SAT_HOSTNAME AAP_IP AAP_HOSTNAME ADMIN_PASS)
+            mode_label="Virt-Manager Only"
+            ;;
+        4)
+            required_vars=(RH_USER RH_PASS ADMIN_PASS ADMIN_USER DOMAIN
+                           IDM_IP IDM_HOSTNAME IDM_DS_PASS
+                           SAT_IP SAT_HOSTNAME SAT_ORG SAT_LOC
+                           AAP_IP AAP_HOSTNAME HUB_TOKEN)
+            mode_label="Full Setup (Local + Virt-Manager)"
+            ;;
+        5)
+            required_vars=(RH_USER RH_PASS ADMIN_PASS ADMIN_USER DOMAIN
+                           IDM_IP IDM_HOSTNAME IDM_DS_PASS
+                           SAT_IP SAT_HOSTNAME SAT_ORG SAT_LOC
+                           AAP_IP AAP_HOSTNAME HUB_TOKEN)
+            mode_label="Full Setup (Container + Virt-Manager)"
+            ;;
+        7)
+            required_vars=(RH_USER RH_PASS ADMIN_PASS DOMAIN IDM_DS_PASS
+                           IDM_IP SAT_IP AAP_IP HUB_TOKEN)
+            mode_label="Container Config-Only"
+            ;;
+        *)
+            _vfail "Unknown menu choice: ${choice} (valid: 1-5, 7)"
+            ;;
+    esac
+    printf "  Mode: %s\n" "${mode_label}"
+    local var val
+    for var in "${required_vars[@]}"; do
+        val="${!var:-}"
+        if [ -z "${val}" ]; then
+            _vfail "${var} is required but not set"
+        else
+            if [[ "${var}" == *PASS* ]] || [[ "${var}" == *TOKEN* ]] || [[ "${var}" == *SECRET* ]]; then
+                val="***REDACTED***"
+            fi
+            _vok "${var} is set (${val})"
+        fi
+    done
+
+    # ── System requirements ────────────────────────────────────────────────────
+    _vhead "System Requirements"
+    if [[ "${OSTYPE:-}" == "linux-gnu"* ]]; then
+        _vok "Running on Linux"
+    else
+        _vfail "Linux required (detected: ${OSTYPE:-unknown})"
+    fi
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        _vok "Running as root"
+    elif sudo -n true 2>/dev/null; then
+        _vok "Passwordless sudo available"
+    else
+        _vwarn "Not root and sudo requires a password"
+    fi
+
+    # ── Required commands ──────────────────────────────────────────────────────
+    _vhead "Required Commands"
+    local cmd
+    for cmd in virsh podman ssh ssh-keygen jq curl; do
+        if command -v "${cmd}" >/dev/null 2>&1; then
+            _vok "${cmd} is available"
+        else
+            _vfail "${cmd} is not installed / not in PATH"
+        fi
+    done
+
+    # ── SSH keys ───────────────────────────────────────────────────────────────
+    _vhead "SSH Configuration"
+    local ssh_key="${RHIS_INSTALLER_SSH_PRIVATE_KEY:-${HOME}/.ssh/rhis-installer/id_rsa}"
+    if [ -f "${ssh_key}" ]; then
+        _vok "SSH private key exists: ${ssh_key}"
+    else
+        _vwarn "SSH private key not found: ${ssh_key}  (run the installer once to generate it)"
+    fi
+    if [ -f "${ssh_key}.pub" ]; then
+        _vok "SSH public key exists: ${ssh_key}.pub"
+    else
+        _vfail "SSH public key not found: ${ssh_key}.pub"
+    fi
+
+    # ── IP address validation ──────────────────────────────────────────────────
+    _vhead "IP Address Validation"
+    _valid_ip() { [[ "${1:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+    local ip_var ip_val
+    for ip_var in IDM_IP SAT_IP AAP_IP HOST_INT_IP; do
+        ip_val="${!ip_var:-}"
+        [ -z "${ip_val}" ] && continue
+        if _valid_ip "${ip_val}"; then
+            _vok "${ip_var} is a valid IP: ${ip_val}"
+        else
+            _vfail "${ip_var} is not a valid IP address: ${ip_val}"
+        fi
+    done
+
+    # ── FQDN validation ────────────────────────────────────────────────────────
+    _vhead "Hostname (FQDN) Validation"
+    _valid_fqdn() {
+        [[ "${1:-}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
+    }
+    local hn_var hn_val
+    for hn_var in IDM_HOSTNAME SAT_HOSTNAME AAP_HOSTNAME; do
+        hn_val="${!hn_var:-}"
+        [ -z "${hn_val}" ] && continue
+        if _valid_fqdn "${hn_val}"; then
+            _vok "${hn_var} is a valid FQDN: ${hn_val}"
+        else
+            _vfail "${hn_var} is not a valid FQDN (must contain ≥1 dot): ${hn_val}"
+        fi
+    done
+
+    # ── Storage ────────────────────────────────────────────────────────────────
+    _vhead "Storage Requirements (/var/lib/libvirt)"
+    local avail_gb
+    avail_gb=$(df -BG /var/lib/libvirt 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}') || avail_gb=""
+    if [ -n "${avail_gb:-}" ] && [[ "${avail_gb}" =~ ^[0-9]+$ ]]; then
+        if [ "${avail_gb}" -ge 300 ]; then
+            _vok "${avail_gb} GB free (≥300 GB required)"
+        else
+            _vfail "Only ${avail_gb} GB free — need ≥300 GB"
+        fi
+    else
+        _vwarn "Could not determine free space on /var/lib/libvirt"
+    fi
+
+    # ── Memory ────────────────────────────────────────────────────────────────
+    _vhead "Memory Requirements"
+    local mem_gb
+    mem_gb=$(awk '/MemTotal/{print int($2/1024/1024)}' /proc/meminfo 2>/dev/null) || mem_gb=""
+    if [ -n "${mem_gb:-}" ] && [[ "${mem_gb}" =~ ^[0-9]+$ ]]; then
+        if [ "${mem_gb}" -ge 64 ]; then
+            _vok "System RAM: ${mem_gb} GB (≥64 GB recommended)"
+        else
+            _vwarn "System RAM: ${mem_gb} GB — ≥64 GB recommended; may be constrained"
+        fi
+    else
+        _vwarn "Could not read /proc/meminfo"
+    fi
+
+    # ── Connectivity ──────────────────────────────────────────────────────────
+    _vhead "Connectivity Tests"
+    if curl -sSf --connect-timeout 5 "https://api.access.redhat.com/ping" -o /dev/null 2>&1; then
+        _vok "Red Hat CDN reachable (api.access.redhat.com)"
+    else
+        _vfail "Cannot reach Red Hat CDN — check internet / proxy connectivity"
+    fi
+    if nslookup redhat.com >/dev/null 2>&1; then
+        _vok "DNS resolution working"
+    else
+        _vwarn "DNS resolution may not be working"
+    fi
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    _vhead "Summary"
+    printf "\n  Passed:   ${_vGREEN}%d${_vNC}\n" "${VPASS}"
+    printf   "  Warnings: ${_vYELLOW}%d${_vNC}\n" "${VWARN}"
+    printf   "  Failed:   ${_vRED}%d${_vNC}\n\n"  "${VFAIL}"
+
+    if [ "${VFAIL}" -eq 0 ]; then
+        printf "${_vGREEN}✓ All critical checks passed!${_vNC}\n\n"
+        local env_arg=""
+        [ -n "${PRESEED_ENV_FILE:-}" ] && [ -f "${PRESEED_ENV_FILE}" ] && \
+            env_arg=" --env-file ${PRESEED_ENV_FILE}"
+        printf "To deploy:\n  %s --non-interactive --menu-choice %s%s\n\n" \
+            "$(basename "${BASH_SOURCE[0]}")" "${choice}" "${env_arg}"
+        [ "${VWARN}" -gt 0 ] && \
+            printf "Note: %d warning(s) above — review before deploying.\n\n" "${VWARN}"
+        return 0
+    else
+        printf "${_vRED}✗ %d critical check(s) failed — fix issues above before deploying.${_vNC}\n\n" \
+            "${VFAIL}"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# generate_env_template
+#
+# Writes a filled headless env-file template to the specified path.
+# Called via --generate-env [path].  Defaults to ./rhis-headless.env.template.
+# ---------------------------------------------------------------------------
+generate_env_template() {
+    local output_path="${1:-${SCRIPT_DIR}/rhis-headless.env.template}"
+    if [ -f "${output_path}" ]; then
+        print_warning "File already exists: ${output_path}"
+        printf "Overwrite? [y/N] "
+        local ans
+        read -r ans
+        [[ "${ans:-n}" =~ ^[Yy] ]] || { print_warning "Aborted."; return 1; }
+    fi
+    cat > "${output_path}" <<'ENV_TEMPLATE_EOF'
+#!/bin/bash
+# RHIS Headless Environment Configuration Template
+#
+# Usage:
+#   1. Copy this file:  cp rhis-headless.env.template /etc/rhis/headless.env
+#   2. Fill it in:      nano /etc/rhis/headless.env
+#   3. Validate:        ./rhis_install.sh --validate --menu-choice 5 \
+#                                         --env-file /etc/rhis/headless.env
+#   4. Deploy:          ./rhis_install.sh --non-interactive --menu-choice 5 \
+#                                         --env-file /etc/rhis/headless.env
+#
+# Security:
+#   chmod 600 /etc/rhis/headless.env
+#   Never commit this file with real credentials to version control.
+
+# =============================================================================
+# CORE CREDENTIALS  (required for almost all menu choices)
+# =============================================================================
+# Red Hat CDN / subscription-manager credentials
+RH_USER="${RH_USERNAME:-}"
+RH_PASS="${RH_PASSWORD:-}"
+
+# Local admin user and password for every managed VM
+ADMIN_USER="rhisadmin"
+ADMIN_PASS="${ADMIN_PASSWORD:-}"
+
+# Root password for kickstart-provisioned VMs
+ROOT_PASS="${ROOT_PASSWORD:-}"
+
+# =============================================================================
+# IdM CONFIGURATION  (required for menu choices 3, 4, 5, 7)
+# =============================================================================
+IDM_IP="10.168.128.3"               # Static IP on the internal bridge network
+IDM_HOSTNAME="idm.example.com"      # FQDN — must contain at least one dot
+IDM_ALIAS="idm"                     # Short hostname
+DOMAIN="example.com"                # Base domain / Kerberos realm base
+IDM_DS_PASS="${IDM_DS_PASSWORD:-}"  # Directory Server (LDAP) password
+
+# =============================================================================
+# SATELLITE CONFIGURATION  (required for menu choices 3, 4, 5, 7)
+# =============================================================================
+SAT_IP="10.168.128.1"
+SAT_HOSTNAME="satellite.example.com"
+SAT_ALIAS="satellite"
+SAT_ORG="Default_Organization"      # Satellite organization name
+SAT_LOC="Default_Location"          # Satellite location name
+SAT_ADMIN_PASS="${ADMIN_PASSWORD:-}"
+
+# =============================================================================
+# AAP (Ansible Automation Platform) CONFIGURATION  (required for 3, 4, 5, 7)
+# =============================================================================
+AAP_IP="10.168.128.2"
+AAP_HOSTNAME="aap.example.com"
+AAP_ALIAS="aap"
+AAP_ADMIN_PASS="${ADMIN_PASSWORD:-}"
+
+# Red Hat Automation Hub offline token
+HUB_TOKEN="${AAP_HUB_TOKEN:-}"
+
+# (Optional) Separate API token for ansible.cfg galaxy_server
+# VAULT_CONSOLE_REDHAT_TOKEN="${CONSOLE_REDHAT_TOKEN:-}"
+
+# =============================================================================
+# NETWORK CONFIGURATION  (optional — auto-detected when empty)
+# =============================================================================
+HOST_INT_IP="192.168.122.1"         # KVM NAT bridge IP on the installer host
+# INTERNAL_NETWORK="10.168.0.0"
+# NETMASK="255.255.0.0"
+# INTERNAL_GW="10.168.0.1"
+
+# =============================================================================
+# VM RESOURCE CONFIGURATION  (optional — uncomment to override defaults)
+# =============================================================================
+# IDM_VCPUS="4"
+# IDM_MEMORY_MB="16384"
+# SAT_VCPUS="8"
+# SAT_MEMORY_MB="32768"
+# AAP_VCPUS="8"
+# AAP_MEMORY_MB="16384"
+
+# =============================================================================
+# FEATURE FLAGS  (optional — uncomment to override)
+# =============================================================================
+# DEMO_MODE="0"                           # 1 = minimal/demo VM specs
+# RHIS_AUTO_CONFIG_ON_CONTAINER_ONLY="1"
+# RHIS_RETRY_FAILED_PHASES_ONCE="1"
+# RHIS_ENABLE_POST_HEALTHCHECK="1"
+# RHIS_HEALTHCHECK_AUTOFIX="1"
+
+# =============================================================================
+# AAP INVENTORY TEMPLATE  (optional — prompted interactively if empty)
+# Set to one of: "inventory", "inventory-growth", "DEMO-inventory"
+# =============================================================================
+# AAP_INVENTORY_TEMPLATE=""
+# AAP_INVENTORY_GROWTH_TEMPLATE=""
+ENV_TEMPLATE_EOF
+
+    chmod 600 "${output_path}"
+    print_success "Env template written to: ${output_path}"
+    printf "\nNext steps:\n"
+    printf "  1. Edit:     nano %s\n" "${output_path}"
+    printf "  2. Validate: %s --validate --menu-choice 5 --env-file %s\n" \
+        "$(basename "${BASH_SOURCE[0]}")" "${output_path}"
+    printf "  3. Deploy:   %s --non-interactive --menu-choice 5 --env-file %s\n\n" \
+        "$(basename "${BASH_SOURCE[0]}")" "${output_path}"
 }
 
 wait_for_post_vm_settle() {
@@ -8696,11 +9078,23 @@ main() {
         exit 0
     fi
 
+    # CLI-only fast path: write headless env template and exit.
+    if [ -n "${CLI_GENERATE_ENV:-}" ]; then
+        generate_env_template "${CLI_GENERATE_ENV}"
+        exit $?
+    fi
+
     if [ ! -f "$ANSIBLE_ENV_FILE" ]; then
         load_preseed_env
     fi
     load_ansible_env_file
     normalize_shared_env_vars
+
+    # CLI-only fast path: run pre-flight validation and exit.
+    if [ -n "${CLI_VALIDATE:-}" ]; then
+        validate_headless_config
+        exit $?
+    fi
 
     ensure_workspace_runtime_layout || {
         print_warning "Could not initialize generated workspace runtime layout."
