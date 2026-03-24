@@ -67,8 +67,8 @@ RHIS_HOST_VARS_DIR="${RHIS_HOST_VARS_DIR:-$SCRIPT_DIR/host_vars}"
 
 REPO_URL="${REPO_URL:-}"
 PRESEED_ENV_FILE="${PRESEED_ENV_FILE:-$SCRIPT_DIR/.env}"
-RH_ISO_URL="${RH_ISO_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/ec/ecc0e9b760247f0ef43100d88ed930a3a8a868545d5db6ad940c5c73be6fb047/rhel-10.1-x86_64-boot.iso?user=dfb5278729bd015d083f488da113c04b&_auth_=1773884550_69d13122ab14a5736321fe8cfe9c1c9d}"
-RH9_ISO_URL="${RH9_ISO_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/aa/aac774e5aba1c0275d50e0cc4e0e08eca660a116773280596e0bcb894d2da16d/rhel-9.7-x86_64-dvd.iso?user=dfb5278729bd015d083f488da113c04b&_auth_=1774126174_9c7dc7bd033124cd0884ec0b856f122e}"
+RH_ISO_URL="${RH_ISO_URL:-}"
+RH9_ISO_URL="${RH9_ISO_URL:-}"
 CLI_MENU_CHOICE=""
 CLI_NONINTERACTIVE=""
 RUN_ONCE="${RUN_ONCE:-0}"
@@ -137,7 +137,7 @@ HUB_TOKEN="${HUB_TOKEN:-}"
 # If unset, HUB_TOKEN is used as fallback.
 VAULT_CONSOLE_REDHAT_TOKEN="${VAULT_CONSOLE_REDHAT_TOKEN:-}"
 HOST_INT_IP="${HOST_INT_IP:-192.168.122.1}"
-AAP_BUNDLE_URL="${AAP_BUNDLE_URL:-https://access.cdn.redhat.com/content/origin/files/sha256/c9/c953da394644892ad66dabdc57fcb4e4022724501466a90904001526fe5660d3/ansible-automation-platform-containerized-setup-bundle-2.6-6-x86_64.tar.gz?user=dfb5278729bd015d083f488da113c04b&_auth_=1773884622_1b332b37fd083ba0f82e94d32ee65a51}"
+AAP_BUNDLE_URL="${AAP_BUNDLE_URL:-}"
 AAP_BUNDLE_DIR="${AAP_BUNDLE_DIR:-${VM_DIR}/aap-bundle}"
 AAP_HTTP_PID=""
 AAP_HTTP_LOG="${AAP_HTTP_LOG:-/tmp/aap-http-server-$(date +%s).log}"
@@ -479,6 +479,73 @@ mask_url_secret() {
 sed_escape_replacement() {
     # Escape chars that are special in sed replacement context: &, |, \
     printf '%s' "${1:-}" | sed -e 's/[&|\\]/\\&/g'
+}
+
+write_file_if_changed() {
+    local src="$1"
+    local dest="$2"
+    local mode="${3:-0644}"
+    local owner="${4:-}"
+    local dest_dir
+
+    RHIS_LAST_WRITE_CHANGED=0
+
+    [ -f "$src" ] || {
+        print_warning "write_file_if_changed: source file not found: $src"
+        return 1
+    }
+
+    if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+        rm -f "$src"
+        print_step "Generated file unchanged: $dest"
+        return 0
+    fi
+
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir" 2>/dev/null || sudo mkdir -p "$dest_dir" >/dev/null 2>&1 || {
+        rm -f "$src"
+        print_warning "Could not create destination directory: $dest_dir"
+        return 1
+    }
+
+    if ! install -D -m "$mode" "$src" "$dest" 2>/dev/null; then
+        sudo install -D -m "$mode" "$src" "$dest" >/dev/null 2>&1 || {
+            rm -f "$src"
+            print_warning "Could not install generated file: $dest"
+            return 1
+        }
+    fi
+
+    if [ -n "$owner" ]; then
+        chown "$owner" "$dest" 2>/dev/null || sudo chown "$owner" "$dest" >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$src"
+    RHIS_LAST_WRITE_CHANGED=1
+    print_success "Generated file updated: $dest"
+    return 0
+}
+
+vault_plaintext_matches_existing() {
+    local plaintext_file="$1"
+    local existing_plaintext=""
+    local rc=1
+
+    [ -f "$plaintext_file" ] || return 1
+    [ -f "$ANSIBLE_ENV_FILE" ] || return 1
+
+    existing_plaintext="$(mktemp)"
+    ansible-vault view --vault-password-file "$ANSIBLE_VAULT_PASS_FILE" "$ANSIBLE_ENV_FILE" > "$existing_plaintext" 2>/dev/null || {
+        rm -f "$existing_plaintext"
+        return 1
+    }
+
+    if cmp -s "$plaintext_file" "$existing_plaintext"; then
+        rc=0
+    fi
+
+    rm -f "$existing_plaintext"
+    return "$rc"
 }
 
 kickstart_nogpg_policy_block() {
@@ -826,6 +893,8 @@ print_runtime_configuration() {
 }
 
 generate_rhis_ansible_cfg() {
+    local tmp_cfg
+
     mkdir -p "${ANSIBLE_ENV_DIR}" "${RHIS_ANSIBLE_FACT_CACHE_HOST}" || return 1
     chmod 700 "${ANSIBLE_ENV_DIR}" "${RHIS_ANSIBLE_FACT_CACHE_HOST}" 2>/dev/null || true
 
@@ -833,7 +902,9 @@ generate_rhis_ansible_cfg() {
     # This token is used for Automation Hub galaxy server auth entries.
     local ah_token="${VAULT_CONSOLE_REDHAT_TOKEN:-${HUB_TOKEN:-}}"
 
-    cat > "${RHIS_ANSIBLE_CFG_HOST}" <<EOF
+    tmp_cfg="$(mktemp "${ANSIBLE_ENV_DIR}/.rhis-ansible.cfg.XXXXXX")" || return 1
+
+    cat > "${tmp_cfg}" <<EOF
 [defaults]
 inventory = /rhis/vars/external_inventory/hosts
 host_key_checking = False
@@ -876,10 +947,10 @@ token = ${ah_token}
 url = https://galaxy.ansible.com/
 EOF
 
-    chmod 600 "${RHIS_ANSIBLE_CFG_HOST}" 2>/dev/null || true
+    chmod 600 "${tmp_cfg}" 2>/dev/null || true
+    write_file_if_changed "${tmp_cfg}" "${RHIS_ANSIBLE_CFG_HOST}" 0600 || return 1
     touch "${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}" 2>/dev/null || true
     chmod 600 "${ANSIBLE_ENV_DIR}/${AAP_ANSIBLE_LOG_BASENAME}" 2>/dev/null || true
-    print_success "Generated RHIS Ansible config: ${RHIS_ANSIBLE_CFG_HOST}"
     return 0
 }
 
@@ -1462,8 +1533,8 @@ normalize_shared_env_vars() {
     ADMIN_USER="${ADMIN_USER:-admin}"
     # Global admin password is the authoritative root password for all systems.
     # Do not infer it from per-system service/admin passwords.
-    ADMIN_PASS="${ADMIN_PASS:-r3dh4t7!}"  # fallback only if vault did not supply a value
-    ROOT_PASS="${ADMIN_PASS}"
+    ADMIN_PASS="${ADMIN_PASS:-}"
+    ROOT_PASS="${ROOT_PASS:-${ADMIN_PASS}}"
     IDM_ADMIN_PASS="${IDM_ADMIN_PASS:-${ADMIN_PASS}}"
     IPADM_PASSWORD="${IPADM_PASSWORD:-${IDM_ADMIN_PASS:-${ADMIN_PASS}}}"
     IPAADMIN_PASSWORD="${IPAADMIN_PASSWORD:-${IDM_ADMIN_PASS:-${ADMIN_PASS}}}"
@@ -1533,10 +1604,11 @@ normalize_shared_env_vars() {
     SAT_REALM="${SAT_REALM:-$REALM}"
     IDM_REALM="${IDM_REALM:-$REALM}"
 
-    # Per-system admin passwords are intentionally unified to the global value.
-    SAT_ADMIN_PASS="${ADMIN_PASS}"
-    AAP_ADMIN_PASS="${ADMIN_PASS}"
-    IDM_ADMIN_PASS="${ADMIN_PASS}"
+    # Per-system admin passwords default to the shared admin password, but do
+    # not override explicit per-role values when they are provided.
+    SAT_ADMIN_PASS="${SAT_ADMIN_PASS:-${ADMIN_PASS}}"
+    AAP_ADMIN_PASS="${AAP_ADMIN_PASS:-${ADMIN_PASS}}"
+    IDM_ADMIN_PASS="${IDM_ADMIN_PASS:-${ADMIN_PASS}}"
     IDM_DS_PASS="${IDM_DS_PASS:-${ADMIN_PASS}}"
 
     SAT_NETMASK="${SAT_NETMASK:-$NETMASK}"
@@ -3196,14 +3268,10 @@ validate_headless_config() {
 # ---------------------------------------------------------------------------
 generate_env_template() {
     local output_path="${1:-${SCRIPT_DIR}/rhis-headless.env.template}"
-    if [ -f "${output_path}" ]; then
-        print_warning "File already exists: ${output_path}"
-        printf "Overwrite? [y/N] "
-        local ans
-        read -r ans
-        [[ "${ans:-n}" =~ ^[Yy] ]] || { print_warning "Aborted."; return 1; }
-    fi
-    cat > "${output_path}" <<'ENV_TEMPLATE_EOF'
+    local tmp_template=""
+
+    tmp_template="$(mktemp)" || return 1
+    cat > "${tmp_template}" <<'ENV_TEMPLATE_EOF'
 #!/bin/bash
 # RHIS Headless Environment Configuration Template
 #
@@ -3301,8 +3369,8 @@ HOST_INT_IP="192.168.122.1"         # KVM NAT bridge IP on the installer host
 # AAP_INVENTORY_GROWTH_TEMPLATE=""
 ENV_TEMPLATE_EOF
 
-    chmod 600 "${output_path}"
-    print_success "Env template written to: ${output_path}"
+    chmod 600 "${tmp_template}"
+    write_file_if_changed "${tmp_template}" "${output_path}" 0600 || return 1
     printf "\nNext steps:\n"
     printf "  1. Edit:     nano %s\n" "${output_path}"
     printf "  2. Validate: %s --validate --menu-choice 5 --env-file %s\n" \
@@ -5722,6 +5790,12 @@ rh9_iso_url: "${RH9_ISO_URL:-}"
 RHIS_ENV_EOF
     chmod 600 "$tmp_env"
 
+    if vault_plaintext_matches_existing "$tmp_env"; then
+        rm -f "$tmp_env"
+        print_step "Encrypted environment unchanged: $ANSIBLE_ENV_FILE"
+        return 0
+    fi
+
     ansible-vault encrypt --vault-password-file "$ANSIBLE_VAULT_PASS_FILE" "$tmp_env" >/dev/null 2>&1 || {
         print_warning "Failed to encrypt $tmp_env with ansible-vault."
         rm -f "$tmp_env"
@@ -6903,6 +6977,7 @@ generate_satellite_618_kickstart() {
     local tmpdir tmp_ks tmp_oem
     local sat_ext_mac sat_int_mac
     local sat_prefix
+    local ks_changed=0
     local bootstrap_ssh_keys
     local ks_nogpg_policy
     local ks_ssh_baseline
@@ -6940,8 +7015,6 @@ generate_satellite_618_kickstart() {
     tmpdir="$(mktemp -d)"
     tmp_ks="${tmpdir}/satellite-618.ks"
     tmp_oem="${tmpdir}/ks.cfg"
-
-    sudo rm -f "$ks_file" "$OEMDRV_ISO"
 
     # --- Common header ---
     cat > "$tmp_ks" <<HEADER
@@ -7193,8 +7266,19 @@ echo "===== END RHIS NETWORK SNAPSHOT ====="
 POSTEOF
 
     cp "$tmp_ks" "$tmp_oem"
-    sudo mkdir -p "$KS_DIR"
-    sudo install -m 0644 "$tmp_ks" "$ks_file"
+    write_file_if_changed "$tmp_ks" "$ks_file" 0644 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    ks_changed="${RHIS_LAST_WRITE_CHANGED:-0}"
+
+    if [ "$ks_changed" = "0" ] && [ -f "$OEMDRV_ISO" ]; then
+        rm -rf "$tmpdir"
+        print_step "OEMDRV ISO unchanged: $OEMDRV_ISO"
+        print_success "Generated Satellite kickstart: $ks_file"
+        print_success "Created OEMDRV ISO: $OEMDRV_ISO"
+        return 0
+    fi
 
     print_step "Packaging Satellite kickstart into OEMDRV ISO"
     if command -v genisoimage >/dev/null 2>&1; then
@@ -7628,8 +7712,6 @@ generate_aap_kickstart() {
 
     tmp_ks="$(mktemp)"
 
-    sudo rm -f "$ks_file"
-
     # --- Common header ---
     cat > "$tmp_ks" <<HEADER
 text
@@ -7832,9 +7914,7 @@ POSTEOF
     sed -i "s|{{AAP_SHORT}}|${AAP_HOSTNAME%%.*}|g" "$tmp_ks"
     sed -i "s|{{IDM_SHORT}}|${IDM_HOSTNAME%%.*}|g" "$tmp_ks"
 
-    sudo mkdir -p "$KS_DIR"
-    sudo install -m 0644 "$tmp_ks" "$ks_file"
-    rm -f "$tmp_ks"
+    write_file_if_changed "$tmp_ks" "$ks_file" 0644 || return 1
     print_success "Generated AAP kickstart: $ks_file"
 }
 
@@ -7896,8 +7976,6 @@ generate_idm_kickstart() {
     ks_trust_bootstrap_keys="$(kickstart_trust_bootstrap_keys_block 1)"
 
     tmp_ks="$(mktemp)"
-
-    sudo rm -f "$ks_file"
 
     # --- Common header ---
     cat > "$tmp_ks" <<HEADER
@@ -8029,9 +8107,7 @@ echo "===== END RHIS NETWORK SNAPSHOT ====="
 %end
 POSTEOF
 
-    sudo mkdir -p "$KS_DIR"
-    sudo install -m 0644 "$tmp_ks" "$ks_file"
-    rm -f "$tmp_ks"
+    write_file_if_changed "$tmp_ks" "$ks_file" 0644 || return 1
     print_success "Generated IdM kickstart: $ks_file"
 }
 
@@ -8047,8 +8123,6 @@ cleanup_generated_kickstart_artifacts() {
 }
 
 write_kickstarts() {
-    cleanup_generated_kickstart_artifacts
-
     generate_satellite_618_kickstart || return 1
     generate_aap_kickstart || return 1
     generate_idm_kickstart || return 1

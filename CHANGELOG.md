@@ -11,6 +11,25 @@ This file tracks repository changes from this point forward.
 
 ---
 
+## 2026-03-24 11:13:51 MDT
+
+### 2026-03-24 11:13:51 MDT — Agnostic/idempotent script hardening
+
+- **Area:** `rhis_install.sh`
+- **Summary:**
+  - Removed baked-in default values for `RH_ISO_URL`, `RH9_ISO_URL`, and `AAP_BUNDLE_URL` so the script no longer depends on stale/expired environment-specific download links.
+  - Removed the hard-coded fallback `ADMIN_PASS` value and preserved explicit `ROOT_PASS`, `SAT_ADMIN_PASS`, `AAP_ADMIN_PASS`, and `IDM_ADMIN_PASS` overrides instead of forcibly replacing them with the shared admin password.
+  - Added `write_file_if_changed()` to make generated artifacts converge only when content changes instead of being rewritten on every run.
+  - Added `vault_plaintext_matches_existing()` so `write_ansible_env_file()` skips re-encrypting `env.yml` when the plaintext content is unchanged.
+  - Updated `generate_rhis_ansible_cfg()` to write through a temp file and only replace the live config when the rendered content changes.
+  - Updated `generate_env_template()` to be idempotent (no forced overwrite prompt/rewrite when content is unchanged).
+  - Updated Satellite/AAP/IdM kickstart generation to stop deleting/reinstalling kickstarts on every run; files now update only when the rendered content changes.
+  - Updated Satellite OEMDRV packaging to skip rebuilding the ISO when the underlying kickstart is unchanged and the ISO already exists.
+  - Removed the eager `cleanup_generated_kickstart_artifacts` call from `write_kickstarts()` so normal reruns preserve stable artifacts rather than deleting them first.
+- **Reason:** Make RHIS safer to re-run on different hosts/environments with fewer hidden assumptions, less artifact churn, and more declarative/idempotent behavior.
+
+---
+
 ## 2026-03-24 10:50:00 MDT
 
 ### 2026-03-24 10:50:00 MDT — Merge headless helper files into rhis_install.sh
