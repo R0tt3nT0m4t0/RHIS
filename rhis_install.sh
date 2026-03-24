@@ -133,6 +133,10 @@ RHIS_PROMPTS_COMPLETED="${RHIS_PROMPTS_COMPLETED:-0}"
 
 # Automation Hub + AAP bundle pre-flight HTTP-serve variables
 HUB_TOKEN="${HUB_TOKEN:-}"
+# Red Hat registry service account credentials for online non-bundled installs.
+# When unset, RH_USER/RH_PASS remain the compatibility fallback.
+REGISTRY_USERNAME="${REGISTRY_USERNAME:-}"
+REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-}"
 # Automation Hub API token used for [galaxy_server.*] in rhis-ansible.cfg.
 # If unset, HUB_TOKEN is used as fallback.
 VAULT_CONSOLE_REDHAT_TOKEN="${VAULT_CONSOLE_REDHAT_TOKEN:-}"
@@ -6672,6 +6676,7 @@ wait_for_vm_ssh() {
 run_aap_setup_on_vm() {
     local vm_name="${1:-aap-26}"
     local vm_ip
+    local installer_inventory
 
     if ! is_enabled "${AAP_SSH_CALLBACK_ENABLED:-0}"; then
         print_step "AAP SSH callback is disabled; skipping run_aap_setup_on_vm."
@@ -6683,56 +6688,30 @@ run_aap_setup_on_vm() {
         return 1
     }
 
+    installer_inventory="$(aap_installer_inventory_filename)"
+
     print_step "Running AAP containerized installer via SSH on ${vm_name} (${vm_ip})..."
+    print_step "  Installer command: ansible-playbook -i ${installer_inventory} ansible.containerized_installer.install"
     print_step "  Output will be logged to: ${AAP_SETUP_LOG_LOCAL}"
 
-    # SSH in and run installer entrypoint, capturing output with timestamp.
-    # Entry-point selection:
-    #   1) setup.sh (legacy)
-    #   2) ansible-playbook with auto-detected install playbook + rendered inventory
+    # SSH in and run the collection playbook entrypoint with the selected inventory.
     {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting AAP setup on ${vm_ip}"
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -i "${AAP_SSH_PRIVATE_KEY}" "root@${vm_ip}" \
-            'set -euo pipefail
+            "set -euo pipefail
              cd /root/aap-setup
 
-             if [ -x ./setup.sh ]; then
-                 echo "[aap-install] using legacy setup.sh"
-                 exec bash ./setup.sh 2>&1
-             fi
-
-             echo "[aap-install] setup.sh not present; using ansible-playbook entrypoint"
              command -v ansible-playbook >/dev/null 2>&1 || dnf install -y --nogpgcheck ansible-core
 
-             inv_file="inventory"
-             if [ "${DEMO_MODE:-0}" = "1" ] && [ -f "DEMO-inventory" ]; then
-                 inv_file="DEMO-inventory"
-             elif [ ! -f "${inv_file}" ] && [ -f "inventory-growth" ]; then
-                 inv_file="inventory-growth"
-             fi
-
-             playbook=""
-             for candidate in install.yml setup.yml site.yml playbook.yml playbooks/install.yml; do
-                 if [ -f "${candidate}" ]; then
-                     playbook="${candidate}"
-                     break
-                 fi
-             done
-
-             if [ -z "${playbook}" ]; then
-                 playbook="$(find . -maxdepth 3 -type f \( -name "*install*.yml" -o -name "site.yml" -o -name "setup.yml" \) | head -1)"
-             fi
-
-             if [ -z "${playbook}" ]; then
-                 echo "[aap-install] ERROR: no installer playbook found under /root/aap-setup"
+             if [ ! -f \"${installer_inventory}\" ]; then
+                 echo \"[aap-install] ERROR: expected inventory file not found: ${installer_inventory}\"
                  ls -la
-                 find . -maxdepth 3 -type f | sed -n "1,120p"
                  exit 1
              fi
 
-             echo "[aap-install] running ansible-playbook -i ${inv_file} ${playbook}"
-             exec ansible-playbook -i "${inv_file}" "${playbook}" 2>&1' || {
+             echo \"[aap-install] running ansible-playbook -i ${installer_inventory} ansible.containerized_installer.install\"
+             exec ansible-playbook -i \"${installer_inventory}\" ansible.containerized_installer.install 2>&1" || {
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] AAP setup FAILED on ${vm_ip}"
                 return 1
             }
@@ -7449,6 +7428,34 @@ ensure_aap_pg_database_if_needed() {
     return 0
 }
 
+aap_installer_inventory_filename() {
+    local selected="${AAP_INVENTORY_TEMPLATE:-}"
+    local base=""
+
+    if is_demo; then
+        printf '%s\n' "DEMO-inventory"
+        return 0
+    fi
+
+    [ -n "$selected" ] || {
+        printf '%s\n' "inventory"
+        return 0
+    }
+
+    base="$(basename "$selected")"
+    case "$base" in
+        DEMO-inventory.j2|DEMO-inventory)
+            printf '%s\n' "DEMO-inventory"
+            ;;
+        inventory-growth.j2|inventory-growth)
+            printf '%s\n' "inventory-growth"
+            ;;
+        *)
+            printf '%s\n' "inventory"
+            ;;
+    esac
+}
+
 _rhis_show_about_inventory() {
     cat <<'ABOUT_INV'
 
@@ -7909,15 +7916,18 @@ fi
 
 tar -xzf /root/aap-bundle.tar.gz -C /root/aap-setup --strip-components=1
 rm -f /root/aap-bundle.tar.gz
-if [ ! -x /root/aap-setup/setup.sh ] && ! find /root/aap-setup -maxdepth 3 -type f \( -name "*install*.yml" -o -name "site.yml" -o -name "setup.yml" \) | grep -q .; then
-    echo "ERROR: AAP bundle extraction failed (missing setup.sh and no install playbook found)."
+if ! find /root/aap-setup -mindepth 1 -maxdepth 1 | grep -q .; then
+    echo "ERROR: AAP bundle extraction failed (extracted directory is empty)."
     exit 1
 fi
-if [ -x /root/aap-setup/setup.sh ]; then
-    echo "AAP installer entrypoint detected: /root/aap-setup/setup.sh" >> /var/log/aap-setup-ready.log
+if [ "${DEMO_MODE:-0}" = "1" ]; then
+    echo "AAP installer inventory selected: DEMO-inventory" >> /var/log/aap-setup-ready.log
+elif [ -f /root/aap-setup/inventory-growth ]; then
+    echo "AAP installer inventory available: inventory-growth" >> /var/log/aap-setup-ready.log
 else
-    echo "AAP installer entrypoint detected: playbook-driven bundle" >> /var/log/aap-setup-ready.log
+    echo "AAP installer inventory selected: inventory" >> /var/log/aap-setup-ready.log
 fi
+echo "AAP installer entrypoint detected: ansible-playbook -i <inventory> ansible.containerized_installer.install" >> /var/log/aap-setup-ready.log
 echo "Bundle extracted. Ready for SSH callback." >> /var/log/aap-setup-ready.log
 
 # 5. SSH callback key injection
