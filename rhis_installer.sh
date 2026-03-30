@@ -5742,6 +5742,8 @@ run_rhis_config_as_code() {
         local root_auth_pass="${ROOT_PASS:-${ADMIN_PASS:-}}"
         local rh_user_q=""
         local rh_pass_q=""
+        local admin_user_q=""
+        local admin_pass_q=""
         local remote_cmd=""
 
         if ! is_enabled "${RHIS_SAT_PRECONTAINER_BOOTSTRAP:-1}"; then
@@ -5758,6 +5760,8 @@ run_rhis_config_as_code() {
 
         printf -v rh_user_q '%q' "${RH_USER}"
         printf -v rh_pass_q '%q' "${RH_PASS}"
+        printf -v admin_user_q '%q' "${ADMIN_USER:-admin}"
+        printf -v admin_pass_q '%q' "${ADMIN_PASS:-}"
 
         # Ensure we have a usable SSH key path for root login first.
         if [ ! -r "${ssh_key}" ]; then
@@ -5777,9 +5781,16 @@ dnf upgrade -y; \
 subscription-manager repos --enable=rhel-9-for-x86_64-baseos-rpms --enable=rhel-9-for-x86_64-appstream-rpms --enable=satellite-6.18-for-rhel-9-x86_64-rpms --enable=satellite-maintenance-6.18-for-rhel-9-x86_64-rpms; \
 dnf clean all; \
 dnf install -y satellite; \
-satellite-installer --scenario satellite"
+foreman-maintain packages unlock >/dev/null 2>&1 || true; \
+satellite-installer --scenario satellite \
+  --foreman-initial-organization \"${SAT_ORG:-REDHAT}\" \
+  --foreman-initial-location \"${SAT_LOC:-CORE}\" \
+  --foreman-initial-admin-username ${admin_user_q} \
+  --foreman-initial-admin-password ${admin_pass_q} \
+  --enable-foreman-plugin-ansible \
+  --enable-foreman-proxy-plugin-ansible"
 
-        print_step "Pre-container Satellite bootstrap: register, upgrade, enable repos, install satellite, run satellite-installer --scenario satellite"
+    print_step "Pre-container Satellite bootstrap: register, upgrade, enable repos, install satellite, run first-pass satellite-installer with org/location/admin + Ansible plugins"
 
         if [ -r "${ssh_key}" ] && timeout 10 ssh -i "${ssh_key}" -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@${sat_target_ip}" 'echo ready' >/dev/null 2>&1; then
             if ssh -i "${ssh_key}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@${sat_target_ip}" "${remote_cmd}"; then
@@ -6228,7 +6239,7 @@ else:
     }
 
     ensure_container_playbook_hotfixes() {
-        local _verify_cmd='test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 && test -f /rhis/rhis-builder-idm/roles/idm_pre/templates/chrony.j2 && grep -q "failed_when: false" /rhis/rhis-builder-satellite/roles/satellite_pre/tasks/is_satellite_installed.yml && grep -q "disable_gpg_check: true" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml && grep -q "exclude: \"intel-audio-firmware\\*\"" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml'
+        local _verify_cmd='test -f /rhis/rhis-builder-satellite/roles/satellite_pre/templates/chrony.j2 && test -f /rhis/rhis-builder-idm/roles/idm_pre/templates/chrony.j2 && grep -q "failed_when: false" /rhis/rhis-builder-satellite/roles/satellite_pre/tasks/is_satellite_installed.yml && grep -q "disable_gpg_check: true" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml && grep -q "exclude: \"intel-audio-firmware\\*\"" /rhis/rhis-builder-idm/roles/idm_pre/tasks/ensure_update_system.yml && grep -q "Check Satellite API endpoint readiness (hard gate)" /rhis/rhis-builder-satellite/tasks/configure_hammer.yml && grep -q "vars\['"'"'ansible_roles_import_list'"'"'\]" /rhis/rhis-builder-satellite/tasks/ensure_import_roles.yml && grep -q "Ensure local Satellite proxy has TFTP enabled in Foreman" /rhis/rhis-builder-satellite/tasks/build_pxe_linux_defaults.yml && test -f /rhis/rhis-builder-satellite/tasks/ensure_local_tftp_proxy.yml && test -f /rhis/rhis-builder-satellite/roles/satellite_pre/tasks/ensure_packages_unlock.yml'
         local _verified=1
 
         print_step "Pre-flight: applying container role hotfixes"
@@ -6243,7 +6254,7 @@ else:
         fi
 
         if [ "${_verified}" -eq 0 ]; then
-            print_success "Container hotfix verification passed (Satellite foreman + IdM GPG update guards)."
+            print_success "Container hotfix verification passed (Satellite hammer/PXE/import + IdM GPG update guards)."
             return 0
         fi
 
@@ -6344,7 +6355,7 @@ EOF
             return 1
         }
 
-        local_extra_json="{\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"use_non_idm_certs\":${sat_use_non_idm_certs},\"sat_ssl_certs_dir\":\"${sat_ssl_certs_dir}\",\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay}}"
+        local_extra_json="{\"satellite_disconnected\":${SATELLITE_DISCONNECTED:-false},\"register_to_satellite\":${REGISTER_TO_SATELLITE:-false},\"satellite_pre_use_idm\":${sat_pre_use_idm},\"use_non_idm_certs\":${sat_use_non_idm_certs},\"sat_ssl_certs_dir\":\"${sat_ssl_certs_dir}\",\"async_timeout\":${idm_async_timeout},\"async_delay\":${idm_async_delay},\"satellite_url\":\"https://${SAT_HOSTNAME}\"}"
 
         local_cmd=(
             ansible-playbook
@@ -6628,7 +6639,7 @@ EOF
         local sat_validation_dns="${SAT_PROVISIONING_DNS_PRIMARY:-${sat_target_ip}}"
         local sat_validation_reverse="${SAT_DNS_REVERSE_ZONE:-0.168.10.in-addr.arpa}"
         while [ $retry_count -lt $max_retries ]; do
-            if timeout 5 ssh -i "${ssh_key}" ${ssh_opts} "root@${sat_target_ip}" "satellite-installer --scenario satellite --foreman-initial-organization \"${SAT_ORG:-REDHAT}\" --foreman-initial-location \"${SAT_LOC:-CORE}\" --foreman-initial-admin-username \"${ADMIN_USER:-admin}\" --foreman-initial-admin-password ${admin_pass_q} --foreman-proxy-dns true --foreman-proxy-dns-interface eth1 --foreman-proxy-dns-managed true --foreman-proxy-dns-reverse \"${sat_validation_reverse}\" --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface eth1 --foreman-proxy-dhcp-managed true --foreman-proxy-dhcp-network \"${sat_validation_network}\" --foreman-proxy-dhcp-netmask \"${sat_validation_netmask}\" --foreman-proxy-dhcp-gateway \"${sat_validation_gateway}\" --foreman-proxy-dhcp-range \"${sat_validation_range}\" --foreman-proxy-dhcp-nameservers \"${sat_validation_dns}\" --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --enable-foreman-compute-libvirt --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --register-with-insights true" >/dev/null 2>&1; then
+            if timeout 5 ssh -i "${ssh_key}" ${ssh_opts} "root@${sat_target_ip}" "foreman-maintain packages unlock >/dev/null 2>&1 || true; satellite-installer --scenario satellite --foreman-initial-organization \"${SAT_ORG:-REDHAT}\" --foreman-initial-location \"${SAT_LOC:-CORE}\" --foreman-initial-admin-username \"${ADMIN_USER:-admin}\" --foreman-initial-admin-password ${admin_pass_q} --foreman-proxy-dns true --foreman-proxy-dns-interface eth1 --foreman-proxy-dns-managed true --foreman-proxy-dns-reverse \"${sat_validation_reverse}\" --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface eth1 --foreman-proxy-dhcp-managed true --foreman-proxy-dhcp-network \"${sat_validation_network}\" --foreman-proxy-dhcp-netmask \"${sat_validation_netmask}\" --foreman-proxy-dhcp-gateway \"${sat_validation_gateway}\" --foreman-proxy-dhcp-range \"${sat_validation_range}\" --foreman-proxy-dhcp-nameservers \"${sat_validation_dns}\" --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --enable-foreman-compute-libvirt --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --register-with-insights true" >/dev/null 2>&1; then
                 print_success "  Satellite installed and running (iteration $((retry_count+1))/${max_retries})"
                 break
             fi
@@ -6692,7 +6703,7 @@ hammer compute-resource info --name \"Libvirt_Prod_Server\" | head -n 10 || echo
             return 0
         fi
 
-        installer_cmd="satellite-installer --scenario satellite --foreman-initial-organization \"${SAT_ORG}\" --foreman-initial-location \"${SAT_LOC}\" --foreman-initial-admin-username \"${ADMIN_USER}\" --foreman-initial-admin-password \"${sat_initial_admin_pass}\" --foreman-proxy-dns true --foreman-proxy-dns-interface \"${SAT_FIREWALLD_INTERFACE:-eth1}\" --foreman-proxy-dns-zone \"${sat_dns_zone}\" --foreman-proxy-dns-reverse \"${sat_dns_reverse_zone}\" --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface \"${SAT_FIREWALLD_INTERFACE:-eth1}\" --foreman-proxy-dhcp-gateway \"${SAT_PROVISIONING_GW:-10.168.0.1}\" --foreman-proxy-dhcp-nameservers \"${sat_dhcp_nameservers}\" --foreman-proxy-dhcp-range \"${sat_dhcp_range}\" --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --foreman-proxy-tftp-servername \"${SAT_IP:-10.168.128.1}\" --foreman-proxy-http true --foreman-proxy-templates true --foreman-proxy-puppet false --enable-foreman-plugin-puppet false --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --enable-foreman-plugin-remote-execution --enable-foreman-proxy-plugin-remote-execution-ssh --enable-foreman-compute-ec2 --enable-foreman-compute-gce --enable-foreman-compute-azure --enable-foreman-compute-libvirt --enable-foreman-plugin-openscap --enable-foreman-proxy-plugin-openscap --register-with-insights true"
+        installer_cmd="foreman-maintain packages unlock >/dev/null 2>&1 || true; satellite-installer --scenario satellite --foreman-initial-organization \"${SAT_ORG}\" --foreman-initial-location \"${SAT_LOC}\" --foreman-initial-admin-username \"${ADMIN_USER}\" --foreman-initial-admin-password \"${sat_initial_admin_pass}\" --foreman-proxy-dns true --foreman-proxy-dns-interface \"${SAT_FIREWALLD_INTERFACE:-eth1}\" --foreman-proxy-dns-zone \"${sat_dns_zone}\" --foreman-proxy-dns-reverse \"${sat_dns_reverse_zone}\" --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface \"${SAT_FIREWALLD_INTERFACE:-eth1}\" --foreman-proxy-dhcp-gateway \"${SAT_PROVISIONING_GW:-10.168.0.1}\" --foreman-proxy-dhcp-nameservers \"${sat_dhcp_nameservers}\" --foreman-proxy-dhcp-range \"${sat_dhcp_range}\" --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --foreman-proxy-tftp-servername \"${SAT_IP:-10.168.128.1}\" --foreman-proxy-http true --foreman-proxy-templates true --foreman-proxy-puppet false --enable-foreman-plugin-puppet false --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --enable-foreman-plugin-remote-execution --enable-foreman-proxy-plugin-remote-execution-ssh --enable-foreman-compute-ec2 --enable-foreman-compute-gce --enable-foreman-compute-azure --enable-foreman-compute-libvirt --enable-foreman-plugin-openscap --enable-foreman-proxy-plugin-openscap --register-with-insights true"
         libvirt_prereq_cmd="dnf -y install --nogpgcheck libvirt-client >/dev/null 2>&1 || satellite-maintain packages install libvirt-client >/dev/null 2>&1 || true; su foreman -s /bin/bash -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && [ -f ~/.ssh/id_rsa ] || ssh-keygen -q -t rsa -b 4096 -N \"\" -f ~/.ssh/id_rsa'; su foreman -s /bin/bash -c 'virsh -c ${sat_libvirt_url} list' || { echo \"WARN: foreman->libvirt connectivity test failed for ${sat_libvirt_url}\"; echo \"Foreman public key (copy to libvirt host authorized_keys):\"; su foreman -s /bin/bash -c 'cat ~/.ssh/id_rsa.pub' || true; true; }"
 
         print_step "Satellite post-CaC pass: running satellite-installer --scenario satellite with RHIS options"
@@ -7696,27 +7707,18 @@ hammer compute-resource info --name \"Libvirt_Prod_Server\" | head -n 10 || echo
         [ "${sat_retries}" -gt 0 ] || sat_retries=5
         [ "${sat_interval}" -gt 0 ] || sat_interval=15
 
-        local sat_check='systemctl is-active --quiet httpd; ss -ltn | grep -q ":443\\b"; ping_out="$(hammer ping 2>&1)"; ping_rc=$?; if [ "${ping_rc}" -ne 0 ]; then if printf "%s\n" "$ping_out" | grep -q "for nil:NilClass"; then echo "SAT_HAMMER_PING_NILCLASS"; else echo "SAT_HAMMER_PING_BAD"; fi; exit 1; fi; code="$(curl -k -sS -o /dev/null -w "%{http_code}" https://localhost/ 2>/dev/null || true)"; case "$code" in 200|301|302|303|307|308|401|403) echo "SAT_HEALTH_OK:$code" ;; 000) echo "SAT_HEALTH_TRANSIENT_CURL_000"; echo "SAT_HEALTH_OK:hammer" ;; *) echo "SAT_HEALTH_BAD:$code"; exit 1 ;; esac'
-        local sat_fix="systemctl enable --now httpd >/dev/null 2>&1 || true; satellite-maintain service restart >/dev/null 2>&1 || true; systemctl restart httpd >/dev/null 2>&1 || true; for _try in \$(seq 1 ${sat_retries}); do ping_out=\"\$(hammer ping 2>&1)\"; ping_rc=\$?; if [ \"\${ping_rc}\" -eq 0 ]; then echo SAT_HAMMER_RECOVERED:\${_try}; exit 0; fi; if printf \"%s\\n\" \"\${ping_out}\" | grep -q \"for nil:NilClass\"; then echo SAT_HAMMER_PING_NILCLASS_RETRY:\${_try}; fi; sleep ${sat_interval}; done; echo SAT_HAMMER_STILL_FAIL; exit 1"
+        local sat_check='systemctl is-active --quiet httpd; ss -ltn | grep -q ":443\\b"; code="$(curl -k -sS -o /dev/null -w "%{http_code}" https://localhost/api/status 2>/dev/null || true)"; case "$code" in 200|401|403) echo "SAT_HEALTH_OK:$code" ;; *) echo "SAT_HEALTH_BAD:$code"; exit 1 ;; esac'
+        local sat_fix="systemctl enable --now httpd >/dev/null 2>&1 || true; satellite-maintain service restart >/dev/null 2>&1 || true; systemctl restart httpd >/dev/null 2>&1 || true; for _try in \$(seq 1 ${sat_retries}); do code=\"\$(curl -k -sS -o /dev/null -w \"%{http_code}\" https://localhost/api/status 2>/dev/null || true)\"; case \"\${code}\" in 200|401|403) echo SAT_API_RECOVERED:\${_try}; exit 0 ;; esac; sleep ${sat_interval}; done; echo SAT_API_STILL_FAIL; exit 1"
 
         if [ "${run_satellite}" -eq 1 ]; then
         if healthcheck_run_shell "scenario_satellite" "Satellite web/service readiness" "${sat_check}"; then
-            if printf '%s\n' "${RHIS_HEALTHCHECK_LAST_OUT:-}" | grep -q 'SAT_HEALTH_TRANSIENT_CURL_000'; then
-                print_step "Satellite API is healthy via hammer; local HTTPS probe is still converging (curl=000)."
-            fi
             print_success "Healthcheck passed: Satellite"
         else
             local_failures=$((local_failures + 1))
             print_warning "Healthcheck failed: Satellite"
-            if printf '%s\n' "${RHIS_HEALTHCHECK_LAST_OUT:-}" | grep -q 'SAT_HAMMER_PING_NILCLASS'; then
-                print_warning "Satellite hammer ping reported nil:NilClass (known app-readiness race); retry/restart path is being applied."
-            fi
             if is_enabled "${RHIS_HEALTHCHECK_AUTOFIX:-1}"; then
                 print_step "Healthcheck autofix: Satellite service remediation"
                 healthcheck_run_shell "scenario_satellite" "Satellite autofix action" "${sat_fix}" || true
-                if printf '%s\n' "${RHIS_HEALTHCHECK_LAST_OUT:-}" | grep -q 'SAT_HAMMER_PING_NILCLASS_RETRY'; then
-                    print_step "Satellite hammer ping still in nil:NilClass race during retry loop; continuing retries."
-                fi
                 if healthcheck_run_shell "scenario_satellite" "Satellite post-autofix verification" "${sat_check}"; then
                     print_success "Satellite recovered after autofix."
                     local_failures=$((local_failures - 1))
@@ -9617,6 +9619,7 @@ fi
 
 # 5. Satellite Installer
 ks_log "Phase 5: Run satellite-installer"
+foreman-maintain packages unlock || true
 satellite-installer --scenario satellite --foreman-initial-organization "${SAT_ORG}" --foreman-initial-location "${SAT_LOC}" --foreman-initial-admin-username "${ADMIN_USER}" --foreman-initial-admin-password "${ADMIN_PASS}" --foreman-proxy-dns true --foreman-proxy-dns-interface "${SAT_FIREWALLD_INTERFACE:-eth1}" --foreman-proxy-dns-zone "${SAT_DNS_ZONE:-${DOMAIN}}" --foreman-proxy-dns-reverse "${SAT_DNS_REVERSE_ZONE:-0.168.10.in-addr.arpa}" --foreman-proxy-dhcp true --foreman-proxy-dhcp-interface "${SAT_FIREWALLD_INTERFACE:-eth1}" --foreman-proxy-dhcp-gateway "${SAT_PROVISIONING_GW:-10.168.0.1}" --foreman-proxy-dhcp-nameservers "${SAT_PROVISIONING_DNS_PRIMARY:-${SAT_IP}}" --foreman-proxy-dhcp-range "${SAT_PROVISIONING_DHCP_START:-10.168.130.1} ${SAT_PROVISIONING_DHCP_END:-10.168.255.254}" --foreman-proxy-tftp true --foreman-proxy-tftp-managed true --foreman-proxy-tftp-servername "${SAT_IP}" --foreman-proxy-http true --foreman-proxy-templates true --foreman-proxy-puppet false --enable-foreman-plugin-puppet false --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible --enable-foreman-plugin-remote-execution --enable-foreman-proxy-plugin-remote-execution-ssh --enable-foreman-compute-ec2 --enable-foreman-compute-gce --enable-foreman-compute-azure --enable-foreman-compute-libvirt --enable-foreman-plugin-openscap --enable-foreman-proxy-plugin-openscap --register-with-insights true
 
 # 5.1 Post-Satellite Installation: Lifecycle Management & Provisioning Configuration

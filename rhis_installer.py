@@ -71,6 +71,11 @@ DEFAULT_CONFIG = {
     "SAT_PROVISIONING_DNS_PRIMARY": "10.168.128.1",
     "SAT_DNS_REVERSE_ZONE": "0.168.10.in-addr.arpa",
     "SAT_ADMIN_EMAIL": "",
+    "SAT_API_READY_TIMEOUT": "900",
+    "SAT_API_READY_INTERVAL": "15",
+    "SAT_POST_REBOOT_WAIT": "60",
+    "SAT_SCENARIO_RETRIES": "30",
+    "SAT_SCENARIO_RETRY_DELAY": "10",
     "RHIS_ANSIBLE_FORKS": "15",
     "RHIS_ANSIBLE_TIMEOUT": "30",
     "RHIS_LOCAL_ROLE_WORKDIR": str(Path(__file__).parent / "container" / "roles"),
@@ -343,17 +348,45 @@ class SatelliteManager:
         self.ssh = ssh_manager
         self.creds = cred_manager
 
+    def _wait_for_api_ready(self, sat_ip: str, timeout: int, interval: int) -> bool:
+        """Wait until Satellite API status endpoint responds with an acceptable code."""
+        check_cmd = (
+            "code=\"$(curl -k -sS -o /dev/null -w \"%{http_code}\" https://localhost/api/status 2>/dev/null || true)\"; "
+            "case \"$code\" in 200|401|403) echo \"SAT_API_READY:$code\" ;; *) echo \"SAT_API_WAIT:$code\"; exit 1 ;; esac"
+        )
+
+        start = time.time()
+        while time.time() - start < timeout:
+            exit_code, stdout, _ = self.ssh.run_remote_command(sat_ip, check_cmd, timeout=max(interval, 30))
+            if exit_code == 0:
+                if stdout.strip():
+                    print_success(f"Satellite API ready ({stdout.strip()})")
+                else:
+                    print_success("Satellite API ready")
+                return True
+            time.sleep(interval)
+
+        print_warning(f"Satellite API did not become ready within {timeout} seconds")
+        return False
+
     def precontainer_bootstrap(self) -> bool:
         """Execute pre-container Satellite bootstrap on target host."""
         print_step("Starting Satellite pre-container bootstrap...")
 
         sat_host = self.env.config.get("SAT_HOSTNAME", "satellite.example.com")
         sat_ip = self.env.config.get("SAT_IP", "10.168.128.1")
+        sat_org = self.env.config.get("SAT_ORG", "REDHAT")
+        sat_loc = self.env.config.get("SAT_LOC", "CORE")
+        admin_user = self.env.config.get("ADMIN_USER", "admin")
+        admin_pass = self.env.config.get("ADMIN_PASS", "")
         rh_user = self.creds.get_credential("RH_USER", "Enter Red Hat account username")
         rh_pass = self.creds.get_credential("RH_PASS", "Enter Red Hat account password")
 
         if not rh_user or not rh_pass:
             print_warning("Skipping Satellite pre-container bootstrap: credentials not available")
+            return False
+        if not admin_pass:
+            print_warning("Skipping Satellite pre-container bootstrap: ADMIN_PASS not configured")
             return False
 
         # Test SSH connectivity
@@ -364,6 +397,8 @@ class SatelliteManager:
         # Build bootstrap command
         rh_user_q = self.creds.quote_for_shell(rh_user)
         rh_pass_q = self.creds.quote_for_shell(rh_pass)
+        admin_user_q = self.creds.quote_for_shell(admin_user)
+        admin_pass_q = self.creds.quote_for_shell(admin_pass)
 
         bootstrap_cmd = f"""set -euo pipefail
 hostnamectl set-hostname {sat_host}
@@ -378,13 +413,23 @@ dnf upgrade -y
 subscription-manager repos --enable=rhel-9-for-x86_64-baseos-rpms --enable=rhel-9-for-x86_64-appstream-rpms --enable=satellite-6.18-for-rhel-9-x86_64-rpms --enable=satellite-maintenance-6.18-for-rhel-9-x86_64-rpms
 dnf clean all
 dnf install -y satellite
-satellite-installer --scenario satellite
+foreman-maintain packages unlock || true
+satellite-installer --scenario satellite \
+    --foreman-initial-organization "{sat_org}" \
+    --foreman-initial-location "{sat_loc}" \
+    --foreman-initial-admin-username {admin_user_q} \
+    --foreman-initial-admin-password {admin_pass_q} \
+    --enable-foreman-plugin-ansible \
+    --enable-foreman-proxy-plugin-ansible
 """
 
         print_step(f"Executing pre-container bootstrap on {sat_host}...")
         exit_code, stdout, stderr = self.ssh.run_remote_command(sat_ip, bootstrap_cmd)
 
         if exit_code == 0:
+            api_timeout = int(self.env.config.get("SAT_API_READY_TIMEOUT", "900") or "900")
+            api_interval = int(self.env.config.get("SAT_API_READY_INTERVAL", "15") or "15")
+            self._wait_for_api_ready(sat_ip, api_timeout, api_interval)
             print_success("Satellite pre-container bootstrap complete")
             return True
         else:
@@ -423,14 +468,16 @@ satellite-installer --scenario satellite
         exit_code, _, _ = self.ssh.run_remote_command(sat_ip, "shutdown -r +1 'RHIS post-container reboot' || reboot", timeout=30)
         
         # Wait for reboot
-        print_step("Waiting 60 seconds for Satellite to reboot...")
-        time.sleep(60)
+        reboot_wait = int(self.env.config.get("SAT_POST_REBOOT_WAIT", "60") or "60")
+        print_step(f"Waiting {reboot_wait} seconds for Satellite to reboot...")
+        time.sleep(reboot_wait)
 
         # Phase 2: Validate satellite-installer scenario
         print_step("Phase 2/3: Validating Satellite scenario after reboot...")
         admin_pass_q = self.creds.quote_for_shell(admin_pass)
         
         scenario_cmd = (
+            f"foreman-maintain packages unlock >/dev/null 2>&1 || true; "
             f"satellite-installer --scenario satellite "
             f"--foreman-initial-organization \"{sat_org}\" "
             f"--foreman-initial-location \"{sat_loc}\" "
@@ -451,7 +498,8 @@ satellite-installer --scenario satellite
         )
 
         retry_count = 0
-        max_retries = 30
+        max_retries = int(self.env.config.get("SAT_SCENARIO_RETRIES", "30") or "30")
+        retry_delay = int(self.env.config.get("SAT_SCENARIO_RETRY_DELAY", "10") or "10")
         while retry_count < max_retries:
             exit_code, _, _ = self.ssh.run_remote_command(sat_ip, scenario_cmd, timeout=300)
             if exit_code == 0:
@@ -460,10 +508,15 @@ satellite-installer --scenario satellite
             retry_count += 1
             if retry_count < max_retries:
                 print_step(f"Satellite not ready, retrying... ({retry_count}/{max_retries})")
-                time.sleep(10)
+                time.sleep(retry_delay)
 
         if retry_count >= max_retries:
             print_warning("Satellite validation timeout after max retries")
+            return False
+
+        api_timeout = int(self.env.config.get("SAT_API_READY_TIMEOUT", "900") or "900")
+        api_interval = int(self.env.config.get("SAT_API_READY_INTERVAL", "15") or "15")
+        if not self._wait_for_api_ready(sat_ip, api_timeout, api_interval):
             return False
 
         # Phase 3: Setup foreman SSH keys and compute resource
