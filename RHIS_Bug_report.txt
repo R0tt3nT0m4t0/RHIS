@@ -1,0 +1,135 @@
+RHIS BUG REPORT
+Generated: 2026-03-29
+Workspace: /home/sgallego/GIT/RHIS
+Scope: Changes applied during troubleshooting of rhis-provisioner Satellite flow
+
+================================================================================
+1) INCIDENTS ADDRESSED
+================================================================================
+
+1. Satellite installer async status appeared stuck/retrying for long periods.
+2. PXE defaults build failed with hammer authentication errors (rc=129).
+3. PXE prerequisite package install failed due dnf exclude filtering for bind/dhcp.
+
+
+================================================================================
+2) ROLE/TASK/PATH CHANGE LOG (WHAT CHANGED)
+================================================================================
+
+[A] Role: rhis-builder-satellite
+		TASK: Wait for hammer to authenticate successfully before PXE build
+		Task Path: container/roles/rhis-builder-satellite/tasks/build_pxe_linux_defaults.yml:16
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/tasks/build_pxe_linux_defaults.yml
+		Change:
+			- Added explicit hammer auth bootstrap facts:
+					__pxe_hammer_username, __pxe_hammer_password, __pxe_hammer_server
+			- Replaced plain `hammer ping` with argv-based command including
+				--username/--password/--server
+			- Added authenticated health gate + assertion before PXE template build
+			- Marked sensitive steps with no_log: true
+
+[B] Role: rhis-builder-satellite
+		TASK: Create the default pxe configuration
+		Task Path: container/roles/rhis-builder-satellite/tasks/build_pxe_linux_defaults.yml:40
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/tasks/build_pxe_linux_defaults.yml
+		Change:
+			- Replaced plain `hammer template build-pxe-default` with argv form using
+				explicit --username/--password/--server
+			- Kept retries/delay; added no_log: true to prevent credential leakage
+
+[C] Role: rhis-builder-satellite
+		TASK: Install PXE prerequisite packages
+		Task Path: container/roles/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml:5
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml
+		Change:
+			- New task file added
+			- Required packages now installed with dnf + disable_excludes: all:
+					syslinux, tftp-server
+			- This prevents failure due package exclude filters for required PXE base
+
+[D] Role: rhis-builder-satellite
+		TASK: Install optional PXE network service packages
+		Task Path: container/roles/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml:13
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml
+		Change:
+			- Added optional install loop for:
+					dhcp-server, bind
+			- Uses disable_excludes: all and failed_when: false
+			- Added warning-only debug task when optional package install fails
+			- Prevents hard-fail in environments where these are intentionally filtered
+
+[E] Role: rhis-builder-satellite
+		TASK: Enable and start PXE prerequisite services
+		Task Path: container/roles/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml:38
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml
+		Change:
+			- Added systemd enable/start for named, dhcpd, tftp.socket (best-effort)
+			- Added TFTP root directory enforcement (/var/lib/tftpboot)
+
+[F] Role: rhis-builder-satellite (main play)
+		TASK: Ensure PXE prerequisite packages and services
+		Task Path: container/roles/rhis-builder-satellite/main.yml:269
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/main.yml
+		Change:
+			- Inserted import_tasks for tasks/ensure_pxe_prereqs.yml
+			- Positioned immediately before "Build PXE Linux defaults"
+			- Ensures prereqs are in place before hammer PXE template operation
+
+[G] Role: satellite (sub-role under rhis-builder-satellite)
+		TASK: Install the Satellite server with specified configuration.
+		Task Path: container/roles/rhis-builder-satellite/roles/satellite/tasks/main.yml:8
+		Runtime Path in rhis-provisioner: /rhis/rhis-builder-satellite/roles/satellite/tasks/main.yml
+		Change:
+			- Added pass-through variable:
+					satellite_installer_timeout: "{{ sat_installer_timeout | default(7200) }}"
+			- Keeps installer role call configurable for long-running installs
+
+[H] Orchestrator script (not an Ansible role task)
+		Component: rhis_installer.sh
+		Path: rhis_installer.sh
+		Change:
+			- Added Satellite installer timeout/verbosity runtime controls:
+					SAT_INSTALLER_TIMEOUT default 7200
+					SAT_INSTALLER_VERBOSE default true
+			- Injected sat_installer_timeout/sat_installer_verbose into Satellite
+				extra-vars for both normal and auth-fallback playbook paths
+			- Added same values to manual rerun json payload
+			- Set initial credential defaults requested by operator:
+					ADMIN_USER=admin
+					ADMIN_PASS=bj8H7ndC7$
+					SAT_ADMIN_PASS/AAP_ADMIN_PASS defaults aligned
+
+
+================================================================================
+3) RHIS-PROVISIONER RUNTIME SYNC ACTIONS PERFORMED
+================================================================================
+
+The following files were copied into the running container to apply fixes
+immediately without waiting for a fresh image build:
+
+	- /rhis/rhis-builder-satellite/tasks/build_pxe_linux_defaults.yml
+	- /rhis/rhis-builder-satellite/tasks/ensure_pxe_prereqs.yml
+	- /rhis/rhis-builder-satellite/main.yml
+	- /rhis/rhis-builder-satellite/roles/satellite/tasks/main.yml
+
+
+================================================================================
+4) EXPECTED BEHAVIOR AFTER FIXES
+================================================================================
+
+1. Satellite installer invocation can run longer before timing out (configurable).
+2. PXE defaults build no longer depends on implicit ~/.hammer state only.
+3. PXE prereq install no longer hard-fails when optional bind/dhcp packages are
+	 filtered/excluded by policy.
+4. PXE prereqs are guaranteed to run before PXE template generation.
+
+
+================================================================================
+5) NOTES
+================================================================================
+
+- This is a one-time consolidated report for the changes performed in this
+	troubleshooting session.
+- Report focuses on rhis-provisioner/Satellite role flow and related orchestrator
+	wiring that was changed to support the same.
+

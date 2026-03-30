@@ -1,7 +1,10 @@
 {
     "chat.tools.terminal.autoApprove": {
 
+
         "/.*/": true
     },
-    "python.analysis.typeCheckingMode": "standard"
+    "python.analysis.typeCheckingMode": "standard",
+    "search.useGlobalIgnoreFiles": true,
+    "search.useParentIgnoreFiles": true
 }

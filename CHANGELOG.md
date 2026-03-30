@@ -11,11 +11,43 @@ This file tracks repository changes from this point forward.
 
 ---
 
+## 2026-03-28 — Roles folder consolidation + Python CLI alignment
+
+### 2026-03-28 — Roles folder consolidation + rhis_installer.py CLI alignment
+
+- **Area:** `rhis_installer.py`, `README.md`, `CHECKLIST.md`, `CHANGELOG.md`, `.PROMPTS_REFERENCE.md`, `host_vars/README.md`, `inventory/README.md`, `Doc/README.md`, `container/roles/host_vars/README.md`, `container/vars/external_inventory/README.md`, `container/vars/host_vars/README.md`
+- **Summary:**
+  - Moved all rhis-builder role trees under `container/roles/` as the single consolidated roles directory.
+  - Updated `rhis_installer.py` `DEFAULT_CONFIG` to match shell script defaults: `RHIS_ANSIBLE_FORKS=15`, `RHIS_ANSIBLE_TIMEOUT=30`, added `RHIS_LOCAL_ROLE_WORKDIR` pointing to `container/roles/`.
+  - Expanded `rhis_installer.py` `main()` argparse to include all CLI flags from `rhis_installer.sh`: `--non-interactive`, `--env-file`, `--inventory`, `--inventory-growth`, `--container-config-only`, `--satellite`, `--idm`, `--aap`, `--attach-consoles`, `--status`, `--reconfigure`, `--test[=fast|full]`, `--demo`/`--DEMO`, `--demokill`/`--DEMOKILL`, `--validate`/`--preflight`, `--generate-env`.
+  - Added shortcut-flag-to-menu-choice routing in Python entrypoint to match shell `apply_cli_overrides()` logic.
+  - Added `_load_env_file()` helper for `--env-file` preseed loading.
+  - Bulk-replaced all `rhis_install.sh` → `rhis_installer.sh` and `rhis_install.py` → `rhis_installer.py` references across all `*.md` documentation files.
+  - Added menu options `9` (Install Satellite 6.18 Only), `10` (Install IdM 5.0 Only), and `11` (Install AAP 2.6 Only) to the interactive menu listing in `README.md`.
+- **Reason:** Reflect the new `container/roles/` folder layout, ensure the Python CLI parity with the shell script, and keep all documentation consistent with the actual filenames.
+
+---
+
+## 2026-03-28 13:35:00 MDT
+
+### 2026-03-28 13:35:00 MDT — Prompted defaults + env persistence alignment
+
+- **Area:** `rhis_installer.sh`, `rhis_installer.py`, `README.md`, `.PROMPTS_REFERENCE.md`, `CHECKLIST.md`, `host_vars/README.md`, `inventory/README.md`, `Doc/README.md`, `QUICK_RECOVERY.md`
+- **Summary:**
+  - Changed IdM default hostname pattern to `idm.<domain>` and aligned prompt/fallback behavior.
+  - Enforced AAP containerized deployment path and removed mandatory AAP RPM repo requirement for bundled flow.
+  - Added/persisted Satellite provisioning and DNS service knobs (`SAT_PROVISIONING_*`, `SAT_DNS_ZONE`, `SAT_DNS_REVERSE_ZONE`, `SAT_FIREWALLD_*`) so values are defaults, prompt-editable, and stored in encrypted `~/.ansible/conf/env.yml`.
+  - Hardened `satellite-installer --scenario satellite` invocations with explicit internal-service settings (DNS/DHCP/TFTP/PXE on configured internal interface), Ansible/REX/OpenSCAP enablement, and Puppet disablement.
+  - Updated Python entrypoint docs/path behavior to canonical `~/.ansible/conf/env.yml` defaults.
+- **Reason:** Ensure no environment-specific values are fixed as immutable constants, and that user-selected values are consistently prompt-driven and vault-persisted.
+
+---
+
 ## 2026-03-24 11:45:08 MDT
 
 ### 2026-03-24 11:45:08 MDT — Kickstart creator baseline integration
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added `kickstart_creator_baseline_block()` to centralize creator/automation prerequisites in kickstart `%post`.
   - Baseline now installs common creator tools (`sudo`, `openssh-clients`, `rsync`, `jq`), enables `chronyd`, and creates `/etc/rhis/creator.env` metadata on provisioned nodes.
@@ -29,7 +61,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 11:13:51 MDT — Agnostic/idempotent script hardening
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Removed baked-in default values for `RH_ISO_URL`, `RH9_ISO_URL`, and `AAP_BUNDLE_URL` so the script no longer depends on stale/expired environment-specific download links.
   - Removed the hard-coded fallback `ADMIN_PASS` value and preserved explicit `ROOT_PASS`, `SAT_ADMIN_PASS`, `AAP_ADMIN_PASS`, and `IDM_ADMIN_PASS` overrides instead of forcibly replacing them with the shared admin password.
@@ -46,18 +78,18 @@ This file tracks repository changes from this point forward.
 
 ## 2026-03-24 10:50:00 MDT
 
-### 2026-03-24 10:50:00 MDT — Merge headless helper files into rhis_install.sh
+### 2026-03-24 10:50:00 MDT — Merge headless helper files into rhis_installer.sh
 
-- **Area:** `rhis_install.sh` (new functions), `rhis-headless-validate.sh` (removed), `rhis-headless.env.template` (removed)
+- **Area:** `rhis_installer.sh` (new functions), `rhis-headless-validate.sh` (removed), `rhis-headless.env.template` (removed)
 - **Summary:**
-  - Merged standalone `rhis-headless-validate.sh` into `rhis_install.sh` as `validate_headless_config()` function.
-  - Merged `rhis-headless.env.template` into `rhis_install.sh` as `generate_env_template()` function (heredoc).
+  - Merged standalone `rhis-headless-validate.sh` into `rhis_installer.sh` as `validate_headless_config()` function.
+  - Merged `rhis-headless.env.template` into `rhis_installer.sh` as `generate_env_template()` function (heredoc).
   - Added `--validate` / `--preflight` CLI flag: runs pre-flight checks (required vars per menu-choice, Linux/root/sudo, required commands, SSH keys, IP format, FQDN format, storage ≥300 GB, memory ≥64 GB, Red Hat CDN and DNS reachability) then exits.
   - Added `--generate-env [path]` CLI flag: writes a commented headless env-file template to the specified path (default `./rhis-headless.env.template`) then exits.
   - Added `CLI_VALIDATE` and `CLI_GENERATE_ENV` global flag variables.
   - Updated `apply_cli_overrides()` to set `NONINTERACTIVE=1 RUN_ONCE=1` for both new flags.
   - Updated `print_usage()` with documentation for both new flags.
-  - Removed `rhis-headless-validate.sh` and `rhis-headless.env.template` from repository (functionality now in `rhis_install.sh`).
+  - Removed `rhis-headless-validate.sh` and `rhis-headless.env.template` from repository (functionality now in `rhis_installer.sh`).
 - **Reason:** Consolidate headless deployment tooling into a single script so users do not need external helper files; headless validation and env-file generation are available as first-class CLI operations.
 
 ---
@@ -82,7 +114,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-23 17:39:04 MDT — Script hardening and orchestration updates
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added container playbook hotfix preflight with verify/fail-fast controls.
   - Added/remediated IdM update task patching (`disable_gpg_check`, firmware exclusion) and Satellite pre-task non-fatal handling.
@@ -106,7 +138,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 07:28:21 MDT — SSH mesh fallback hardening
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added installer-user + passwordless `sudo` fallback for root SSH key bootstrap on RHIS nodes.
   - Added installer-user + `sudo` fallback when collecting root public keys.
@@ -115,7 +147,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 07:35:18 MDT — Managed container patch persistence
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added top-level RHIS-managed container patch functions for Satellite and IdM playbook component fixes.
   - Container startup/reuse now automatically reapplies and verifies these patches on every deployment or restart of `rhis-provisioner`.
@@ -124,17 +156,17 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 07:51:02 MDT — Per-run installer logging under /var/log/rhis
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added run-log configuration and startup log initialization for each script invocation.
   - Script now ensures `/var/log/rhis` exists and writes a timestamped per-run logfile.
   - Added output mirroring (`tee`) so each RHIS run is captured while still printing live to console.
   - Added/updated `latest.log` symlink in `/var/log/rhis` for quick access to most recent run.
-- **Reason:** Provide durable, per-run operational logs for troubleshooting and auditability of each `rhis_install.sh` execution.
+- **Reason:** Provide durable, per-run operational logs for troubleshooting and auditability of each `rhis_installer.sh` execution.
 
 ### 2026-03-24 07:54:03 MDT — Automatic run-log retention/pruning
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added `RHIS_RUN_LOG_KEEP_COUNT` (default `30`) to control retained per-run installer logs.
   - Added automatic pruning of old `/var/log/rhis/rhis_install_*.log` files after logging initialization.
@@ -143,7 +175,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 08:09:44 MDT — Root SSH mesh defaults to best-effort
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added `RHIS_REQUIRE_ROOT_SSH_MESH` (default `0`) to control whether root mesh failures are fatal.
   - Updated `setup_rhis_ssh_mesh()` so installer-user mesh remains mandatory, while root-key bootstrap/collection/distribution failures warn-and-continue by default.
@@ -152,7 +184,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 08:15:26 MDT — SSH key/known_hosts stability hardening for rebuilt RHIS nodes
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added dedicated persistent installer-host RHIS SSH key path (`RHIS_INSTALLER_SSH_KEY_DIR`) so RHIS mesh operations no longer depend on/churn default `~/.ssh/id_rsa`.
   - Updated SSH mesh bootstrap/copy-id paths to use the dedicated RHIS installer key.
@@ -162,7 +194,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 08:45:25 MDT — Config-only auth resilience preflight
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added config-as-code preflight call to refresh SSH trust baseline (`setup_rhis_ssh_mesh`) before phase playbooks (best-effort in this path).
   - Added config-as-code preflight root password normalization (`fix_vm_root_passwords`) before phase execution to improve root fallback reliability.
@@ -170,7 +202,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 09:17:24 MDT — /etc/hosts sync for RHIS external interfaces
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added `sync_rhis_external_hosts_entries()` to discover RHIS VM external/NAT interface IPs via `virsh domifaddr` and write them to a managed `/etc/hosts` block.
   - Added managed markers (`# BEGIN RHIS EXTERNAL HOSTS` / `# END RHIS EXTERNAL HOSTS`) so reruns replace/update entries cleanly instead of duplicating lines.
@@ -179,7 +211,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 09:21:37 MDT — Fix missing IdM chrony.j2 template during idm_pre
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added managed container hotfix creation for `/rhis/rhis-builder-idm/roles/idm_pre/templates/chrony.j2` (fallback template) alongside existing Satellite chrony fallback.
   - Extended container hotfix verification checks to require both Satellite and IdM `chrony.j2` template files.
@@ -188,7 +220,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 09:28:18 MDT — IdM Web UI readiness gate + diagnostics
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added IdM Web UI readiness controls (`RHIS_IDM_WEB_UI_TIMEOUT`, `RHIS_IDM_WEB_UI_INTERVAL`) and runtime config visibility.
   - Added automated post-IdM remediation/start checks for key services (`ipa`, `httpd`, `pki-tomcatd@pki-tomcat`) with `/ipa/ui` HTTPS readiness probing.
@@ -198,7 +230,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 16:35:00 MDT — Fix container SSH auth for Ansible (admin user key distribution)
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Root cause: `setup_rhis_ssh_mesh()` was distributing the RHIS installer key only to `installer_user` (sgallego) and root on each VM — not to `ADMIN_USER` (admin), which is the `ansible_user` in the inventory and the account Ansible actually connects as.
   - Added explicit installer-key push to `ADMIN_USER@node` in the key distribution loop when `ADMIN_USER != installer_user`.
@@ -209,7 +241,7 @@ This file tracks repository changes from this point forward.
 
 ### 2026-03-24 09:43:07 MDT — Cross-component post-install healthcheck/remediation framework
 
-- **Area:** `rhis_install.sh`
+- **Area:** `rhis_installer.sh`
 - **Summary:**
   - Added post-install healthcheck controls: `RHIS_ENABLE_POST_HEALTHCHECK`, `RHIS_HEALTHCHECK_AUTOFIX`, `RHIS_HEALTHCHECK_RERUN_COMPONENT`.
   - Added healthcheck stage after phase execution/retries to validate IdM, Satellite, and AAP service/web readiness.

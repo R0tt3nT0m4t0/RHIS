@@ -4,7 +4,7 @@
 
 RHIS stands for **Red Hat Infrastructure Standard**.
 
-This repository is built around `rhis_install.sh`, an orchestration script for building and bootstrapping a Red Hat management lab on libvirt/KVM.
+This repository is built around `rhis_installer.sh`, an orchestration script for building and bootstrapping a Red Hat management lab on libvirt/KVM.
 
 The current workflow focuses on:
 
@@ -25,13 +25,18 @@ The script automates:
 
 If you are starting fresh, review:
 
-- `CHECKLIST.md` — what must be provided by the user and where to obtain it
+- [CHECKLIST.md](CHECKLIST.md) — what must be provided by the user and where to obtain it
 
 ---
 
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Main entry point](#main-entry-point)
+- [Headless Operations](#headless-operations)
+- [Headless Quick Reference](#headless-quick-reference)
+- [Headless Troubleshooting](#headless-troubleshooting)
+- [Recovery & Diagnostics](#recovery--diagnostics)
 - [Configuration and secrets](#configuration-and-secrets)
 - [Default lab layout](#default-lab-layout)
 - [Kickstart generation](#kickstart-generation)
@@ -40,6 +45,7 @@ If you are starting fresh, review:
 - [DEMOKILL behavior](#demokill-behavior)
 - [RHIS CMDB / HTML dashboard](#rhis-cmdb--html-dashboard)
 - [RHIS Hardware Planning & Resource Management Guide (RHEL 10)](#rhis-hardware-planning--resource-management-guide-rhel-10)
+- [Directory Structure & Configuration Files](#directory-structure--configuration-files)
 - [Important files](#important-files)
 - [Recommended run sequence](#recommended-run-sequence)
 - [Troubleshooting](#troubleshooting)
@@ -56,13 +62,13 @@ This repository is intended for repeatable build-out of a Red Hat infrastructure
 - one **external** network for updates and remote access
 - one **internal** network for provisioning, orchestration, and management
 - consistent bootstrap of these core nodes:
-  - `satellite-618`
-  - `aap-26`
+  - `satellite`
+  - `aap`
   - `idm`
 
 This is primarily an **infrastructure provisioning and bootstrap repository**, not just a generic application project.
 
-The machine where you execute `rhis_install.sh` is the **installer host**. Host-side prerequisites and collection management are resolved there.
+The machine where you execute `rhis_installer.sh` is the **installer host**. Host-side prerequisites and collection management are resolved there.
 
 ---
 
@@ -70,7 +76,7 @@ The machine where you execute `rhis_install.sh` is the **installer host**. Host-
 
 [⬆ Back to top](#table-of-contents)
 
-`rhis_install.sh` is expected to ensure installer-host software requirements using `dnf`/`pip` (current platform profile focuses on libvirt + virt-manager workflows).
+`rhis_installer.sh` is expected to ensure installer-host software requirements using `dnf`/`pip` (current platform profile focuses on libvirt + virt-manager workflows).
 
 It also ensures host-side Ansible collections in this order:
 
@@ -91,7 +97,7 @@ This keeps the installer host self-sufficient for the RHIS workflow.
   - `IdM -> Satellite -> AAP`
 - Menu option `2` (Container Deployment) now auto-runs config-as-code by default.
 - New one-shot workflow:
-  - `./rhis_install.sh --container-config-only`
+  - `./rhis_installer.sh --container-config-only`
 - Retry behavior for transient failures:
   - Failed phases are retried once by default.
   - Disable with `RHIS_RETRY_FAILED_PHASES_ONCE=0`.
@@ -101,19 +107,19 @@ This keeps the installer host self-sufficient for the RHIS workflow.
 ### Recommended first run
 
 ```bash
-./rhis_install.sh --reconfigure
+./rhis_installer.sh --reconfigure
 ```
 
 ### Clean up a previous demo run
 
 ```bash
-./rhis_install.sh --DEMOKILL
+./rhis_installer.sh --DEMOKILL
 ```
 
 ### Build the demo stack
 
 ```bash
-./rhis_install.sh --DEMO
+./rhis_installer.sh --DEMO
 ```
 
 ---
@@ -125,7 +131,7 @@ This keeps the installer host self-sufficient for the RHIS workflow.
 The main workflow is:
 
 ```bash
-./rhis_install.sh
+./rhis_installer.sh
 ```
 
 ### Interactive menu options
@@ -138,6 +144,9 @@ The main workflow is:
 - `6` Generate Satellite OEMDRV Only
 - `7` Container Config-Only (`IdM -> Satellite -> AAP`)
 - `8` Live Status Dashboard
+- `9` Install Satellite 6.18 Only
+- `10` Install IdM 5.0 Only
+- `11` Install AAP 2.6 Only
 - `0` Exit
 
 Environment toggles:
@@ -153,7 +162,7 @@ Environment toggles:
 
 ```text
 --non-interactive        Run without prompts; required values must already be set
---menu-choice <0-8>      Preselect a visible menu option
+--menu-choice <0-11>     Preselect a visible menu option
 --env-file <path>        Load preseed variables from a custom env file
 --inventory <template>   Pin AAP inventory template; skips interactive submenu
 --inventory-growth <tpl> Pin AAP inventory-growth template; skips interactive submenu
@@ -161,12 +170,15 @@ Environment toggles:
                          About pages is presented when template values are unset.
                          --DEMO always forces DEMO-inventory.j2 and skips the submenu.
 --container-config-only  One-shot: start container + run IdM -> Satellite -> AAP
+--satellite              Run Satellite 6.18-only workflow (menu option 9)
+--idm                    Run IdM 5.0-only workflow (menu option 10)
+--aap                    Run AAP 2.6-only workflow (menu option 11)
 --attach-consoles        Re-open VM console monitors for Satellite/AAP/IdM
   --status                 Read-only status snapshot (no provisioning changes)
 --reconfigure            Prompt for all installer values and update env.yml
 --test[=fast|full]       Run a curated non-interactive test sweep and print a summary
---DEMO|--demo            Use demo sizing/profile for VM specs
---DEMOKILL|--demokill    CLI-only cleanup for demo VMs/files/temp artifacts/lock files/processes
+--DEMO            Use demo sizing/profile for VM specs
+--DEMOKILL        CLI-only cleanup for demo VMs/files/temp artifacts/lock files/processes
 --help                   Show usage
 ```
 
@@ -175,7 +187,7 @@ Environment toggles:
 When running interactively without a pre-configured template, the script presents
 a guided **inventory architecture submenu**:
 
-```
+```text
   0) Exit              -- Return to previous menu
   1) inventory         -- Enterprise / Multi-Node deployment
   2) About inventory   -- Name, synopsis, diagram & guidance
@@ -202,40 +214,50 @@ RHIS now generates a host-side Ansible config for provisioner runs and mounts it
 
 The provisioner container uses that generated config via `ANSIBLE_CONFIG` and writes logs/cache on the host through the existing vault bind mount.
 
+### IdM 5.0 repository prerequisites
+
+For IdM 5.0 installation/configuration paths, ensure the target system has access to these repositories:
+
+```bash
+subscription-manager repos --enable="rhel-10-for-x86_64-baseos-rpms" \
+--enable="rhel-10-for-x86_64-appstream-rpms" \
+--enable="idm-for-rhel-10-x86_64-rpms"
+```
+
 ### Container one-shot examples
 
 ```bash
-./rhis_install.sh --container-config-only
+./rhis_installer.sh --container-config-only
 ```
 
 Run one-shot container workflow without retries:
 
 ```bash
-RHIS_RETRY_FAILED_PHASES_ONCE=0 ./rhis_install.sh --container-config-only
+RHIS_RETRY_FAILED_PHASES_ONCE=0 ./rhis_installer.sh --container-config-only
 ```
 
 Re-open VM console monitors after boot:
 
 ```bash
-./rhis_install.sh --attach-consoles
+./rhis_installer.sh --attach-consoles
 ```
 
 Read-only health/status snapshot (no provisioning changes):
 
 ```bash
-./rhis_install.sh --status
+./rhis_installer.sh --status
 ```
 
 Run a fast noninteractive validation sweep (recommended after `--DEMOKILL`):
 
 ```bash
-./rhis_install.sh --test=fast --DEMO
+./rhis_installer.sh --test=fast --DEMO
 ```
 
 Run the broader integration-style validation sweep:
 
 ```bash
-./rhis_install.sh --test=full --DEMO
+./rhis_installer.sh --test=full --DEMO
 ```
 
 ### Common examples
@@ -243,31 +265,443 @@ Run the broader integration-style validation sweep:
 Generate only the Satellite kickstart and `OEMDRV.iso`:
 
 ```bash
-./rhis_install.sh --menu-choice 6
+./rhis_installer.sh --menu-choice 6
 ```
 
 Run fully unattended:
 
 ```bash
-./rhis_install.sh --non-interactive --menu-choice 6
+./rhis_installer.sh --non-interactive --menu-choice 6
 ```
 
 Use a custom bootstrap env file:
 
 ```bash
-./rhis_install.sh --env-file /path/to/custom.env --menu-choice 3
+./rhis_installer.sh --env-file /path/to/custom.env --menu-choice 3
 ```
 
 Re-prompt for all saved values:
 
 ```bash
-./rhis_install.sh --reconfigure
+./rhis_installer.sh --reconfigure
 ```
 
 Destroy demo resources and clean leftovers:
 
 ```bash
-./rhis_install.sh --DEMOKILL
+./rhis_installer.sh --DEMOKILL
+```
+
+---
+
+## Headless Operations
+
+[⬆ Back to top](#table-of-contents)
+
+RHIS can run on headless systems (no display/keyboard) using environment variables and command-line flags instead of interactive prompts.
+
+### Quick Start: Headless Container + VMs Deployment
+
+```bash
+# Create an environment file with all required values
+cat > /tmp/rhis-headless.env << 'EOF'
+# Core Credentials
+RH_USER="your-rhn-username"
+RH_PASS="your-rhn-password"
+ADMIN_USER="rhisadmin"
+ADMIN_PASS="secure-admin-password"
+
+# IdM Configuration
+IDM_IP="10.168.128.3"
+IDM_NETMASK="255.255.255.0"
+IDM_GW="10.168.128.1"
+IDM_HOSTNAME="idm.example.com"
+IDM_ALIAS="idm"
+DOMAIN="example.com"
+IDM_DS_PASS="secure-ds-password"
+
+# Satellite Configuration
+SAT_IP="10.168.128.1"
+SAT_NETMASK="255.255.255.0"
+SAT_GW="10.168.128.1"
+SAT_HOSTNAME="satellite.example.com"
+SAT_ORG="Default_Organization"
+SAT_LOC="Default_Location"
+
+# AAP Configuration
+AAP_IP="10.168.128.2"
+AAP_NETMASK="255.255.255.0"
+AAP_GW="10.168.128.1"
+AAP_HOSTNAME="aap.example.com"
+AAP_ADMIN_USER="admin"
+AAP_ADMIN_EMAIL="admin@example.com"
+HUB_TOKEN="your-automation-hub-token"
+
+# Network Configuration
+HOST_EXT_IP="192.168.1.X"          # Your host's external IP
+HOST_INT_IP="10.168.128.1"          # Your host's internal network IP
+MGMT_NETWORK="10.168.128.0/24"
+
+# Feature Flags (optional - defaults shown)
+DEMO_MODE=0
+RHIS_ENABLE_POST_HEALTHCHECK=1
+RHIS_HEALTHCHECK_AUTOFIX=1
+EOF
+
+# Run headless installation (Container + VMs + Config-as-Code)
+./rhis_installer.sh \
+  --non-interactive \
+  --menu-choice 5 \
+  --env-file /tmp/rhis-headless.env
+```
+
+**Expected Flow:**
+
+1. Loads env vars from file
+2. Skips all interactive prompts
+3. Deploys container (Podman)
+4. Creates VM infrastructure (Virt-Manager)
+5. Runs config-as-code phases (IdM → Satellite → AAP)
+6. Exits with status code 0 on success
+
+### Required Environment Variables
+
+**Authentication (Required)**
+
+```bash
+RH_USER="<Red Hat CDN username>"
+RH_PASS="<Red Hat CDN password>"
+ADMIN_USER="<local admin user>"
+ADMIN_PASS="<local admin password>"
+```
+
+**IdM Configuration (Required for Options 3-5)**
+
+```bash
+IDM_IP="10.168.128.3"              # Static IP on internal network
+IDM_NETMASK="255.255.255.0"        # /24 = 255.255.255.0
+IDM_GW="10.168.128.1"              # Gateway (usually your host)
+IDM_HOSTNAME="idm.example.com"     # FQDN required
+IDM_ALIAS="idm"                    # Short name
+DOMAIN="example.com"               # Base domain
+IDM_DS_PASS="secure-password"      # Directory Service password
+```
+
+**Satellite Configuration (Required for Options 3-5)**
+
+```bash
+SAT_IP="10.168.128.1"              # Static IP
+SAT_NETMASK="255.255.255.0"        
+SAT_GW="10.168.128.1"              
+SAT_HOSTNAME="satellite.example.com"
+SAT_ORG="Default_Organization"     # Satellite org name
+SAT_LOC="Default_Location"         # Satellite location
+```
+
+**AAP Configuration (Required for Options 3-5)**
+
+```bash
+AAP_IP="10.168.128.2"              # Static IP
+AAP_NETMASK="255.255.255.0"        
+AAP_GW="10.168.128.1"              
+AAP_HOSTNAME="aap.example.com"     # FQDN required
+AAP_ADMIN_USER="admin"             
+AAP_ADMIN_EMAIL="admin@example.com"
+HUB_TOKEN="<your-hub-token>"       # Automation Hub token
+```
+
+**Network Configuration (Optional)**
+
+```bash
+HOST_EXT_IP="192.168.1.100"        # External NIC IP (default: auto-detect)
+HOST_INT_IP="10.168.128.1"         # Internal NIC IP (default: 10.168.128.1)
+MGMT_NETWORK="10.168.128.0/24"     # Internal network (default: auto-calc)
+```
+
+### Exit Codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | General error (check logs) |
+| 2 | Invalid CLI flag |
+| 3 | Missing required environment variable |
+| 4 | Network/connectivity error |
+| 5 | Container/VM operation failed |
+
+### Expected Timeline
+
+| Phase | Duration | What's Happening |
+| --- | --- | --- |
+| Container setup | 2-5 min | Download image, run provisioner |
+| VM creation | 5-10 min | Create 3 VMs, allocate storage |
+| IdM install | 15-20 min | IdM server install + web UI ready |
+| Satellite install | 20-30 min | Satellite installer runs |
+| AAP install | 10-15 min | AAP setup + callback |
+| **Total** | **~60-90 min** | Complete deployment |
+
+---
+
+## Headless Quick Reference
+
+[⬆ Back to top](#table-of-contents)
+
+### One-Command Deployment
+
+```bash
+# 1. Copy template
+cp rhis-headless.env.template /etc/rhis/headless.env
+
+# 2. Edit with your values
+nano /etc/rhis/headless.env
+
+# 3. Run deployment
+source /etc/rhis/headless.env
+./rhis_installer.sh --non-interactive --menu-choice 5
+```
+
+### Environment Variables Cheat Sheet
+
+| Variable | Purpose | Example | Required |
+| --- | --- | --- | --- |
+| `RH_USER` | Red Hat CDN username | `rh_user@example.com` | Menu 1,2,4,5 |
+| `RH_PASS` | Red Hat CDN password | `secure-pass` | Menu 1,2,4,5 |
+| `ADMIN_PASS` | Local admin password | `P@ssw0rd123!` | Menu 3,4,5,7 |
+| `IDM_IP` | IdM VM IP (internal) | `10.168.128.3` | Menu 3,4,5,7 |
+| `IDM_HOSTNAME` | IdM FQDN | `idm.example.com` | Menu 4,5,7 |
+| `SAT_IP` | Satellite VM IP | `10.168.128.1` | Menu 3,4,5,7 |
+| `SAT_HOSTNAME` | Satellite FQDN | `satellite.example.com` | Menu 4,5,7 |
+| `AAP_IP` | AAP VM IP | `10.168.128.2` | Menu 3,4,5,7 |
+| `AAP_HOSTNAME` | AAP FQDN | `aap.example.com` | Menu 4,5,7 |
+| `HUB_TOKEN` | Automation Hub token | `eyJ...` | Menu 4,5,7 |
+
+---
+
+## Headless Troubleshooting
+
+[⬆ Back to top](#table-of-contents)
+
+### Common Issues & Solutions
+
+**Issue 1: "NONINTERACTIVE mode requires X to be set"**
+
+```bash
+# Check which variable is missing
+env | grep -E "^(RH_|IDM_|SAT_|AAP_|ADMIN_|HUB_|DOMAIN|HOST_)"
+
+# Export individually if needed
+export RH_USER="username"
+export RH_PASS="password"
+export ADMIN_PASS="password"
+```
+
+**Issue 2: "Cannot reach aap via SSH"**
+
+```bash
+# Check VM status
+virsh list --all | grep aap
+
+# Test SSH manually
+ssh -o ConnectTimeout=5 root@10.168.128.2 "hostname"
+
+# Check SSH key permissions
+chmod 600 ~/.ssh/id_rsa
+chmod 644 ~/.ssh/id_rsa.pub
+```
+
+**Issue 3: Installation hangs with no output**
+
+```bash
+# Monitor real-time logs
+tail -100f /var/log/rhis/rhis_install_*.log
+
+# Check container execution
+podman ps -a
+podman logs -f rhis-provisioner
+```
+
+**Issue 4: Container fails to start**
+
+```bash
+# Stop and remove old container
+podman stop rhis-provisioner 2>/dev/null || true
+podman rm rhis-provisioner 2>/dev/null || true
+
+# Re-run installer
+./rhis_installer.sh --non-interactive --menu-choice 5
+```
+
+**Issue 5: "Failed to reach Satellite/IdM web UI"**
+
+```bash
+# Check service status
+ssh root@10.168.128.1 "systemctl status satellite"
+ssh root@10.168.128.1 "systemctl status httpd"
+
+# Check if port is listening
+ssh root@10.168.128.1 "ss -tlnp | grep :443"
+```
+
+### Cleanup
+
+After deployment or if starting over:
+
+```bash
+# Stop all RHIS services
+podman stop rhis-provisioner
+
+# Remove all VMs  
+for vm in satellite aap idm; do
+  virsh destroy "$vm" 2>/dev/null || true
+  virsh undefine "$vm" --remove-all-storage 2>/dev/null || true
+done
+
+# Remove container
+podman rm rhis-provisioner
+
+# Start fresh
+./rhis_installer.sh --non-interactive --menu-choice 5
+```
+
+---
+
+## Recovery & Diagnostics
+
+[⬆ Back to top](#table-of-contents)
+
+### Situation: Config-as-Code Phases Failed
+
+If IdM, Satellite, or AAP playbooks fail during deployment:
+
+**Recovery Procedures**
+
+**Option A: Retry Config-as-Code (Recommended - Simple)**
+
+```bash
+# Re-run the config-as-code phases
+./rhis_installer.sh --non-interactive --menu-choice 7
+```
+
+**Option B: Re-run Full RHIS Installer**
+
+```bash
+# Backup any important logs/configs:
+cp -r /var/log/rhis /var/log/rhis.backup.2026-03-24
+
+# Stop the container:
+podman rm -f rhis-provisioner
+
+# Re-run the installer:
+cd ~/GIT/RHIS
+./rhis_installer.sh
+```
+
+**Option C: Manual Phase Re-execution**
+
+```bash
+# Connect to provisioner container:
+podman exec -it -e ANSIBLE_DEBUG=1 rhis-provisioner /bin/bash
+
+# Run IdM with verbose output:
+cd /rhis
+ansible-playbook -vvv \
+  --inventory /rhis/vars/external_inventory/hosts \
+  --vault-password-file /rhis/vars/vault/.vaultpass.container \
+  --extra-vars @/rhis/vars/vault/env.yml \
+  --limit scenario_idm \
+  /rhis/rhis-builder-idm/main.yml 2>&1 | tee /tmp/idm-playbook.log
+```
+
+**Option D: Isolated Component Testing**
+
+```bash
+# Test IdM SSH connectivity and basic services:
+ssh root@10.168.128.3 "ipactl status && systemctl status ipa httpd"
+
+# Test Satellite SSH connectivity:
+ssh root@10.168.128.1 "systemctl status httpd"
+
+# Test AAP SSH connectivity:
+ssh root@10.168.128.2 "whoami"
+```
+
+### Verification
+
+After remediation, verify all phases pass:
+
+```bash
+# Check IdM
+curl -k https://10.168.128.3/ipa/ui/ && echo "✓  IdM UI reached"
+
+# Check Satellite
+curl -k https://10.168.128.1/ && echo "✓  Satellite web reached"
+
+# Check AAP (after setup completes)
+curl -k https://10.168.128.2/ && echo "✓  AAP web reached"
+```
+
+---
+
+## Directory Structure & Configuration Files
+
+[⬆ Back to top](#table-of-contents)
+
+### Top-Level Files
+
+| File | Purpose |
+| --- | --- |
+| `rhis_installer.sh` | Primary orchestration script |
+| `CHECKLIST.md` | Required user-provided inputs and where to get them |
+| `README.md` | This document - complete RHIS documentation |
+| `LICENSE` | License information |
+
+### Directory: `host_vars/`
+
+This directory is bind-mounted into the `rhis-provisioner` container at `/rhis/vars/host_vars/`.
+
+**Setup:** Copy each `*.SAMPLE` file to its actual name and fill in real values:
+
+- `host_vars/satellite.yml` — Satellite VM connection + org/location vars
+- `host_vars/aap.yml` — AAP admin credentials
+- `host_vars/idm.yml` — IdM realm/domain overrides
+- `host_vars/installer.yml` — Controller/installer host SSH settings
+
+**Runtime Note:** `rhis_installer.sh` regenerates `host_vars/*.yml` during config-as-code startup. Treat these files as generated runtime artifacts.
+
+### Directory: `inventory/`
+
+This directory is bind-mounted into the `rhis-provisioner` container at `/rhis/vars/external_inventory/`.
+
+**Setup:**
+
+1. Copy `hosts.SAMPLE` → `hosts` and fill in your actual hostnames and IPs.
+2. The `hosts` file is referenced by all rhis-builder playbooks.
+
+**Group Names:**
+
+| Group | Purpose |
+| --- | --- |
+| `scenario_satellite` | Satellite VM |
+| `aap` | Ansible Automation Platform VM |
+| `idm` | Red Hat Identity Management VM |
+
+**AAP Inventory Templates:**
+
+Available deployment models:
+
+1. **Enterprise / Multi-Node** (`inventory.j2`): All AAP components on separate VMs
+2. **Growth / Single-Node** (`inventory-growth.j2`): All AAP components co-located on one VM
+3. **DEMO** (`DEMO-inventory.j2`): Forced automatically with `--DEMO`
+
+**CLI Overrides:**
+
+```bash
+# Force DEMO model
+./rhis_installer.sh --non-interactive --DEMO
+
+# Pin specific topology
+./rhis_installer.sh --non-interactive \
+   --inventory inventory.j2
 ```
 
 ---
@@ -316,8 +750,8 @@ By default, the script uses these internal addresses:
 
 | Node | Default IP | Default Hostname Pattern |
 |---|---:|---|
-| Satellite | `10.168.128.1` | `satellite-618.<domain>` |
-| AAP | `10.168.128.2` | `aap-26.<domain>` |
+| Satellite | `10.168.128.1` | `satellite.<domain>` |
+| AAP | `10.168.128.2` | `aap.<domain>` |
 | IdM | `10.168.128.3` | `idm.<domain>` |
 
 Shared defaults also include:
@@ -338,6 +772,12 @@ Role aliases (used for hostname-role matching and inventory convenience names):
 
 Adjust these during `--reconfigure` if your environment needs different values.
 
+Satellite service/provisioning settings are also defaulted, prompted, and then
+persisted in encrypted `~/.ansible/conf/env.yml` (for example:
+`SAT_FIREWALLD_INTERFACE`, `SAT_FIREWALLD_ZONE`,
+`SAT_FIREWALLD_SERVICES_JSON`, `SAT_PROVISIONING_*`, `SAT_DNS_ZONE`,
+`SAT_DNS_REVERSE_ZONE`).
+
 ---
 
 ## Kickstart generation
@@ -354,7 +794,7 @@ The script generates unattended kickstarts for:
 
 The Satellite build produces:
 
-- `kickstarts/satellite-618.ks`
+- `kickstarts/satellite.ks`
 - `/var/lib/libvirt/images/OEMDRV.iso`
 
 Satellite boots using:
@@ -417,11 +857,13 @@ When you choose a libvirt build path, the script:
 2. generates kickstarts
 3. stages the AAP bundle on the host
 4. creates these VMs:
-  - `idm`
-  - `satellite-618`
-  - `aap-26`
-5. enables `virsh autostart` for each VM
-6. checks that the three VMs are left in an ON/running state so automation can continue
+
+- `idm`
+- `satellite`
+- `aap`
+
+1. enables `virsh autostart` for each VM
+2. checks that the three VMs are left in an ON/running state so automation can continue
 
 After provisioning, config-as-code is executed in dependency order:
 
@@ -501,6 +943,8 @@ It currently cleans up:
 - staged AAP bundle content
 - known lock files
 - RHIS temp/cache artifacts
+- stale RHIS node SSH trust entries in the installer host's `~/.ssh/known_hosts`
+- stale RHIS node hostname/IP comment lines in the installer host's `~/.ssh/authorized_keys`
 - auto-opened console monitor windows
 - fallback `tmux` console sessions
 - known leftover processes from current or previous RHIS runs
@@ -550,7 +994,7 @@ The script can provide a non-destructive snapshot without provisioning changes:
 Use:
 
 ```bash
-./rhis_install.sh --status
+./rhis_installer.sh --status
 ```
 
 ### Ports used by the workflow
@@ -604,10 +1048,11 @@ The hypervisor choice dictates how much "tax" is taken from your physical hardwa
 
 Overcommitting allows you to run more virtual resources than you have physical hardware, provided you follow these "Golden Ratios."
 
-* **vCPU Overcommit (3:1 to 5:1):** Generally safe. You can assign 3–5 vCPUs per physical core.
-* **RAM Overcommit (1:1):** Highly dangerous for RHIS. Satellite and AAP rely on PostgreSQL; if they are forced into swap, performance collapses.
+- **vCPU Overcommit (3:1 to 5:1):** Generally safe. You can assign 3–5 vCPUs per physical core.
+- **RAM Overcommit (1:1):** Highly dangerous for RHIS. Satellite and AAP rely on PostgreSQL; if they are forced into swap, performance collapses.
 
 ### Sample Calculation: 64GB RAM / 12-Core (24 Thread) Host
+
 | VM Name | vCPU | RAM | Note |
 | :--- | :--- | :--- | :--- |
 | **Satellite 6.18** | 8 | 28 GB | Priority for RAM |
@@ -624,16 +1069,22 @@ Overcommitting allows you to run more virtual resources than you have physical h
 Use these commands to determine if your hardware can handle an additional VM or if it is currently "thrashing."
 
 ### A. Pressure Stall Information (PSI)
+
 The most accurate health metric in RHEL 10. It measures how much time processes spend waiting for resources.
+
 ```bash
 # Check for Memory Stalls
 cat /proc/pressure/memory
 ```
-* **avg10 > 10.00:** Your RAM is over-saturated. Do not add more VMs.
-* **avg10 < 1.00:** Your system is healthy and has room to grow.
+
+- **avg10 > 10.00:** Your RAM is over-saturated. Do not add more VMs.
+
+- **avg10 < 1.00:** Your system is healthy and has room to grow.
 
 ### B. Hypervisor Stats (virsh)
+
 Run these on the KVM/Libvirt host to see actual physical memory footprint (`rss`).
+
 ```bash
 # Get memory stats for all running domains
 virsh domstats --memory
@@ -643,6 +1094,7 @@ virsh memstat <domain_name>
 ```
 
 ### C. Standard Linux Monitoring
+
 | Tool | Command | Focus |
 | :--- | :--- | :--- |
 | **Free** | `free -h` | Look at the **available** column only. |
@@ -671,7 +1123,7 @@ cat /sys/kernel/mm/ksm/pages_shared
 
 [⬆ Back to top](#table-of-contents)
 
-- `rhis_install.sh` — primary orchestration script
+- `rhis_installer.sh` — primary orchestration script
 - `CHECKLIST.md` — required user-provided inputs and where to get them
 - `README.md` — this document
 
@@ -680,7 +1132,7 @@ For a minimal source tree model, treat these as the canonical non-hidden top-lev
 - `CHECKLIST.md`
 - `LICENSE`
 - `README.md`
-- `rhis_install.sh`
+- `rhis_installer.sh`
 
 Other runtime directories/files (for example `inventory/`, `host_vars/`, generated placeholders) can be generated by the script if missing.
 
@@ -695,16 +1147,16 @@ Other runtime directories/files (for example `inventory/`, `host_vars/`, generat
 cat CHECKLIST.md
 
 # 2. Configure or update saved values
-./rhis_install.sh --reconfigure
+./rhis_installer.sh --reconfigure
 
 # 3. Clean old lab state if needed
-./rhis_install.sh --DEMOKILL
+./rhis_installer.sh --DEMOKILL
 
 # 4. Build the demo stack
-./rhis_install.sh --DEMO
+./rhis_installer.sh --DEMO
 
 # 5. Optional: run a fast end-to-end wiring check
-./rhis_install.sh --test=fast --DEMO
+./rhis_installer.sh --test=fast --DEMO
 ```
 
 ---
@@ -760,7 +1212,7 @@ podman exec -it -e ANSIBLE_CONFIG=/rhis/vars/vault/rhis-ansible.cfg rhis-provisi
 If configuration values are wrong, rerun:
 
 ```bash
-./rhis_install.sh --reconfigure
+./rhis_installer.sh --reconfigure
 ```
 
 ---

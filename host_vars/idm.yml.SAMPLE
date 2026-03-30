@@ -2,7 +2,7 @@
 # Copy to host_vars/idm.yml and fill in real values.
 # ---
 
-ansible_user: "root"
+ansible_user: "{{ admin_user | default('admin') }}"
 ansible_become: true
 ansible_password: "{{ global_admin_password | default('') }}"
 

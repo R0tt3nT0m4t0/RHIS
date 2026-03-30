@@ -1,3 +1,6 @@
+# Ansible runtime caches/state
+.ansible/conf/facts-cache/
+~/.ansible/
 # Logs
 *.log
 npm-debug.log*
@@ -112,3 +115,31 @@ host_vars/satellite.yml
 host_vars/aap.yml
 host_vars/idm.yml
 host_vars/installer.yml
+
+# Local fallback workspace synced from provisioner container (may include vault data)
+container/roles/**
+
+# RHIS runtime secrets and generated container-side artifacts
+container/vars/ssh/id_rsa
+container/vars/ssh/id_rsa.pub
+container/vars/ssh/known_hosts
+container/vars/vault/.vaultpass.txt
+container/vars/vault/.vaultpass.container*
+container/vars/vault/env.yml
+container/vars/vault/rhis-ansible.cfg
+container/vars/vault/ansible-provisioner.log
+container/vars/vault/manifest.zip
+container/vars/vault/facts-cache/
+
+# RHIS generated runtime version markers
+container/version24.txt
+container/version25.txt
+
+# RHIS runtime package retry output
+failed_packages.txt
+
+# Local helper script
+.sync-rhis.sh
+
+# Local/generated documentation artifacts
+Doc/

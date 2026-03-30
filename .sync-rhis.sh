@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # --- Configuration ---
-SOURCE_DIR="/home/sgallego/GIT/RHIS/"
-DEST_DIR="/home/sgallego/GIT/rhis-builder-kvm-lz"
+SOURCE_DIR="$HOME/GIT/RHIS/"
+DEST_DIR="$HOME/GIT/rhis-builder-kvm-lz"
 BRANCH="shadd"
 REMOTE="shaddfork"
 BASE_REMOTE="origin"
